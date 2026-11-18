@@ -16,6 +16,15 @@ layout(push_constant) uniform Push {
 } pc;
 
 const uint FULL_BLOCK = 16u;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+const float QUANT = 1023.0;
+const int DISAGREE = 96;
+
+int quantize_luma(vec4 c) {
+    precise float q = clamp(dot(c.rgb, LUMA), 0.0, 1.0) * QUANT;
+    precise float r = q + 0.5;
+    return int(floor(r));
+}
 
 vec4 bilinear_prev(vec2 p) {
     vec2 c = clamp(p, vec2(0.0), vec2(float(pc.w - 1u), float(pc.h - 1u)));
@@ -52,9 +61,38 @@ void main() {
         return;
     }
     ivec2 block = ivec2(min(p.x / FULL_BLOCK, pc.flow_w - 1u), min(p.y / FULL_BLOCK, pc.flow_h - 1u));
-    vec2 f = imageLoad(flow, block).rg * 2.0;
+    ivec2 offsets[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
     vec2 pos = vec2(p);
-    vec4 a = bilinear_prev(pos - pc.t * f);
-    vec4 b = bilinear_cur(pos + (1.0 - pc.t) * f);
-    imageStore(dst, ip, mix(a, b, pc.t));
+    vec2 seen[5];
+    int seen_count = 0;
+    vec4 best_a = vec4(0.0);
+    vec4 best_b = vec4(0.0);
+    int best_cost = 0x7fffffff;
+    for (int i = 0; i < 5; i++) {
+        ivec2 c = block + offsets[i];
+        if (c.x < 0 || c.y < 0 || c.x >= int(pc.flow_w) || c.y >= int(pc.flow_h)) {
+            continue;
+        }
+        vec2 v = imageLoad(flow, c).rg * 2.0;
+        bool duplicate = false;
+        for (int j = 0; j < seen_count; j++) {
+            duplicate = duplicate || seen[j] == v;
+        }
+        if (duplicate) {
+            continue;
+        }
+        seen[seen_count++] = v;
+        vec4 a = bilinear_prev(pos - pc.t * v);
+        vec4 b = bilinear_cur(pos + (1.0 - pc.t) * v);
+        int cost = abs(quantize_luma(a) - quantize_luma(b));
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_a = a;
+            best_b = b;
+        }
+    }
+    vec4 a = best_a;
+    vec4 b = best_b;
+    vec4 result = best_cost > DISAGREE ? (pc.t >= 0.5 ? b : a) : mix(a, b, pc.t);
+    imageStore(dst, ip, result);
 }
