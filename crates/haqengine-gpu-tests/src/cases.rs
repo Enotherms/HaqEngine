@@ -826,10 +826,36 @@ fn unwritten(a: &Image<Rgba8>, b: &Image<Rgba8>) -> usize {
     a.data.iter().zip(&b.data).filter(|(x, y)| x[..3] == ca && y[..3] == cb).count()
 }
 
-fn interp_prepare_case(gpu: &Gpu) -> Result<CaseResult, String> {
+/// The blend after AMD's inpainting equals the CPU reference within one 8-bit step, on the
+/// still-square scene and at an odd size.
+fn blend_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
     fsr3_ready(gpu)?;
-    let us = crate::fsr3_interp::prepare_is_constant(gpu, 1280, 800)?;
-    Ok(fsr3_result(us))
+    let square = checker(96, 96, 6);
+    let mut reports = Vec::new();
+    let mut time = 0.0;
+    for (w, h, dx, dy) in [(1280u32, 800u32, 16i32, 0i32), (1281, 801, -6, 4)] {
+        let mut frames = pan_frames(w, h, dx, dy, QUALITY_STEPS, 151);
+        for f in &mut frames {
+            paste(f, &square, (592, 352));
+        }
+        let mut fi = crate::fsr3_interp::Fsr3Interp::new(gpu, w, h, FSR3_FORMAT)?;
+        let result = (|| -> Result<CompareReport, String> {
+            for f in &frames {
+                time = fi.run_frame(gpu, f)?;
+            }
+            let (raw, lp, lc) = fi.read_blend_inputs(gpu)?;
+            let n = frames.len();
+            let expected = haqengine_core::fsr3_interp::fi_blend_reference(&frames[n - 2], &frames[n - 1], &raw, &lp, &lc, false);
+            let mut got = fi.read_output(gpu)?;
+            for (g, e) in got.data.iter_mut().zip(&expected.data) {
+                g[3] = e[3];
+            }
+            Ok(compare_rgba8(&expected, &got, BLEND_TOLERANCE))
+        })();
+        fi.destroy(gpu);
+        reports.push(result?);
+    }
+    Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: BLEND_TOLERANCE as f32 })
 }
 
 fn interp_reset_case(gpu: &Gpu) -> Result<CaseResult, String> {
@@ -850,7 +876,7 @@ fn interp_reset_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(fsr3_result(us))
 }
 
-/// Interpolation's own images, measured as the driver allocates them, stay within 24 MiB at
+/// Interpolation's own images, measured as the driver allocates them, stay within 12 MiB at
 /// 1280×800; the two real frames and the flow are counted elsewhere.
 fn interp_memory_case(gpu: &Gpu) -> Result<CaseResult, String> {
     fsr3_ready(gpu)?;
@@ -859,10 +885,194 @@ fn interp_memory_case(gpu: &Gpu) -> Result<CaseResult, String> {
     fi.destroy(gpu);
     let texels = haqengine_core::fsr3_interp::fi_memory_bytes(1280, 800);
     println!("      fsr3 interp owns {owned} bytes in {count} images and 1 buffer ({texels} bytes of texels)");
-    if owned > 24 << 20 {
-        return Err(format!("interpolation owns {owned} bytes, budget 24 MiB"));
+    if owned > 12 << 20 {
+        return Err(format!("interpolation owns {owned} bytes, budget 12 MiB"));
     }
     Ok(fsr3_result(0.0))
+}
+
+const QUALITY_STEPS: u32 = 11;
+
+/// The pan scene `half_steps / 2` steps in: the exact frame between two real ones when
+/// `half_steps` is odd and both motions are even.
+fn pan_at(width: u32, height: u32, dx: i32, dy: i32, n: u32, seed: u64, half_steps: i32) -> Image<Rgba8> {
+    let base = noise(width + n * dx.unsigned_abs(), height + n * dy.unsigned_abs(), seed);
+    let (cx, cy) = (n as i32 * dx.max(0), n as i32 * dy.max(0));
+    let (ox, oy) = (half_steps * dx / 2, half_steps * dy / 2);
+    let mut f = Image::new(width, height, [0u8, 0, 0, 255]);
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            f.set(x as u32, y as u32, base.get((x - ox + cx) as u32, (y - oy + cy) as u32));
+        }
+    }
+    f
+}
+
+fn paste(dst: &mut Image<Rgba8>, src: &Image<Rgba8>, at: (u32, u32)) {
+    for y in 0..src.height {
+        for x in 0..src.width {
+            dst.set(at.0 + x, at.1 + y, src.get(x, y));
+        }
+    }
+}
+
+/// Mean absolute RGB difference over the kept pixels, in 8-bit steps.
+fn mean_err(a: &Image<Rgba8>, b: &Image<Rgba8>, keep: impl Fn(u32, u32) -> bool) -> f64 {
+    let (mut sum, mut n) = (0u64, 0u64);
+    for y in 0..a.height {
+        for x in 0..a.width {
+            if keep(x, y) {
+                let (p, q) = (a.get(x, y), b.get(x, y));
+                sum += (0..3).map(|c| p[c].abs_diff(q[c]) as u64).sum::<u64>();
+                n += 3;
+            }
+        }
+    }
+    if n == 0 { f64::NAN } else { sum as f64 / n as f64 }
+}
+
+/// Battery's frame between the last two frames, computed exactly as its GPU passes do.
+fn battery_mid(prev: &Image<Rgba8>, cur: &Image<Rgba8>) -> Image<Rgba8> {
+    let (pp, cp) = (flow::pyramid(prev), flow::pyramid(cur));
+    let f = flow::estimate_flow(&pp, &cp);
+    flow::warp_blend(prev, cur, &pp[0], &cp[0], &f, 0.5)
+}
+
+/// FSR 3's last interpolated frame for a sequence, checked for unwritten pixels with two canaries.
+fn fsr3_mid(gpu: &Gpu, frames: &[Image<Rgba8>]) -> Result<(Image<Rgba8>, f64, crate::fsr3_interp::InterpTimes), String> {
+    let (a, us, times) = interp_run(gpu, frames, CANARIES[0])?;
+    let (b, _, _) = interp_run(gpu, frames, CANARIES[1])?;
+    let (la, lb) = (a.last().ok_or("no output")?, b.last().ok_or("no output")?);
+    let n = unwritten(la, lb);
+    if n > 0 {
+        return Err(format!("{n} pixels were never written"));
+    }
+    Ok((la.clone(), us, times))
+}
+
+fn compare_to_battery(what: &str, fsr3: f64, battery: f64, bar: f64, slack: f64) -> Result<(), String> {
+    println!("      {what}: fsr3 {fsr3:.3}, battery {battery:.3} (8-bit steps)");
+    if fsr3.is_nan() || fsr3 > bar || fsr3 > battery + slack {
+        return Err(format!("{what}: fsr3 {fsr3:.3} vs battery {battery:.3}, bar {bar} and battery + {slack}"));
+    }
+    Ok(())
+}
+
+fn interp_pan_case(gpu: &Gpu, width: u32, height: u32, dx: i32, dy: i32) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let frames = pan_frames(width, height, dx, dy, QUALITY_STEPS, 111);
+    let truth = pan_at(width, height, dx, dy, QUALITY_STEPS, 111, 2 * QUALITY_STEPS as i32 - 1);
+    let (out, us, _) = fsr3_mid(gpu, &frames)?;
+    let n = frames.len();
+    let battery = battery_mid(&frames[n - 2], &frames[n - 1]);
+    let margin = 48;
+    let keep = |x: u32, y: u32| x >= margin && y >= margin && x + margin < width && y + margin < height;
+    compare_to_battery("pan", mean_err(&out, &truth, keep), mean_err(&battery, &truth, keep), 2.0, 0.5)?;
+    Ok(fsr3_result(us))
+}
+
+fn interp_square_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let square = checker(96, 96, 6);
+    let at = (592u32, 352u32);
+    let mut frames = pan_frames(1280, 800, 16, 0, QUALITY_STEPS, 51);
+    for f in &mut frames {
+        paste(f, &square, at);
+    }
+    let mut truth = pan_at(1280, 800, 16, 0, QUALITY_STEPS, 51, 2 * QUALITY_STEPS as i32 - 1);
+    paste(&mut truth, &square, at);
+    let (out, us, _) = fsr3_mid(gpu, &frames)?;
+    let n = frames.len();
+    let battery = battery_mid(&frames[n - 2], &frames[n - 1]);
+    let dist = |x: u32, y: u32| {
+        let dx = (at.0 as i32 - x as i32).max(x as i32 - (at.0 + 95) as i32).max(0);
+        let dy = (at.1 as i32 - y as i32).max(y as i32 - (at.1 + 95) as i32).max(0);
+        dx.max(dy)
+    };
+    let inside = |x: u32, y: u32| x >= at.0 + 8 && x < at.0 + 88 && y >= at.1 + 8 && y < at.1 + 88;
+    let far = |x: u32, y: u32| dist(x, y) >= 32 && x >= 48 && y >= 48 && x + 48 < 1280 && y + 48 < 800;
+    let band = |x: u32, y: u32| !inside(x, y) && dist(x, y) < 24;
+    compare_to_battery("square", mean_err(&out, &truth, inside), mean_err(&battery, &truth, inside), 2.0, 0.5)?;
+    compare_to_battery("background", mean_err(&out, &truth, far), mean_err(&battery, &truth, far), 2.0, 0.5)?;
+    compare_to_battery("edge band", mean_err(&out, &truth, band), mean_err(&battery, &truth, band), 255.0, 0.0)?;
+    Ok(fsr3_result(us))
+}
+
+fn interp_overlay_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let mut bar = Image::new(200, 40, [255u8, 255, 255, 255]);
+    for y in 0..40 {
+        for x in (0..200).filter(|x| x % 8 < 2) {
+            bar.set(x, y, [0, 0, 0, 255]);
+        }
+    }
+    let at = (100u32, 700u32);
+    let mut frames = pan_frames(1280, 800, 12, -8, QUALITY_STEPS, 121);
+    for f in &mut frames {
+        paste(f, &bar, at);
+    }
+    let mut truth = pan_at(1280, 800, 12, -8, QUALITY_STEPS, 121, 2 * QUALITY_STEPS as i32 - 1);
+    paste(&mut truth, &bar, at);
+    let (out, us, _) = fsr3_mid(gpu, &frames)?;
+    let n = frames.len();
+    let battery = battery_mid(&frames[n - 2], &frames[n - 1]);
+    let on_bar = |x: u32, y: u32| x >= at.0 && x < at.0 + 200 && y >= at.1 && y < at.1 + 40;
+    compare_to_battery("overlay", mean_err(&out, &truth, on_bar), mean_err(&battery, &truth, on_bar), 5.0, 0.0)?;
+    Ok(fsr3_result(us))
+}
+
+/// A black square moving 16 px per real frame over still noise. Where it covers or reveals the
+/// background, FSR 3's frame must be at least as close to the true midpoint as Battery's.
+fn interp_revealed_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let bg = noise(1280, 800, 131);
+    let square = Image::new(200, 200, [0u8, 0, 0, 255]);
+    let frames: Vec<Image<Rgba8>> = (0..=QUALITY_STEPS)
+        .map(|k| {
+            let mut f = bg.clone();
+            paste(&mut f, &square, (200 + 16 * k, 300));
+            f
+        })
+        .collect();
+    let (out, us, _) = fsr3_mid(gpu, &frames)?;
+    let n = frames.len();
+    let (prev, cur) = (&frames[n - 2], &frames[n - 1]);
+    let mut truth = bg.clone();
+    paste(&mut truth, &square, (200 + 16 * (QUALITY_STEPS - 1) + 8, 300));
+    let battery = battery_mid(prev, cur);
+    let band = |x: u32, y: u32| (300..500).contains(&y) && prev.get(x, y) != cur.get(x, y);
+    compare_to_battery("revealed band", mean_err(&out, &truth, band), mean_err(&battery, &truth, band), 255.0, 0.0)?;
+    Ok(fsr3_result(us))
+}
+
+fn interp_black_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let black = Image::new(1280, 800, [0u8, 0, 0, 255]);
+    let frames: Vec<_> = (0..=QUALITY_STEPS).map(|_| black.clone()).collect();
+    let (out, us, _) = fsr3_mid(gpu, &frames)?;
+    if let Some(p) = out.data.iter().find(|p| p[..3].iter().any(|c| *c > 1)) {
+        return Err(format!("flat black gave {p:?}"));
+    }
+    Ok(fsr3_result(us))
+}
+
+fn interp_pipeline_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let frames = pan_frames(1280, 800, 12, -8, QUALITY_STEPS, 141);
+    let (_, us, times) = interp_run(gpu, &frames, CANARIES[0])?;
+    let names = [
+        "setup", "prepare", "prev depth", "game field", "game pyramid", "flow field", "disocclusion", "interpolation", "pyramid",
+        "inpainting", "blend",
+    ];
+    let detail: Vec<String> =
+        names.iter().zip(times.passes).filter(|(_, t)| *t > 0.0).map(|(n, t)| format!("{n} {t:.0}")).collect();
+    let interp: f64 = times.passes.iter().sum();
+    println!(
+        "      fsr3 quality pipeline total {us:.1} us (budget 3000 us): flow {:.0}, interpolation {interp:.0} ({})",
+        times.flow,
+        detail.join(", ")
+    );
+    Ok(fsr3_result(us))
 }
 
 fn luma_half_case(gpu: &Gpu, f: PackedFormat, img: &Image<Rgba8>) -> Result<CaseResult, String> {
@@ -1008,9 +1218,16 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("fsr3 flow pipeline 1280x800 total", fsr3_pipeline_case),
         case("fsr3 flow odd shift(7,-3)", fsr3_odd_case),
         case("fsr3 flow memory within budget", fsr3_memory_case),
-        case("fsr3 interp prepare is constant", interp_prepare_case),
+        case("fi_blend matches CPU", blend_parity_case),
         case("fsr3 interp first frames after reset", interp_reset_case),
         case("fsr3 interp memory within budget", interp_memory_case),
+        case("fsr3 interp pan", |g| interp_pan_case(g, 1280, 800, 12, -8)),
+        case("fsr3 interp 1281x801 pan", |g| interp_pan_case(g, 1281, 801, -6, 4)),
+        case("fsr3 interp still square over moving background", interp_square_case),
+        case("fsr3 interp static overlay", interp_overlay_case),
+        case("fsr3 interp revealed area", interp_revealed_case),
+        case("fsr3 interp flat black", interp_black_case),
+        case("fsr3 interp pipeline total", interp_pipeline_case),
     ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
@@ -1079,9 +1296,16 @@ mod tests {
             "of_luma_half matches CPU",
             "fsr3 flow odd shift(7,-3)",
             "fsr3 flow memory within budget",
-            "fsr3 interp prepare is constant",
+            "fi_blend matches CPU",
             "fsr3 interp first frames after reset",
             "fsr3 interp memory within budget",
+            "fsr3 interp pan",
+            "fsr3 interp 1281x801 pan",
+            "fsr3 interp still square over moving background",
+            "fsr3 interp static overlay",
+            "fsr3 interp revealed area",
+            "fsr3 interp flat black",
+            "fsr3 interp pipeline total",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

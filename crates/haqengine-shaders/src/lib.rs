@@ -270,8 +270,19 @@ pub const FI_INPAINTING: Fsr3Pass = Fsr3Pass {
     push_size: 0,
 };
 
-/// The FSR 3 interpolation passes; indices are `haqengine_core::fsr3_interp`'s `FI_*` constants.
-pub const FI_PASSES: [&Fsr3Pass; 10] = [
+/// HaqEngine's blend on FSR 3's flow (SPIR-V 1.0), replacing AMD's interpolation pass:
+/// 0/1 = previous/current frame (`rgba8`), 2 = flow (`rg16i`), 3/4 = previous/current 8-bit luma,
+/// 5 = output (`rgba8`); push `{ w, h, flow_w, flow_h, reset }`.
+pub const FI_BLEND: Fsr3Pass = Fsr3Pass {
+    name: "fi_blend",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_blend.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Uav), (1, Uav), (2, Uav), (3, Uav), (4, Uav), (5, Uav)],
+    push_size: 20,
+};
+
+/// The interpolation passes; indices are `haqengine_core::fsr3_interp`'s `PASS_FI_*` constants.
+pub const FI_PASSES: [&Fsr3Pass; 11] = [
     &FI_SETUP,
     &FI_RECONSTRUCT_AND_DILATE,
     &FI_RECONSTRUCT_PREVIOUS_DEPTH,
@@ -282,6 +293,7 @@ pub const FI_PASSES: [&Fsr3Pass; 10] = [
     &FI_INTERPOLATION,
     &FI_INPAINTING_PYRAMID,
     &FI_INPAINTING,
+    &FI_BLEND,
 ];
 
 /// Every shader HaqEngine ships.
@@ -392,8 +404,9 @@ mod tests {
 
     #[test]
     fn fi_passes_are_spirv_1_3() {
-        assert_eq!(FI_PASSES.len(), 10);
-        for p in FI_PASSES {
+        assert_eq!(FI_PASSES.len(), 11);
+        assert_eq!(words(FI_BLEND.spirv)[1], 0x0001_0000);
+        for p in &FI_PASSES[..10] {
             assert_eq!(words(p.spirv)[1], 0x0001_0300, "{}", p.name);
         }
     }
@@ -428,7 +441,8 @@ mod tests {
                 "fi_disocclusion_mask",
                 "fi_interpolation",
                 "fi_inpainting_pyramid",
-                "fi_inpainting"
+                "fi_inpainting",
+                "fi_blend"
             ]
         );
     }

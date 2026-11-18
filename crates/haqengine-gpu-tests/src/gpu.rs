@@ -571,11 +571,6 @@ impl Gpu {
         }
     }
 
-    /// Mip 0 of an image as raw bytes, `texel_bytes` per texel.
-    pub fn read_raw(&self, img: &StorageImage, texel_bytes: usize) -> Result<Vec<u8>, String> {
-        unsafe { self.copy_out(img, (img.width * img.height) as usize * texel_bytes) }
-    }
-
     pub fn write_u32(&self, img: &StorageImage, src: &Image<u32>) -> Result<(), String> {
         let bytes: Vec<u8> = src.data.iter().flat_map(|v| v.to_le_bytes()).collect();
         unsafe { self.copy_in(img, &bytes) }

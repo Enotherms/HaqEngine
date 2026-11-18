@@ -2,6 +2,7 @@
 //! one interpolated frame, fed with zero game motion, a constant depth and half-resolution flow.
 
 use crate::fsr3_flow::{half_size, of_sizes};
+use crate::{Image, Rgba8};
 
 pub const PASS_FI_SETUP: usize = 0;
 pub const PASS_FI_RECONSTRUCT_AND_DILATE: usize = 1;
@@ -13,6 +14,11 @@ pub const PASS_FI_DISOCCLUSION_MASK: usize = 6;
 pub const PASS_FI_INTERPOLATION: usize = 7;
 pub const PASS_FI_INPAINTING_PYRAMID: usize = 8;
 pub const PASS_FI_INPAINTING: usize = 9;
+pub const PASS_FI_BLEND: usize = 10;
+
+/// Above this summed 8-bit luma difference over the 3×3 window the best candidate's two samples
+/// show different things, and the blend takes the current frame instead of a ghost of both.
+pub const DISAGREE8: u32 = 288;
 
 pub const FI_CONSTANTS_SIZE: usize = 176;
 pub const FI_PYRAMID_BINDINGS: u32 = 13;
@@ -55,6 +61,8 @@ pub enum FiRes {
     Confidence,
     Flow,
     Scd,
+    PrevLuma,
+    CurLuma,
 }
 
 /// Per-frame inputs to the constants.
@@ -64,7 +72,8 @@ pub struct FiParams {
     pub delta_time_ms: f32,
 }
 
-/// One compute dispatch. `clears` run before it, as `(image, 32-bit clear value)`.
+/// One compute dispatch. `clears` run before it, as `(image or buffer, 32-bit fill)`; `push` is
+/// used by `PASS_FI_BLEND` only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FiDispatch {
     pub pass: usize,
@@ -72,6 +81,7 @@ pub struct FiDispatch {
     pub bind: Vec<(u32, FiRes)>,
     pub pyramid_constants: Option<[u8; 16]>,
     pub clears: Vec<(FiRes, u32)>,
+    pub push: [u8; 20],
 }
 
 pub fn fi_sizes(display_w: u32, display_h: u32) -> FiSizes {
@@ -139,10 +149,13 @@ pub fn fi_constants(sizes: &FiSizes, p: &FiParams) -> [u8; FI_CONSTANTS_SIZE] {
     c
 }
 
-/// Patches the only per-frame word, `reset`; the frame counter lives in the `Counters` buffer,
-/// which the setup pass updates on the GPU.
-pub fn set_fi_frame(constants: &mut [u8; FI_CONSTANTS_SIZE], frame_since_reset: u32) {
-    put(constants, 44, (frame_since_reset == 0) as u32);
+/// Patches the per-frame words: `reset` in the constants and in the blend's push constants.
+pub fn set_fi_frame(constants: &mut [u8; FI_CONSTANTS_SIZE], schedule: &mut [FiDispatch], frame_since_reset: u32) {
+    let reset = (frame_since_reset == 0) as u32;
+    put(constants, 44, reset);
+    for d in schedule.iter_mut().filter(|d| d.pass == PASS_FI_BLEND) {
+        put(&mut d.push, 16, reset);
+    }
 }
 
 fn spd(width: u32, height: u32) -> ([u8; 16], [u32; 3]) {
@@ -158,108 +171,113 @@ fn groups8((w, h): (u32, u32)) -> [u32; 3] {
     [w.div_ceil(8), h.div_ceil(8), 1]
 }
 
-fn mips(sizes: &FiSizes, first: u32) -> impl Iterator<Item = (u32, FiRes)> + '_ {
-    (0..FI_PYRAMID_BINDINGS).map(move |i| (first + i, FiRes::PyramidMip(i.min(sizes.pyramid_mips - 1))))
-}
-
-/// Every dispatch of one interpolated frame, in `ffxFrameInterpolationDispatch` order. The
-/// prepare pass is left out: on a constant depth and zero motion its outputs are constant images.
+/// One interpolated frame: our blend on FSR 3's flow, then AMD's inpainting pyramid and
+/// inpainting, which fill holes and fall back to the current frame on a scene cut.
 pub fn fi_schedule(sizes: &FiSizes, p: &FiParams) -> Vec<FiDispatch> {
     use FiRes::*;
-    let d = |pass, groups, bind: Vec<(u32, FiRes)>| FiDispatch { pass, groups, bind, pyramid_constants: None, clears: Vec::new() };
-    let (render, display) = (groups8(sizes.render), groups8(sizes.display));
-    let mut out = vec![d(
-        PASS_FI_SETUP,
-        render,
-        vec![(0, Scd), (1, GameFieldX), (2, GameFieldY), (3, FlowFieldX), (4, FlowFieldY), (5, Disocclusion), (6, Counters)],
-    )];
-    if p.frame_since_reset != 0 {
-        let mut rpd = d(
-            PASS_FI_RECONSTRUCT_PREVIOUS_DEPTH,
-            render,
-            vec![(0, DilatedMotion), (1, DilatedDepth), (2, CurColor), (3, Distortion), (4, ReconstructedInterpDepth)],
-        );
-        rpd.clears.push((ReconstructedInterpDepth, 1.0f32.to_bits()));
-        out.push(rpd);
-        out.push(d(
-            PASS_FI_GAME_MOTION_VECTOR_FIELD,
-            render,
-            vec![(0, DilatedMotion), (1, DilatedDepth), (2, PrevColor), (3, CurColor), (4, Distortion), (5, GameFieldX), (6, GameFieldY)],
-        ));
-        let (gc, gg) = spd(sizes.render.0, sizes.render.1);
-        let mut game = d(PASS_FI_GAME_VECTOR_FIELD_INPAINTING_PYRAMID, gg, vec![(0, GameFieldX), (1, GameFieldY), (2, Counters)]);
-        game.bind.extend(mips(sizes, 3));
-        game.pyramid_constants = Some(gc);
-        out.push(game);
-        out.push(d(
-            PASS_FI_OPTICAL_FLOW_VECTOR_FIELD,
-            groups8(sizes.flow),
-            vec![(0, Flow), (1, Confidence), (2, DilatedDepth), (3, PrevColor), (4, CurColor), (6, FlowFieldX), (7, FlowFieldY)],
-        ));
-        out.push(d(
-            PASS_FI_DISOCCLUSION_MASK,
-            render,
-            vec![
-                (0, GameFieldX),
-                (1, GameFieldY),
-                (2, ReconstructedPrevDepth),
-                (3, DilatedDepth),
-                (4, ReconstructedInterpDepth),
-                (5, Pyramid),
-                (6, Distortion),
-                (7, Disocclusion),
-            ],
-        ));
-    }
-    out.push(d(
-        PASS_FI_INTERPOLATION,
+    let d = |pass, groups, bind: Vec<(u32, FiRes)>| FiDispatch {
+        pass,
+        groups,
+        bind,
+        pyramid_constants: None,
+        clears: Vec::new(),
+        push: [0; 20],
+    };
+    let display = groups8(sizes.display);
+    let mut blend = d(
+        PASS_FI_BLEND,
         display,
-        vec![
-            (0, GameFieldX),
-            (1, GameFieldY),
-            (2, FlowFieldX),
-            (3, FlowFieldY),
-            (4, PrevColor),
-            (5, CurColor),
-            (6, Disocclusion),
-            (7, Pyramid),
-            (8, Counters),
-            (9, Output),
-        ],
-    ));
+        vec![(0, PrevColor), (1, CurColor), (2, Flow), (3, PrevLuma), (4, CurLuma), (5, Output)],
+    );
+    blend.clears.push((Counters, 0));
+    let words = [sizes.display.0, sizes.display.1, sizes.flow.0, sizes.flow.1, (p.frame_since_reset == 0) as u32];
+    for (i, w) in words.iter().enumerate() {
+        put(&mut blend.push, i * 4, *w);
+    }
     let (oc, og) = spd(sizes.display.0, sizes.display.1);
     let mut pyramid = d(PASS_FI_INPAINTING_PYRAMID, og, vec![(0, Output), (1, Counters)]);
-    pyramid.bind.extend(mips(sizes, 2));
+    pyramid.bind.extend((0..FI_PYRAMID_BINDINGS).map(|i| (2 + i, PyramidMip(i.min(sizes.pyramid_mips - 1)))));
     pyramid.pyramid_constants = Some(oc);
-    out.push(pyramid);
-    out.push(d(PASS_FI_INPAINTING, display, vec![(0, Scd), (1, Pyramid), (2, CurColor), (3, CurColor), (7, Output)]));
+    vec![blend, pyramid, d(PASS_FI_INPAINTING, display, vec![(0, Scd), (1, Pyramid), (2, CurColor), (3, CurColor), (7, Output)])]
+}
+
+/// CPU reference of `fi_blend.comp`: per pixel, the candidates are zero, then the FSR 3 vectors of
+/// the pixel's own 16×16 block and its edge neighbours; the one whose two 3×3 windows of FSR 3's
+/// 8-bit luma agree best wins (zero on ties, which keeps a still HUD still), and a winner that
+/// still disagrees takes the current frame.
+pub fn fi_blend_reference(
+    prev: &Image<Rgba8>,
+    cur: &Image<Rgba8>,
+    flow_raw: &Image<[i16; 2]>,
+    prev_luma: &Image<u8>,
+    cur_luma: &Image<u8>,
+    reset: bool,
+) -> Image<Rgba8> {
+    let mut out = cur.clone();
+    if reset {
+        return out;
+    }
+    let luma_at = |img: &Image<u8>, x: i64, y: i64| {
+        img.get(x.clamp(0, img.width as i64 - 1) as u32, y.clamp(0, img.height as i64 - 1) as u32) as i32
+    };
+    let window_cost = |ax: f32, ay: f32, bx: f32, by: f32| {
+        let (pa, pb) = (((ax / 2.0).floor() as i64, (ay / 2.0).floor() as i64), ((bx / 2.0).floor() as i64, (by / 2.0).floor() as i64));
+        let mut sum = 0u32;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let weight = if dx == 0 && dy == 0 { 4 } else { 1 };
+                sum += weight * luma_at(prev_luma, pa.0 + dx, pa.1 + dy).abs_diff(luma_at(cur_luma, pb.0 + dx, pb.1 + dy));
+            }
+        }
+        sum
+    };
+    for y in 0..cur.height {
+        for x in 0..cur.width {
+            let (bx, by) = ((x / 16).min(flow_raw.width - 1) as i64, (y / 16).min(flow_raw.height - 1) as i64);
+            let mut cands: Vec<[f32; 2]> = Vec::with_capacity(6);
+            cands.push([0.0, 0.0]);
+            for (ox, oy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let (nx, ny) = (bx + ox, by + oy);
+                if nx >= 0 && ny >= 0 && nx < flow_raw.width as i64 && ny < flow_raw.height as i64 {
+                    let v = crate::fsr3_flow::ffx_to_haq(flow_raw.get(nx as u32, ny as u32), 2.0);
+                    if !cands.contains(&v) {
+                        cands.push(v);
+                    }
+                }
+            }
+            let (px, py) = (x as f32, y as f32);
+            let mut best = (u32::MAX, [0.0f32; 2]);
+            for v in cands {
+                let (ax, ay, bx2, by2) = (px - v[0] * 0.5, py - v[1] * 0.5, px + v[0] * 0.5, py + v[1] * 0.5);
+                let cost = window_cost(ax, ay, bx2, by2);
+                if cost < best.0 {
+                    best = (cost, v);
+                }
+            }
+            let v = best.1;
+            let a = crate::flow::bilinear(prev, px - v[0] * 0.5, py - v[1] * 0.5);
+            let b = crate::flow::bilinear(cur, px + v[0] * 0.5, py + v[1] * 0.5);
+            let mut c = [0u8; 4];
+            for i in 0..3 {
+                let value = if best.0 > DISAGREE8 { b[i] } else { (a[i] + b[i]) * 0.5 };
+                c[i] = (value + 0.5).floor().clamp(0.0, 255.0) as u8;
+            }
+            out.set(x, y, c);
+        }
+    }
     out
 }
 
-/// AMD's prepare pass on its own, for checking that its outputs are the constant images.
-pub fn fi_prepare_dispatch(sizes: &FiSizes) -> FiDispatch {
-    use FiRes::*;
-    FiDispatch {
-        pass: PASS_FI_RECONSTRUCT_AND_DILATE,
-        groups: groups8(sizes.render),
-        bind: vec![(0, InputMotion), (1, InputDepth), (2, ReconstructedPrevDepth), (3, DilatedMotion), (4, DilatedDepth)],
-        pyramid_constants: None,
-        clears: Vec::new(),
-    }
-}
-
-/// Texel bytes of the images interpolation owns: everything but the two frames, the flow and
-/// the scene-change words, which belong to the frame generator and the optical flow.
+/// Texel bytes of the images interpolation owns (the output, the inpainting pyramid and the
+/// counters); the frames, the flow, its luma and its scene-change words belong to others.
 pub fn fi_memory_bytes(display_w: u32, display_h: u32) -> u64 {
     let s = fi_sizes(display_w, display_h);
     let area = |(w, h): (u32, u32)| w as u64 * h as u64;
-    let render = area(s.render);
     let mut pyramid = 0u64;
     for m in 0..s.pyramid_mips {
         pyramid += area(((s.pyramid.0 >> m).max(1), (s.pyramid.1 >> m).max(1))) * 8;
     }
-    let render_images = render * (4 + 4 + 4 + 4 + 4 * 4 + 2);
-    render_images + pyramid + area(s.display) * 4 + 8 + 2 + 4
+    pyramid + area(s.display) * 4 + 8
 }
 
 #[cfg(test)]
@@ -317,25 +335,78 @@ mod tests {
         assert_eq!(word(&reset, 44), 1);
     }
 
+    fn luma8(img: &crate::Image<crate::Rgba8>) -> crate::Image<u8> {
+        use crate::packed::{to_packed, PackedFormat};
+        crate::fsr3_flow::luma_half_reference(PackedFormat::Rgba8, &to_packed(PackedFormat::Rgba8, img))
+    }
+
+    fn raw_flow(width: u32, height: u32, raw: [i16; 2]) -> crate::Image<[i16; 2]> {
+        let s = fi_sizes(width, height);
+        crate::Image::new(s.flow.0, s.flow.1, raw)
+    }
+
     #[test]
-    fn fi_reset_skips_preparation() {
+    fn fi_blend_uniform_pan_follows_motion() {
+        let prev = crate::noise(64, 48, 3);
+        let cur = crate::shift(&prev, 8, -4);
+        let out = fi_blend_reference(&prev, &cur, &raw_flow(64, 48, [-4, 2]), &luma8(&prev), &luma8(&cur), false);
+        let want = crate::shift(&prev, 4, -2);
+        for y in 12..36 {
+            for x in 12..52 {
+                assert_eq!(out.get(x, y)[..3], want.get(x, y)[..3], "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn fi_blend_static_overlay_takes_zero() {
+        let bar = crate::checker(16, 16, 2);
+        let mut prev = crate::noise(64, 48, 5);
+        let mut cur = crate::shift(&prev, 8, 0);
+        let want_bg = crate::shift(&prev, 4, 0);
+        for img in [&mut prev, &mut cur] {
+            for y in 0..16 {
+                for x in 0..16 {
+                    img.set(24 + x, 16 + y, bar.get(x, y));
+                }
+            }
+        }
+        let out = fi_blend_reference(&prev, &cur, &raw_flow(64, 48, [-4, 0]), &luma8(&prev), &luma8(&cur), false);
+        for y in 18..30 {
+            for x in 26..38 {
+                assert_eq!(out.get(x, y)[..3], bar.get(x - 24, y - 16)[..3], "bar ({x}, {y})");
+            }
+        }
+        for y in 4..12 {
+            for x in 8..56 {
+                assert_eq!(out.get(x, y)[..3], want_bg.get(x, y)[..3], "background ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn fi_blend_disagreement_takes_current() {
+        let prev = crate::Image::new(32, 32, [0u8, 0, 0, 255]);
+        let cur = crate::Image::new(32, 32, [255u8, 255, 255, 255]);
+        let out = fi_blend_reference(&prev, &cur, &raw_flow(32, 32, [0, 0]), &luma8(&prev), &luma8(&cur), false);
+        assert!(out.data.iter().all(|p| p[..3] == [255, 255, 255]));
+    }
+
+    #[test]
+    fn fi_blend_reset_copies_current() {
+        let prev = crate::noise(40, 24, 7);
+        let cur = crate::noise(40, 24, 8);
+        let out = fi_blend_reference(&prev, &cur, &raw_flow(40, 24, [-4, 2]), &luma8(&prev), &luma8(&cur), true);
+        assert_eq!(out.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>(), cur.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fi_schedule_order() {
         let s = fi_sizes(1280, 800);
         let passes = |f| fi_schedule(&s, &FiParams { frame_since_reset: f, delta_time_ms: 33.3 }).iter().map(|d| d.pass).collect::<Vec<_>>();
-        assert_eq!(passes(0), [PASS_FI_SETUP, PASS_FI_INTERPOLATION, PASS_FI_INPAINTING_PYRAMID, PASS_FI_INPAINTING]);
-        assert_eq!(
-            passes(1),
-            [
-                PASS_FI_SETUP,
-                PASS_FI_RECONSTRUCT_PREVIOUS_DEPTH,
-                PASS_FI_GAME_MOTION_VECTOR_FIELD,
-                PASS_FI_GAME_VECTOR_FIELD_INPAINTING_PYRAMID,
-                PASS_FI_OPTICAL_FLOW_VECTOR_FIELD,
-                PASS_FI_DISOCCLUSION_MASK,
-                PASS_FI_INTERPOLATION,
-                PASS_FI_INPAINTING_PYRAMID,
-                PASS_FI_INPAINTING
-            ]
-        );
+        let order = [PASS_FI_BLEND, PASS_FI_INPAINTING_PYRAMID, PASS_FI_INPAINTING];
+        assert_eq!(passes(0), order);
+        assert_eq!(passes(1), order);
     }
 
     #[test]
@@ -343,20 +414,16 @@ mod tests {
         let s = fi_sizes(1280, 800);
         let d = fi_schedule(&s, &P1);
         let by = |pass| d.iter().find(|x| x.pass == pass).unwrap();
-        assert_eq!(by(PASS_FI_SETUP).groups, [80, 50, 1]);
-        assert_eq!(by(PASS_FI_INTERPOLATION).groups, [160, 100, 1]);
+        let blend = by(PASS_FI_BLEND);
+        assert_eq!(blend.groups, [160, 100, 1]);
+        assert_eq!(blend.clears, vec![(FiRes::Counters, 0)]);
+        let push: Vec<u32> = blend.push.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(push, [1280, 800, 80, 50, 0]);
         assert_eq!(by(PASS_FI_INPAINTING).groups, [160, 100, 1]);
-        assert_eq!(by(PASS_FI_OPTICAL_FLOW_VECTOR_FIELD).groups, [10, 7, 1]);
-        let game = by(PASS_FI_GAME_VECTOR_FIELD_INPAINTING_PYRAMID);
-        assert_eq!(game.groups, [10, 7, 1]);
-        let gp = game.pyramid_constants.unwrap();
-        assert_eq!([word(&gp, 0), word(&gp, 4)], [9, 70]);
         let out = by(PASS_FI_INPAINTING_PYRAMID);
         assert_eq!(out.groups, [20, 13, 1]);
         let op = out.pyramid_constants.unwrap();
         assert_eq!([word(&op, 0), word(&op, 4)], [10, 260]);
-        let rpd = by(PASS_FI_RECONSTRUCT_PREVIOUS_DEPTH);
-        assert_eq!(rpd.clears, vec![(FiRes::ReconstructedInterpDepth, 1.0f32.to_bits())]);
     }
 
     #[test]
@@ -365,18 +432,14 @@ mod tests {
         let d = fi_schedule(&s, &P1);
         let by = |pass| d.iter().find(|x| x.pass == pass).unwrap();
         assert_eq!(
-            by(PASS_FI_INTERPOLATION).bind,
+            by(PASS_FI_BLEND).bind,
             vec![
-                (0, FiRes::GameFieldX),
-                (1, FiRes::GameFieldY),
-                (2, FiRes::FlowFieldX),
-                (3, FiRes::FlowFieldY),
-                (4, FiRes::PrevColor),
-                (5, FiRes::CurColor),
-                (6, FiRes::Disocclusion),
-                (7, FiRes::Pyramid),
-                (8, FiRes::Counters),
-                (9, FiRes::Output)
+                (0, FiRes::PrevColor),
+                (1, FiRes::CurColor),
+                (2, FiRes::Flow),
+                (3, FiRes::PrevLuma),
+                (4, FiRes::CurLuma),
+                (5, FiRes::Output)
             ]
         );
         let pyramid = &by(PASS_FI_INPAINTING_PYRAMID).bind;
@@ -384,40 +447,26 @@ mod tests {
         assert_eq!(pyramid[2], (2, FiRes::PyramidMip(0)));
         assert_eq!(pyramid.last(), Some(&(14, FiRes::PyramidMip(9))));
         assert_eq!(pyramid.len(), 2 + FI_PYRAMID_BINDINGS as usize);
-        assert_eq!(by(PASS_FI_OPTICAL_FLOW_VECTOR_FIELD).bind[0], (0, FiRes::Flow));
-        assert_eq!(by(PASS_FI_SETUP).bind[0], (0, FiRes::Scd));
-        let prepare = fi_prepare_dispatch(&s);
-        assert_eq!(prepare.pass, PASS_FI_RECONSTRUCT_AND_DILATE);
-        assert_eq!(prepare.groups, [80, 50, 1]);
-        assert_eq!(
-            prepare.bind,
-            vec![
-                (0, FiRes::InputMotion),
-                (1, FiRes::InputDepth),
-                (2, FiRes::ReconstructedPrevDepth),
-                (3, FiRes::DilatedMotion),
-                (4, FiRes::DilatedDepth)
-            ]
-        );
+        assert_eq!(by(PASS_FI_INPAINTING).bind, vec![(0, FiRes::Scd), (1, FiRes::Pyramid), (2, FiRes::CurColor), (3, FiRes::CurColor), (7, FiRes::Output)]);
     }
 
     #[test]
     fn fi_schedule_reuse() {
         let s = fi_sizes(1280, 800);
-        let five = FiParams { frame_since_reset: 5, delta_time_ms: 33.3 };
-        let seven = FiParams { frame_since_reset: 7, delta_time_ms: 33.3 };
-        assert_eq!(fi_schedule(&s, &five), fi_schedule(&s, &seven));
-        let mut c = fi_constants(&s, &five);
-        set_fi_frame(&mut c, 7);
-        assert_eq!(c, fi_constants(&s, &seven));
-        set_fi_frame(&mut c, 0);
+        let reset = fi_schedule(&s, &FiParams { frame_since_reset: 0, delta_time_ms: 33.3 });
+        let five = fi_schedule(&s, &FiParams { frame_since_reset: 5, delta_time_ms: 33.3 });
+        assert_eq!(five, fi_schedule(&s, &FiParams { frame_since_reset: 7, delta_time_ms: 33.3 }));
+        let mut c = fi_constants(&s, &FiParams { frame_since_reset: 5, delta_time_ms: 33.3 });
+        let mut patched = five.clone();
+        set_fi_frame(&mut c, &mut patched, 0);
+        assert_eq!(patched, reset);
         assert_eq!(c, fi_constants(&s, &FiParams { frame_since_reset: 0, delta_time_ms: 33.3 }));
     }
 
     #[test]
     fn fi_memory_bounded() {
         let bytes = fi_memory_bytes(1280, 800);
-        assert!(bytes <= 24 << 20, "{bytes}");
+        assert!(bytes <= 12 << 20, "{bytes}");
         assert!(bytes > fi_memory_bytes(640, 400));
     }
 }

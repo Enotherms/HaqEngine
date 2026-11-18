@@ -123,6 +123,16 @@ impl Fsr3Flow {
         Ok(Image { width: raw.width, height: raw.height, data: raw.data.iter().map(|v| ffx_to_haq(*v, 2.0)).collect() })
     }
 
+    pub fn read_raw(&self, gpu: &Gpu) -> Result<Image<[i16; 2]>, String> {
+        gpu.read_rg16i(self.image(OfRes::Output)?)
+    }
+
+    /// The `(previous, current)` input slots of the last frame run; their level 0 is 8-bit luma.
+    pub fn luma_slots(&self) -> (usize, usize) {
+        let cur = (!self.odd) as usize;
+        (1 - cur, cur)
+    }
+
     pub fn read_scd(&self, gpu: &Gpu) -> Result<ScdOutput, String> {
         let img = gpu.read_u32(self.image(OfRes::ScdOutput)?)?;
         Ok([img.data[0], img.data[1], img.data[2]])
