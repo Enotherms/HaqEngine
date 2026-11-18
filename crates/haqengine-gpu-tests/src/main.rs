@@ -6,7 +6,7 @@ mod cases;
 mod gpu;
 mod report;
 
-use report::{exit_code, format_line, outcome};
+use report::{exit_code, format_line, is_fatal, outcome};
 
 struct Args {
     validation: bool,
@@ -43,6 +43,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    println!("device: {}", gpu.device_name);
     let mut outcomes = Vec::new();
     for case in cases::all_cases(args.self_test_fail) {
         if args.filter.as_deref().is_some_and(|f| !case.name.contains(f)) {
@@ -51,6 +52,10 @@ fn main() {
         let result = (case.run)(&gpu);
         println!("{}", format_line(&case.name, &result));
         outcomes.push(outcome(&result));
+        if is_fatal(&result) {
+            println!("stopping: the GPU is no longer usable");
+            break;
+        }
     }
     let passed = outcomes.iter().filter(|o| **o == report::Outcome::Pass).count();
     let errors = gpu.validation_errors();

@@ -4,7 +4,7 @@ use ash::vk;
 use haqengine_core::{Image, Rgba8};
 use haqengine_shaders::Shader;
 use std::ffi::{c_void, CStr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -49,6 +49,21 @@ pub struct Gpu {
     timestamps: bool,
     timestamp_period_ns: f32,
     memory: vk::PhysicalDeviceMemoryProperties,
+    lost: AtomicBool,
+    pub device_name: String,
+}
+
+/// Index of the device to test on: a discrete or integrated GPU first, never a CPU renderer
+/// when a real GPU exists.
+pub fn pick_device(types: &[vk::PhysicalDeviceType]) -> Option<usize> {
+    let rank = |t: vk::PhysicalDeviceType| match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+        vk::PhysicalDeviceType::CPU => 4,
+        _ => 3,
+    };
+    (0..types.len()).min_by_key(|&i| (rank(types[i]), i))
 }
 
 fn err(what: &str, r: vk::Result) -> String {
@@ -102,19 +117,23 @@ impl Gpu {
                 None
             };
             let physicals = instance.enumerate_physical_devices().map_err(|e| err("listing GPUs", e))?;
-            let (physical, family, valid_bits) = physicals
+            let candidates: Vec<(vk::PhysicalDevice, u32, u32)> = physicals
                 .iter()
-                .find_map(|&p| {
+                .filter_map(|&p| {
                     instance
                         .get_physical_device_queue_family_properties(p)
                         .iter()
-                        .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                        .map(|i| {
-                            let f = instance.get_physical_device_queue_family_properties(p)[i];
-                            (p, i as u32, f.timestamp_valid_bits)
-                        })
+                        .enumerate()
+                        .find(|(_, f)| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                        .map(|(i, f)| (p, i as u32, f.timestamp_valid_bits))
                 })
-                .ok_or("no GPU with a compute queue")?;
+                .collect();
+            let types: Vec<vk::PhysicalDeviceType> = candidates
+                .iter()
+                .map(|(p, _, _)| instance.get_physical_device_properties(*p).device_type)
+                .collect();
+            let (physical, family, valid_bits) =
+                pick_device(&types).map(|i| candidates[i]).ok_or("no GPU with a compute queue")?;
             let props = instance.get_physical_device_properties(physical);
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
@@ -148,8 +167,15 @@ impl Gpu {
                 timestamps: valid_bits > 0,
                 timestamp_period_ns: props.limits.timestamp_period,
                 memory,
+                lost: AtomicBool::new(false),
+                device_name: props.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             })
         }
+    }
+
+    /// True after a hang or device loss; nothing the GPU may still use is freed after that.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
     }
 
     pub fn validation_errors(&self) -> u32 {
@@ -227,10 +253,16 @@ impl Gpu {
                     Err(vk::Result::TIMEOUT) => Err("GPU timeout".to_string()),
                     Err(e) => Err(err("waiting for the GPU", e)),
                 });
-            d.destroy_fence(fence, None);
+            if r.as_ref().is_err_and(|e| e.contains("GPU timeout") || e.contains("ERROR_DEVICE_LOST")) {
+                self.lost.store(true, Ordering::Relaxed);
+            } else {
+                d.destroy_fence(fence, None);
+            }
             r
         })();
-        d.free_command_buffers(self.pool, &[cmd]);
+        if !self.is_lost() {
+            d.free_command_buffers(self.pool, &[cmd]);
+        }
         result
     }
 
@@ -297,6 +329,9 @@ impl Gpu {
     }
 
     pub fn destroy_image(&self, img: StorageImage) {
+        if self.is_lost() {
+            return;
+        }
         unsafe {
             self.device.destroy_image_view(img.view, None);
             self.device.destroy_image(img.image, None);
@@ -465,6 +500,9 @@ impl Gpu {
                     .map_err(|e| err("reading timestamps", e))?;
                 Ok(stamps[1].wrapping_sub(stamps[0]) as f64 * self.timestamp_period_ns as f64 / 1000.0)
             });
+            if self.is_lost() {
+                return time;
+            }
             d.destroy_descriptor_pool(desc_pool, None);
             d.destroy_pipeline(pipeline, None);
             d.destroy_pipeline_layout(layout, None);
@@ -477,6 +515,9 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        if self.is_lost() {
+            return;
+        }
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_query_pool(self.query_pool, None);
@@ -510,4 +551,18 @@ fn copy_region(img: &StorageImage) -> vk::BufferImageCopy {
 /// Push-constant bytes from 32-bit values in order.
 pub fn push_bytes(words: &[[u8; 4]]) -> Vec<u8> {
     words.iter().flatten().copied().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::PhysicalDeviceType as T;
+
+    #[test]
+    fn pick_device_prefers_real_gpus() {
+        assert_eq!(pick_device(&[T::CPU, T::INTEGRATED_GPU]), Some(1));
+        assert_eq!(pick_device(&[T::INTEGRATED_GPU, T::DISCRETE_GPU]), Some(1));
+        assert_eq!(pick_device(&[T::CPU]), Some(0));
+        assert_eq!(pick_device(&[]), None);
+    }
 }

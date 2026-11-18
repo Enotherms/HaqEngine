@@ -31,6 +31,11 @@ pub fn format_line(name: &str, r: &Result<CaseResult, String>) -> String {
     }
 }
 
+/// True when the GPU can no longer be trusted (hang or device loss): the run must stop.
+pub fn is_fatal(r: &Result<CaseResult, String>) -> bool {
+    matches!(r, Err(e) if e.contains("GPU timeout") || e.contains("ERROR_DEVICE_LOST"))
+}
+
 pub fn exit_code(results: &[Outcome], validation_errors: u32) -> i32 {
     if validation_errors == 0 && results.iter().all(|o| *o == Outcome::Pass) { 0 } else { 1 }
 }
@@ -57,6 +62,14 @@ mod tests {
         let r = Err("GPU timeout".to_string());
         assert_eq!(outcome(&r), Outcome::Fail);
         assert!(format_line("x", &r).contains("GPU timeout"));
+    }
+
+    #[test]
+    fn fatal_errors_stop_the_run() {
+        assert!(is_fatal(&Err("GPU timeout".into())));
+        assert!(is_fatal(&Err("submitting: ERROR_DEVICE_LOST".into())));
+        assert!(!is_fatal(&Err("creating an image: ERROR_OUT_OF_DEVICE_MEMORY".into())));
+        assert!(!is_fatal(&result(3)));
     }
 
     #[test]
