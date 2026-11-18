@@ -81,7 +81,7 @@ impl ChainCopy {
         &mut self,
         head: *const c_void,
         target: vk::StructureType,
-        size_of: fn(vk::StructureType) -> Option<usize>,
+        size_fn: fn(vk::StructureType) -> Option<usize>,
     ) -> PrefixCopy {
         let mut needed_words = 0usize;
         let mut cur = head as *const vk::BaseInStructure;
@@ -89,7 +89,7 @@ impl ChainCopy {
             if cur.is_null() {
                 return PrefixCopy::NotFound;
             }
-            let Some(size) = size_of((*cur).s_type) else {
+            let Some(size) = size_fn((*cur).s_type) else {
                 if Self::contains(cur, target) {
                     return PrefixCopy::Unsupported;
                 }
@@ -104,13 +104,14 @@ impl ChainCopy {
         if self.used + needed_words > CHAIN_BUF_WORDS {
             return PrefixCopy::Unsupported;
         }
+        let base = self.buf.as_mut_ptr();
         let mut first: *const c_void = std::ptr::null();
         let mut prev: *mut vk::BaseOutStructure = std::ptr::null_mut();
         let mut cur = head as *const vk::BaseInStructure;
         loop {
             let s_type = (*cur).s_type;
-            let size = size_of(s_type).expect("checked above");
-            let dst = self.buf.as_mut_ptr().add(self.used) as *mut u8;
+            let size = size_fn(s_type).expect("checked above");
+            let dst = base.add(self.used) as *mut u8;
             std::ptr::copy_nonoverlapping(cur as *const u8, dst, size);
             self.used += size.div_ceil(8);
             let copy = dst as *mut vk::BaseOutStructure;
