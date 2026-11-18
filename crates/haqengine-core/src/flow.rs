@@ -224,7 +224,8 @@ pub fn pick(
 }
 
 /// One output pixel at time `t`: picks the best candidate vector, then blends the two samples, or
-/// takes the nearer frame's sample when they disagree. Samplers return channels in `0..=scale`.
+/// takes the nearer frame's sample when they disagree. Candidates are scored on the level-0
+/// luma images; only the winner's colour is sampled.
 #[allow(clippy::too_many_arguments)]
 pub fn interpolate_pixel(
     sample_prev: impl Fn(f32, f32) -> [f32; 4],

@@ -223,7 +223,7 @@ fn warp_packed_case(
             time += us;
             let expected = packed::warp_blend_packed(f, prev, cur, &lp, &lc, flow_cpu, t);
             let report = packed::compare_packed(f, &expected, &actual, tol_steps);
-            reports.push(tolerate_rare(report, prev.width * prev.height)?);
+            reports.push(report);
         }
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: tol_steps })
     })();
@@ -264,7 +264,7 @@ fn battery_packed_case(gpu: &Gpu) -> Result<CaseResult, String> {
         require_recovery(&level0, [5.0, -3.0])?;
         let (lp, lc) = lumas?;
         let report = packed::compare_packed(f, &packed::warp_blend_packed(f, &pp, &cp, &lp, &lc, &level0, 0.5), &actual, 1.0);
-        reports.push(tolerate_rare(report, pp.width * pp.height)?);
+        reports.push(report);
         println!("      battery packed pipeline total {time:.1} us (budget 2000 us)");
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: 1.0 })
     })();
@@ -335,15 +335,6 @@ fn gpu_flows(gpu: &Gpu, prev: &Frame, cur: &Frame, time: &mut f64) -> Result<Flo
         return Err(e);
     }
     Ok(Flows { images, checks })
-}
-
-/// Warp results may differ beyond tolerance in at most 0.1% of pixels: float rounding in bilinear
-/// sampling can tip a near-tie between candidate vectors.
-fn tolerate_rare(report: CompareReport, total: u32) -> Result<CompareReport, String> {
-    if report.over_tolerance == u32::MAX || report.over_tolerance > total / 1000 {
-        return Err(format!("warp differs in {}/{} pixels, max 0.1%", report.over_tolerance, total));
-    }
-    Ok(CompareReport { over_tolerance: 0, ..report })
 }
 
 fn merge(reports: &[CompareReport]) -> CompareReport {
@@ -458,7 +449,7 @@ fn warp_case(gpu: &Gpu, prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow_cpu: &Flow
             ]);
             time += gpu.run(&WARP_BLEND, &[&gp, &gc, &gf, &dst, &glp, &glc], &push, groups(prev.width, prev.height))?;
             let report = compare_rgba8(&flow::warp_blend(prev, cur, &lp, &lc, flow_cpu, t), &gpu.read_rgba8(&dst)?, tol);
-            reports.push(tolerate_rare(report, prev.width * prev.height)?);
+            reports.push(report);
         }
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: tol as f32 })
     })();
@@ -512,7 +503,7 @@ fn battery_case(gpu: &Gpu) -> Result<CaseResult, String> {
         require_recovery(&level0, [5.0, -3.0])?;
         let (lp, lc) = (gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?);
         let report = compare_rgba8(&flow::warp_blend(&prev, &cur, &lp, &lc, &level0, 0.5), &warp?, BLEND_TOLERANCE);
-        reports.push(tolerate_rare(report, prev.width * prev.height)?);
+        reports.push(report);
         println!("      battery pipeline total {time:.1} us (budget 2000 us)");
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: BLEND_TOLERANCE as f32 })
     })();
@@ -543,6 +534,20 @@ fn still_square_scene() -> (Image<Rgba8>, Image<Rgba8>, Flow) {
         }
     }
     (prev, cur, flow)
+}
+
+/// A level-0 flow for a `width`×`height` frame whose vectors change from block to block.
+fn varied_flow(width: u32, height: u32) -> Flow {
+    let (bw, bh) = (width.div_ceil(2).div_ceil(BLOCK), height.div_ceil(2).div_ceil(BLOCK));
+    let mut flow = Image::new(bw, bh, [0.0f32, 0.0]);
+    for by in 0..bh {
+        for bx in 0..bw {
+            let x = ((bx * 7 + by * 3) % 9) as f32 - 4.0;
+            let y = ((bx * 5 + by * 11) % 7) as f32 - 3.0;
+            flow.set(bx, by, [x, y]);
+        }
+    }
+    flow
 }
 
 fn case(name: &str, run: impl Fn(&Gpu) -> Result<CaseResult, String> + 'static) -> Case {
@@ -632,6 +637,16 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
             let (prev, cur, flow) = still_square_scene();
             warp_case(g, &prev, &cur, &flow, &[0.5], BLEND_TOLERANCE)
         }),
+        case("warp_blend 1281x801 t=0.5 varied flow", |g| {
+            let prev = noise(1281, 801, 52);
+            warp_case(g, &prev, &shift(&prev, -6, 4), &varied_flow(1281, 801), &[0.5], BLEND_TOLERANCE)
+        }),
+        case("warp packed bgra8 1281x801 t=0.5 varied flow", |g| {
+            let f = PackedFormat::Bgra8;
+            let prev = noise(1281, 801, 53);
+            let cur = shift(&prev, -6, 4);
+            warp_packed_case(g, f, &packed::to_packed(f, &prev), &packed::to_packed(f, &cur), &varied_flow(1281, 801), &[0.5], 1.0)
+        }),
     ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
@@ -677,6 +692,8 @@ mod tests {
             "warp packed endpoints",
             "battery packed pipeline bgra8 total",
             "warp still square over moving background",
+            "warp_blend 1281x801 t=0.5 varied flow",
+            "warp packed bgra8 1281x801 t=0.5 varied flow",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }
