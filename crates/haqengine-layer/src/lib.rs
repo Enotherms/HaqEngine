@@ -1,6 +1,7 @@
 //! The HaqEngine Vulkan layer.
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
+pub mod battery;
 pub mod chain;
 pub mod device;
 pub mod extensions;

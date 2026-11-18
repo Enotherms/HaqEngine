@@ -1,12 +1,14 @@
 //! Per-swapchain resources for generated frames. Created once per swapchain, never per frame.
 
+use crate::battery::BatteryResources;
+use crate::pipelines::Pipelines;
 use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
 use ash::vk;
 use ash::vk::Handle;
-use haqengine_core::{should_log, FrameStats};
+use haqengine_core::{should_log, FrameStats, PackedFormat};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 /// Most wait semaphores a game present may carry for HaqEngine to duplicate it.
@@ -32,6 +34,11 @@ pub struct Ready {
     pub family: u32,
     pub pool: vk::CommandPool,
     pub slots: Vec<Slot>,
+    /// Two timestamps per slot, or null when the queue cannot time.
+    pub queries: vk::QueryPool,
+    pub timestamp_period_ns: f32,
+    /// Whether a slot's timestamps were written and can be read.
+    pub stamped: Vec<bool>,
 }
 
 pub struct GenStats {
@@ -40,6 +47,7 @@ pub struct GenStats {
     pub skipped: u64,
     pub intervals: FrameStats,
     pub present_cost: FrameStats,
+    pub gpu_cost: FrameStats,
     pub last_present: Option<Instant>,
     pub last_log_ms: u64,
 }
@@ -48,20 +56,25 @@ pub struct GenState {
     pub ready: Option<Ready>,
     pub next: usize,
     pub stats: GenStats,
+    pub battery: Option<BatteryResources>,
+    pub battery_failed: bool,
 }
 
 pub struct FrameGen {
     pub images: Vec<vk::Image>,
     pub extent: vk::Extent2D,
+    /// Battery mode's packed layout for this swapchain, or `None` for copy mode.
+    pub battery_format: Option<PackedFormat>,
     pub disabled: AtomicBool,
     pub state: Mutex<GenState>,
 }
 
 impl FrameGen {
-    pub fn new(images: Vec<vk::Image>, extent: vk::Extent2D) -> FrameGen {
+    pub fn new(images: Vec<vk::Image>, extent: vk::Extent2D, battery_format: Option<PackedFormat>) -> FrameGen {
         FrameGen {
             images,
             extent,
+            battery_format,
             disabled: AtomicBool::new(false),
             state: Mutex::new(GenState {
                 ready: None,
@@ -72,9 +85,12 @@ impl FrameGen {
                     skipped: 0,
                     intervals: FrameStats::new(),
                     present_cost: FrameStats::new(),
+                    gpu_cost: FrameStats::new(),
                     last_present: None,
                     last_log_ms: 0,
                 },
+                battery: None,
+                battery_failed: false,
             }),
         }
     }
@@ -94,7 +110,27 @@ impl FrameGen {
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER | vk::CommandPoolCreateFlags::TRANSIENT),
             None,
         )?;
-        let mut ready = Ready { family, pool, slots: Vec::with_capacity(self.images.len() + 2) };
+        let slot_count = self.images.len() + 2;
+        let family_props = device.queue_families.get(family as usize).copied().unwrap_or_default();
+        let queries = if family_props.timestamp_valid_bits > 0 {
+            d.create_query_pool(
+                &vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2 * slot_count as u32),
+                None,
+            )
+            .unwrap_or(vk::QueryPool::null())
+        } else {
+            vk::QueryPool::null()
+        };
+        let timestamp_period_ns =
+            device.instance.instance.get_physical_device_properties(device.physical_device).limits.timestamp_period;
+        let mut ready = Ready {
+            family,
+            pool,
+            slots: Vec::with_capacity(slot_count),
+            queries,
+            timestamp_period_ns,
+            stamped: vec![false; slot_count],
+        };
         let result = (|| -> Result<(), vk::Result> {
             let cmds = d.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -145,6 +181,9 @@ impl FrameGen {
         if let Some(ready) = state.ready.take() {
             destroy_ready(device, &ready);
         }
+        if let Some(battery) = state.battery.take() {
+            battery.destroy(&device.device);
+        }
     }
 }
 
@@ -166,6 +205,9 @@ unsafe fn destroy_ready(device: &DeviceData, ready: &Ready) {
         }
     }
     d.destroy_command_pool(ready.pool, None);
+    if ready.queries != vk::QueryPool::null() {
+        d.destroy_query_pool(ready.queries, None);
+    }
 }
 
 impl FrameGen {
@@ -192,6 +234,9 @@ impl FrameGen {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let next_present = device.swapchain.queue_present_khr;
         let pass = |st: &mut GenState, skipped: bool| {
+            if let Some(b) = st.battery.as_mut() {
+                b.forget_previous();
+            }
             let r = next_present(queue, pi);
             record(st, id, start, false, skipped);
             r
@@ -210,9 +255,10 @@ impl FrameGen {
             self.disable(id, "creating copy resources", e);
             return pass(&mut st, false);
         }
+        let slot_index = st.next % st.ready.as_ref().expect("ensure_ready succeeded").slots.len();
         let slot = {
             let ready = st.ready.as_ref().expect("ensure_ready succeeded");
-            let s = &ready.slots[st.next % ready.slots.len()];
+            let s = &ready.slots[slot_index];
             Slot { cmd: s.cmd, fence: s.fence, acquired: s.acquired, copy_ready: s.copy_ready, real_ready: s.real_ready }
         };
         st.next = st.next.wrapping_add(1);
@@ -225,6 +271,7 @@ impl FrameGen {
                 return pass(&mut st, false);
             }
         }
+        read_gpu_time(&mut st, d, slot_index);
         let swapchain = *pi.p_swapchains;
         let game_index = *pi.p_image_indices;
         let mut spare = 0u32;
@@ -250,10 +297,13 @@ impl FrameGen {
             self.disable(id, "image index out of range", vk::Result::ERROR_UNKNOWN);
             return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
         };
-        if let Err(e) = self.record_copy(d, slot.cmd, game_image, spare_image) {
-            self.disable(id, "recording the copy", e);
-            return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
-        }
+        let used_battery = match self.record_frame(&mut st, id, device, slot.cmd, slot_index, game_image, spare_image) {
+            Ok(b) => b,
+            Err(e) => {
+                self.disable(id, "recording the frame", e);
+                return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
+            }
+        };
         let mut waits = [vk::Semaphore::null(); MAX_WAITS + 1];
         let n = pi.wait_semaphore_count as usize;
         if n > 0 {
@@ -277,6 +327,14 @@ impl FrameGen {
             self.disable(id, "submitting the copy", e);
             return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
         }
+        if let Some(ready) = st.ready.as_mut() {
+            ready.stamped[slot_index] = ready.queries != vk::QueryPool::null();
+        }
+        if used_battery {
+            if let Some(b) = st.battery.as_mut() {
+                b.submitted();
+            }
+        }
         let copy_wait = [slot.copy_ready];
         let copy_indices = [spare];
         let swapchains = [swapchain];
@@ -294,8 +352,76 @@ impl FrameGen {
         combine_present_results(r_copy, r_real)
     }
 
+    /// Records this present's commands: battery interpolation when available, otherwise a copy,
+    /// bracketed by timestamps. Returns whether battery mode recorded the frame.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_frame(
+        &self,
+        st: &mut GenState,
+        id: u64,
+        device: &DeviceData,
+        cmd: vk::CommandBuffer,
+        slot_index: usize,
+        game: vk::Image,
+        spare: vk::Image,
+    ) -> Result<bool, vk::Result> {
+        let d = &device.device;
+        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+        d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+        let queries = st.ready.as_ref().map_or(vk::QueryPool::null(), |r| r.queries);
+        let first = 2 * slot_index as u32;
+        if queries != vk::QueryPool::null() {
+            d.cmd_reset_query_pool(cmd, queries, first, 2);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, first);
+        }
+        let pipelines = self.battery_pipelines(st, id, device);
+        let used_battery = match (pipelines, st.battery.as_mut()) {
+            (Some(p), Some(b)) => {
+                b.record(d, cmd, &p, game, spare);
+                true
+            }
+            _ => {
+                self.record_copy_body(d, cmd, game, spare);
+                false
+            }
+        };
+        if queries != vk::QueryPool::null() {
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, first + 1);
+        }
+        d.end_command_buffer(cmd)?;
+        Ok(used_battery)
+    }
+
+    /// The device's battery pipelines with this swapchain's resources created, or `None` for copy
+    /// mode (or after a creation failure, logged once).
+    unsafe fn battery_pipelines(&self, st: &mut GenState, id: u64, device: &DeviceData) -> Option<Arc<Pipelines>> {
+        let format = self.battery_format?;
+        if st.battery_failed {
+            return None;
+        }
+        let pipelines = match device.pipelines.get_or_init(|| Pipelines::create(&device.device).map(Arc::new)) {
+            Ok(p) => Arc::clone(p),
+            Err(e) => {
+                st.battery_failed = true;
+                LOG.log(&format!("battery mode off for swapchain {id}: creating pipelines {e:?}"));
+                return None;
+            }
+        };
+        if st.battery.is_none() {
+            match BatteryResources::create(device, &pipelines, self.extent, format) {
+                Ok(b) => st.battery = Some(b),
+                Err(e) => {
+                    st.battery_failed = true;
+                    LOG.log(&format!("battery mode off for swapchain {id}: creating resources {e:?}"));
+                    return None;
+                }
+            }
+        }
+        Some(pipelines)
+    }
+
     /// Records copying the game's image into the spare image, leaving both ready to present.
-    unsafe fn record_copy(&self, d: &ash::Device, cmd: vk::CommandBuffer, src: vk::Image, dst: vk::Image) -> Result<(), vk::Result> {
+    unsafe fn record_copy_body(&self, d: &ash::Device, cmd: vk::CommandBuffer, src: vk::Image, dst: vk::Image) {
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
@@ -311,8 +437,6 @@ impl FrameGen {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .subresource_range(range)
         };
-        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-        d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         let to_copy = [
             barrier(src, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ),
             barrier(dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
@@ -329,7 +453,6 @@ impl FrameGen {
             barrier(dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty()),
         ];
         d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &to_present);
-        d.end_command_buffer(cmd)
     }
 
     /// Error path after a spare image was acquired: present it as-is (waiting on its acquire
@@ -364,6 +487,21 @@ impl FrameGen {
     }
 }
 
+/// Reads a slot's GPU time from its previous use (the slot's fence has signalled).
+unsafe fn read_gpu_time(st: &mut GenState, d: &ash::Device, slot_index: usize) {
+    let Some(ready) = st.ready.as_mut() else { return };
+    if ready.queries == vk::QueryPool::null() || !ready.stamped[slot_index] {
+        return;
+    }
+    let mut stamps = [0u64; 2];
+    let r = d.get_query_pool_results(ready.queries, 2 * slot_index as u32, &mut stamps, vk::QueryResultFlags::TYPE_64);
+    ready.stamped[slot_index] = false;
+    if r.is_ok() && stamps[1] >= stamps[0] {
+        let us = (stamps[1] - stamps[0]) as f64 * ready.timestamp_period_ns as f64 / 1000.0;
+        st.stats.gpu_cost.push(us.min(u32::MAX as f64) as u32);
+    }
+}
+
 /// Updates counters and timing windows after one real present, logging every 10 seconds.
 fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: bool) {
     let now = Instant::now();
@@ -388,8 +526,13 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: 
         if let (Some(iv), Some(cost)) = (s.intervals.summary(), s.present_cost.summary()) {
             let real_fps = iv.count as f32 / secs;
             let out_per_real = if s.real > 0 { (s.real + s.generated) as f32 / s.real as f32 } else { 1.0 };
+            let gpu = s
+                .gpu_cost
+                .summary()
+                .map(|g| format!(", gpu {:.2} ms p99 {:.2}", g.mean_ms, g.p99_ms))
+                .unwrap_or_default();
             LOG.log(&format!(
-                "swapchain {id}: real {real_fps:.1} fps, out {:.1} fps, interval mean {:.2} ms sd {:.2} p99 {:.2}, added {:.2} ms p99 {:.2}, skipped {}",
+                "swapchain {id}: real {real_fps:.1} fps, out {:.1} fps, interval mean {:.2} ms sd {:.2} p99 {:.2}, added {:.2} ms p99 {:.2}, skipped {}{gpu}",
                 real_fps * out_per_real,
                 iv.mean_ms,
                 iv.stddev_ms,
@@ -401,6 +544,7 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: 
         }
         s.intervals.clear();
         s.present_cost.clear();
+        s.gpu_cost.clear();
         s.last_log_ms = now_ms;
     }
 }

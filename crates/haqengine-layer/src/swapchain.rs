@@ -3,6 +3,8 @@
 use crate::guard::guard;
 use crate::chain::{present_ext_size, swapchain_ext_size, ChainCopy, PrefixCopy};
 use crate::framegen::FrameGen;
+use crate::pipelines::packed_format;
+use haqengine_core::Mode;
 use crate::plan::plan_swapchain_with;
 use crate::state::{device_can_transfer, dispatch_key, multiplier, DeviceData, DEVICES, LOG};
 use ash::vk;
@@ -199,9 +201,15 @@ unsafe fn create_swapchain_inner(
                 Some(p) => p.reason,
             };
             let generate = plan.is_some_and(|p| p.generate) && r == vk::Result::SUCCESS && !images.is_empty();
+            let (battery_format, engine) = match (crate::state::SETTINGS.mode, packed_format(ci.image_format)) {
+                (Mode::Copy, _) => (None, " copy (mode copy)".to_string()),
+                (Mode::Battery, Some(f)) => (Some(f), " battery".to_string()),
+                (Mode::Battery, None) => (None, format!(" copy (format {:?} not supported)", ci.image_format)),
+            };
+            let engine = if generate { engine } else { String::new() };
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             LOG.log(&format!(
-                "swapchain {id}: {}x{} format {:?} colour {:?} images {count} mode {:?} gen {reason}{}",
+                "swapchain {id}: {}x{} format {:?} colour {:?} images {count} mode {:?} gen {reason}{engine}{}",
                 ci.image_extent.width,
                 ci.image_extent.height,
                 ci.image_format,
@@ -224,7 +232,7 @@ unsafe fn create_swapchain_inner(
                     images: count,
                     presents: AtomicU64::new(0),
                     device: Some(Arc::clone(&data)),
-                    gen: generate.then(|| FrameGen::new(images, ci.image_extent)),
+                    gen: generate.then(|| FrameGen::new(images, ci.image_extent, battery_format)),
                     fifo_only_modes,
                 },
             );
