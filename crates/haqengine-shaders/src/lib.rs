@@ -30,7 +30,8 @@ pub const LUMA_REDUCE: Shader = Shader {
 };
 
 /// One motion vector per 8×8 block: bindings 0 = prev `r32f`, 1 = cur `r32f`, 2 = coarse `rg32f`,
-/// 3 = output `rg32f`; push `{ w, h, coarse_w, coarse_h, radius: i32, use_coarse }`. One invocation per block.
+/// 3 = output `rg32f`; push `{ w, h, coarse_w, coarse_h, radius: i32, use_coarse }`. One workgroup
+/// (8×8 threads) per block: dispatch `blocks_w × blocks_h` groups. `radius` is at most 4.
 pub const BLOCK_MATCH: Shader = Shader {
     name: "block_match",
     spirv: include_bytes!(concat!(env!("OUT_DIR"), "/block_match.spv")),

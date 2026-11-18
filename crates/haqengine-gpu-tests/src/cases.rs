@@ -32,7 +32,7 @@ fn groups(w: u32, h: u32) -> [u32; 2] {
 }
 
 fn block_groups(blocks_w: u32, blocks_h: u32) -> [u32; 2] {
-    groups(blocks_w, blocks_h)
+    [blocks_w, blocks_h]
 }
 
 fn luma_case(gpu: &Gpu, input: &Image<Rgba8>) -> Result<CaseResult, String> {
