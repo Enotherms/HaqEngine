@@ -65,6 +65,19 @@ pub fn noise(width: u32, height: u32, seed: u64) -> Image<Rgba8> {
     img
 }
 
+/// `img` with its content moved by `(dx, dy)`; pixels uncovered at the edges repeat the border.
+pub fn shift(img: &Image<Rgba8>, dx: i32, dy: i32) -> Image<Rgba8> {
+    let (w, h) = (img.width as i32, img.height as i32);
+    let mut out = img.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = ((x - dx).clamp(0, w - 1), (y - dy).clamp(0, h - 1));
+            out.set(x as u32, y as u32, img.get(sx as u32, sy as u32));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
