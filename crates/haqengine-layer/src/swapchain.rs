@@ -137,8 +137,13 @@ unsafe fn create_swapchain_inner(
             let generate = plan.is_some_and(|p| p.generate) && r == vk::Result::SUCCESS && !images.is_empty();
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             LOG.log(&format!(
-                "swapchain {id}: {}x{} format {:?} colour {:?} images {count} mode {:?} gen {reason}",
-                ci.image_extent.width, ci.image_extent.height, ci.image_format, ci.image_color_space, planned.present_mode
+                "swapchain {id}: {}x{} format {:?} colour {:?} images {count} mode {:?} gen {reason}{}",
+                ci.image_extent.width,
+                ci.image_extent.height,
+                ci.image_format,
+                ci.image_color_space,
+                planned.present_mode,
+                game_present_modes(ci.p_next).map(|m| format!(" (game modes {m:?})")).unwrap_or_default()
             ));
             SWAPCHAINS.created(
                 (*out).as_raw(),

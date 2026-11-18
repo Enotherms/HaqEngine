@@ -4,6 +4,9 @@ use crate::guard::guard;
 use crate::state::{dispatch_key, multiplier, INSTANCES};
 use ash::vk;
 use std::ffi::{c_char, CStr};
+use std::sync::Once;
+
+static HID_REPORTED: Once = Once::new();
 
 /// Extensions hidden from games while HaqEngine generates frames. `VK_EXT_swapchain_maintenance1`
 /// lets a game switch present modes on every present, which breaks forced FIFO pacing; without it,
@@ -58,7 +61,11 @@ pub unsafe extern "system" fn enumerate_device_extension_properties(
             return r;
         }
         all.truncate(n as usize);
-        write_out(&filter_extensions(&all, HIDDEN_WHEN_GENERATING), count, props)
+        let shown = filter_extensions(&all, HIDDEN_WHEN_GENERATING);
+        if shown.len() < all.len() {
+            HID_REPORTED.call_once(|| crate::state::LOG.log("hid VK_EXT_swapchain_maintenance1 from the game"));
+        }
+        write_out(&shown, count, props)
     })
 }
 
