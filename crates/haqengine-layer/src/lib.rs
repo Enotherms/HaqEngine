@@ -5,6 +5,7 @@ pub mod device;
 pub mod guard;
 pub mod instance;
 pub mod loader_abi;
+pub mod plan;
 pub mod state;
 pub mod swapchain;
 
