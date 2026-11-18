@@ -1,7 +1,7 @@
 //! Swapchain and present pass-through. M0 only counts presents and forwards everything unchanged.
 
 use crate::guard::guard;
-use crate::state::{dispatch_key, DEVICES, LOG};
+use crate::state::{dispatch_key, DeviceData, DEVICES, LOG};
 use ash::vk;
 use ash::vk::Handle;
 use haqengine_core::HandleMap;
@@ -14,6 +14,8 @@ pub struct SwapchainInfo {
     pub format: vk::Format,
     pub images: u32,
     pub presents: AtomicU64,
+    /// The device that created it, used when a present arrives on a queue we can't map.
+    pub device: Option<Arc<DeviceData>>,
 }
 
 /// Live swapchains, keyed by raw handle.
@@ -36,6 +38,10 @@ impl SwapchainRegistry {
     }
     pub fn destroyed(&self, handle: u64) -> Option<Arc<SwapchainInfo>> {
         self.map.remove(handle as usize)
+    }
+    /// The device that created a live swapchain.
+    pub fn device_of(&self, handle: u64) -> Option<Arc<DeviceData>> {
+        self.map.get(handle as usize).and_then(|info| info.device.clone())
     }
 }
 
@@ -93,6 +99,7 @@ unsafe fn create_swapchain_inner(
                     format: ci.image_format,
                     images,
                     presents: AtomicU64::new(0),
+                    device: Some(Arc::clone(&data)),
                 },
             );
         });
@@ -128,7 +135,14 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
             }
         }
     });
-    match DEVICES.get(dispatch_key(queue)) {
+    let device = DEVICES.get(dispatch_key(queue)).or_else(|| {
+        let pi = &*present_info;
+        if pi.swapchain_count == 0 || pi.p_swapchains.is_null() {
+            return None;
+        }
+        SWAPCHAINS.device_of((*pi.p_swapchains).as_raw())
+    });
+    match device {
         Some(data) => (data.swapchain.queue_present_khr)(queue, present_info),
         None => {
             NO_DEVICE_REPORTED.call_once(|| LOG.log("error: present on an unknown device"));
@@ -156,7 +170,56 @@ mod tests {
             format: vk::Format::B8G8R8A8_UNORM,
             images: 3,
             presents: AtomicU64::new(0),
+            device: None,
         }
+    }
+
+    static FAKE_PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn fake_present(_: vk::Queue, _: *const vk::PresentInfoKHR) -> vk::Result {
+        FAKE_PRESENTS.fetch_add(1, Ordering::SeqCst);
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn fake_gdpa(_: vk::Device, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+        None
+    }
+
+    /// A device whose next layer only provides `vkQueuePresentKHR`, and a queue handle whose
+    /// dispatch key is not in `DEVICES`.
+    fn fake_device_and_stray_queue() -> (Arc<DeviceData>, vk::Queue) {
+        let device_word: &'static usize = Box::leak(Box::new(0x0dd0_0001));
+        let queue_word: &'static usize = Box::leak(Box::new(0x0dd0_0002));
+        let handle = vk::Device::from_raw(device_word as *const usize as u64);
+        let load = |name: &std::ffi::CStr| {
+            if name == c"vkQueuePresentKHR" { fake_present as *const std::ffi::c_void } else { std::ptr::null() }
+        };
+        let data = DeviceData {
+            next_gdpa: fake_gdpa,
+            device: unsafe { ash::Device::load_with(load, handle) },
+            swapchain: ash::khr::swapchain::DeviceFn::load(load),
+        };
+        (Arc::new(data), vk::Queue::from_raw(queue_word as *const usize as u64))
+    }
+
+    #[test]
+    fn present_on_unmapped_queue_uses_the_swapchains_device() {
+        let (device, queue) = fake_device_and_stray_queue();
+        let handle = 0x5c_0001u64;
+        SWAPCHAINS.created(handle, SwapchainInfo { device: Some(device), ..info(100) });
+        let swapchain = vk::SwapchainKHR::from_raw(handle);
+        let index = 0u32;
+        let present = vk::PresentInfoKHR {
+            swapchain_count: 1,
+            p_swapchains: &swapchain,
+            p_image_indices: &index,
+            ..Default::default()
+        };
+        let before = FAKE_PRESENTS.load(Ordering::SeqCst);
+        let result = unsafe { queue_present(queue, &present) };
+        SWAPCHAINS.destroyed(handle);
+        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(FAKE_PRESENTS.load(Ordering::SeqCst), before + 1);
     }
 
     #[test]
