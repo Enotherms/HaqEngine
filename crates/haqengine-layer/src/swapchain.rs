@@ -83,6 +83,17 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, present_info: *con
 static NO_DEVICE_REPORTED: Once = Once::new();
 static MODE_INFO_UNREWRITTEN: Once = Once::new();
 
+/// The structure types in a `pNext` chain, for diagnostics (at most 16).
+unsafe fn chain_types(p_next: *const std::ffi::c_void) -> Vec<i32> {
+    let mut out = Vec::new();
+    let mut cur = p_next as *const vk::BaseInStructure;
+    while !cur.is_null() && out.len() < 16 {
+        out.push((*cur).s_type.as_raw());
+        cur = (*cur).p_next;
+    }
+    out
+}
+
 /// True when a `pNext` chain contains a struct of type `s_type`.
 unsafe fn chain_has(p_next: *const std::ffi::c_void, s_type: vk::StructureType) -> bool {
     let mut cur = p_next as *const vk::BaseInStructure;
@@ -266,7 +277,10 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
                 && chain_has((*present_info).p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT)
             {
                 MODE_INFO_UNREWRITTEN.call_once(|| {
-                    LOG.log("warning: per-present mode info could not be rewritten to FIFO (unknown struct in the chain)")
+                    LOG.log(&format!(
+                        "warning: per-present mode info could not be rewritten to FIFO; chain {:?}",
+                        chain_types((*present_info).p_next)
+                    ))
                 });
             }
             let present_info: *const vk::PresentInfoKHR = match rewritten.as_ref() {
