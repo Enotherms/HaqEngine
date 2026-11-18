@@ -81,6 +81,19 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, present_info: *con
     guard("vkQueuePresentKHR", vk::Result::ERROR_DEVICE_LOST, || unsafe { queue_present_inner(queue, present_info) })
 }
 static NO_DEVICE_REPORTED: Once = Once::new();
+static MODE_INFO_UNREWRITTEN: Once = Once::new();
+
+/// True when a `pNext` chain contains a struct of type `s_type`.
+unsafe fn chain_has(p_next: *const std::ffi::c_void, s_type: vk::StructureType) -> bool {
+    let mut cur = p_next as *const vk::BaseInStructure;
+    while !cur.is_null() {
+        if (*cur).s_type == s_type {
+            return true;
+        }
+        cur = (*cur).p_next;
+    }
+    false
+}
 
 /// FIFO repeated, for rewritten present-mode lists (create: 1 entry; present: one per swapchain).
 pub static FIFO_MODES: [vk::PresentModeKHR; 16] = [vk::PresentModeKHR::FIFO; 16];
@@ -246,7 +259,16 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
     match device {
         Some(data) => {
             let mut chain = ChainCopy::new();
-            let rewritten = if any_fifo_only(&*present_info) { fifo_present_info(&*present_info, &mut chain) } else { None };
+            let fifo_only = any_fifo_only(&*present_info);
+            let rewritten = if fifo_only { fifo_present_info(&*present_info, &mut chain) } else { None };
+            if fifo_only
+                && rewritten.is_none()
+                && chain_has((*present_info).p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT)
+            {
+                MODE_INFO_UNREWRITTEN.call_once(|| {
+                    LOG.log("warning: per-present mode info could not be rewritten to FIFO (unknown struct in the chain)")
+                });
+            }
             let present_info: *const vk::PresentInfoKHR = match rewritten.as_ref() {
                 Some(pi) => pi,
                 None => present_info,
