@@ -12,19 +12,23 @@ pub struct SwapchainPlan {
     pub present_mode: vk::PresentModeKHR,
 }
 
-/// Like `plan_swapchain`, also told whether the game chains `VkSwapchainPresentModesCreateInfoEXT`
-/// (it then switches present modes itself, so FIFO cannot be forced).
+/// Like `plan_swapchain`, also given the modes the game lists in `VkSwapchainPresentModesCreateInfoEXT`
+/// (`None` when it chains none). Such a game may switch present modes itself on every present.
 pub fn plan_swapchain_with(
     ci: &vk::SwapchainCreateInfoKHR,
     caps: &vk::SurfaceCapabilitiesKHR,
     multiplier: u32,
     queue_can_transfer: bool,
-    game_manages_present_modes: bool,
+    game_present_modes: Option<&[vk::PresentModeKHR]>,
 ) -> SwapchainPlan {
-    if multiplier >= 2 && game_manages_present_modes {
+    let fifo_only = |modes: &[vk::PresentModeKHR]| {
+        modes.contains(&vk::PresentModeKHR::FIFO)
+            && modes.iter().all(|m| matches!(*m, vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED))
+    };
+    if multiplier >= 2 && game_present_modes.is_some_and(|m| !fifo_only(m)) {
         return SwapchainPlan {
             generate: false,
-            reason: "game manages present modes (swapchain_maintenance1)",
+            reason: "game present modes include non-FIFO (swapchain_maintenance1)",
             min_image_count: ci.min_image_count,
             image_usage: ci.image_usage,
             present_mode: ci.present_mode,
@@ -148,11 +152,28 @@ mod tests {
     }
 
     #[test]
-    fn plan_off_when_game_manages_present_modes() {
-        let c = ci(3, vk::PresentModeKHR::IMMEDIATE);
-        let p = plan_swapchain_with(&c, &caps(8, all_usage()), 2, true, true);
-        assert_unchanged(&p, &c);
-        assert!(p.reason.contains("present modes"));
+    fn plan_off_when_game_present_modes_include_non_fifo() {
+        let c = ci(3, vk::PresentModeKHR::FIFO);
+        for list in [
+            &[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX][..],
+            &[vk::PresentModeKHR::IMMEDIATE][..],
+            &[vk::PresentModeKHR::FIFO_RELAXED][..],
+        ] {
+            let p = plan_swapchain_with(&c, &caps(8, all_usage()), 2, true, Some(list));
+            assert_unchanged(&p, &c);
+            assert!(p.reason.contains("present modes"), "{list:?}");
+        }
+    }
+
+    #[test]
+    fn plan_generates_when_game_present_modes_are_fifo_only() {
+        let c = ci(3, vk::PresentModeKHR::FIFO);
+        for list in [&[vk::PresentModeKHR::FIFO][..], &[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::FIFO_RELAXED][..]] {
+            let p = plan_swapchain_with(&c, &caps(8, all_usage()), 2, true, Some(list));
+            assert!(p.generate, "{list:?}");
+            assert_eq!(p.present_mode, vk::PresentModeKHR::FIFO);
+        }
+        assert!(plan_swapchain_with(&c, &caps(8, all_usage()), 2, true, None).generate);
     }
 
     #[test]

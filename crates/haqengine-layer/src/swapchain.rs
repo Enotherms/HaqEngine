@@ -79,16 +79,20 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, present_info: *con
 }
 static NO_DEVICE_REPORTED: Once = Once::new();
 
-/// True when a `pNext` chain contains a struct of type `s_type`.
-unsafe fn chain_has(p_next: *const std::ffi::c_void, s_type: vk::StructureType) -> bool {
+/// The present modes listed in a chained `VkSwapchainPresentModesCreateInfoEXT`, if any.
+unsafe fn game_present_modes<'a>(p_next: *const std::ffi::c_void) -> Option<&'a [vk::PresentModeKHR]> {
     let mut cur = p_next as *const vk::BaseInStructure;
     while !cur.is_null() {
-        if (*cur).s_type == s_type {
-            return true;
+        if (*cur).s_type == vk::StructureType::SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT {
+            let info = &*(cur as *const vk::SwapchainPresentModesCreateInfoEXT);
+            if info.p_present_modes.is_null() {
+                return Some(&[]);
+            }
+            return Some(std::slice::from_raw_parts(info.p_present_modes, info.present_mode_count as usize));
         }
         cur = (*cur).p_next;
     }
-    false
+    None
 }
 
 unsafe fn create_swapchain_inner(
@@ -108,9 +112,9 @@ unsafe fn create_swapchain_inner(
             ci.surface,
             &mut caps,
         );
-        let manages_modes = chain_has(ci.p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT);
+        let game_modes = game_present_modes(ci.p_next);
         (r == vk::Result::SUCCESS)
-            .then(|| plan_swapchain_with(ci, &caps, multiplier(), device_can_transfer(&data), manages_modes))
+            .then(|| plan_swapchain_with(ci, &caps, multiplier(), device_can_transfer(&data), game_modes))
     });
     let mut planned = *ci;
     if let Some(p) = plan.filter(|p| p.generate) {
