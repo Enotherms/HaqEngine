@@ -2,6 +2,7 @@
 
 pub mod flow;
 pub mod fsr3_flow;
+pub mod fsr3_interp;
 pub mod handle_map;
 pub mod image;
 pub mod log;
