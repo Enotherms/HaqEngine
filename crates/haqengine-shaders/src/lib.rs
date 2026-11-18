@@ -45,9 +45,17 @@ pub const WARP_BLEND: Shader = Shader {
     local_size: [8, 8],
 };
 
+/// 3×3 component-wise median of a flow field: bindings 0 = input `rg32f`, 1 = output `rg32f`;
+/// push `{ w, h }`.
+pub const FLOW_MEDIAN: Shader = Shader {
+    name: "flow_median",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/flow_median.spv")),
+    local_size: [8, 8],
+};
+
 /// Every shader HaqEngine ships.
 pub fn all() -> &'static [Shader] {
-    &[LUMA_DOWNSAMPLE, BLEND, LUMA_REDUCE, BLOCK_MATCH, WARP_BLEND]
+    &[LUMA_DOWNSAMPLE, BLEND, LUMA_REDUCE, BLOCK_MATCH, WARP_BLEND, FLOW_MEDIAN]
 }
 
 #[cfg(test)]
@@ -66,6 +74,6 @@ mod tests {
     #[test]
     fn all_lists_every_shader() {
         let names: Vec<&str> = all().iter().map(|s| s.name).collect();
-        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend"]);
+        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median"]);
     }
 }

@@ -120,12 +120,38 @@ pub fn block_sad(prev: &Image<f32>, cur: &Image<f32>, bx: u32, by: u32, offset: 
     sad
 }
 
+/// Component-wise median of each block's 3×3 neighbourhood (cells that exist), so one wrong
+/// coarse vector cannot mislead the finer level.
+pub fn median_flow(flow: &Flow) -> Flow {
+    let mut out = flow.clone();
+    for by in 0..flow.height as i32 {
+        for bx in 0..flow.width as i32 {
+            let (mut xs, mut ys) = (Vec::with_capacity(9), Vec::with_capacity(9));
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (x, y) = (bx + dx, by + dy);
+                    if x >= 0 && y >= 0 && x < flow.width as i32 && y < flow.height as i32 {
+                        let v = flow.get(x as u32, y as u32);
+                        xs.push(v[0]);
+                        ys.push(v[1]);
+                    }
+                }
+            }
+            xs.sort_by(f32::total_cmp);
+            ys.sort_by(f32::total_cmp);
+            let mid = (xs.len() - 1) / 2;
+            out.set(bx as u32, by as u32, [xs[mid], ys[mid]]);
+        }
+    }
+    out
+}
+
 /// Level-0 flow between two pyramids, coarse to fine.
 pub fn estimate_flow(prev: &[Image<f32>], cur: &[Image<f32>]) -> Flow {
     let top = prev.len() - 1;
     let mut flow = block_match(&prev[top], &cur[top], None, RADIUS_COARSE);
     for level in (0..top).rev() {
-        flow = block_match(&prev[level], &cur[level], Some(&flow), RADIUS_FINE);
+        flow = block_match(&prev[level], &cur[level], Some(&median_flow(&flow)), RADIUS_FINE);
     }
     flow
 }
@@ -195,6 +221,44 @@ mod tests {
     #[test]
     fn recovers_known_shift() {
         let prev = noise(512, 320, 9);
+        let cur = shift(&prev, 12, -8);
+        let flow = estimate_flow(&pyramid(&prev), &pyramid(&cur));
+        let (mut hits, mut total) = (0, 0);
+        for by in 2..flow.height - 2 {
+            for bx in 2..flow.width - 2 {
+                total += 1;
+                if flow.get(bx, by) == [6.0, -4.0] {
+                    hits += 1;
+                }
+            }
+        }
+        assert!(hits * 100 >= total * 95, "{hits}/{total}");
+    }
+
+    #[test]
+    fn median_removes_isolated_outlier() {
+        let mut f = Image::new(5, 5, [2.0f32, -1.0]);
+        f.set(2, 2, [30.0, 30.0]);
+        assert!(median_flow(&f).data.iter().all(|v| *v == [2.0, -1.0]));
+    }
+
+    #[test]
+    fn median_keeps_uniform_field() {
+        let f = Image::new(4, 3, [6.0f32, -4.0]);
+        assert_eq!(median_flow(&f), f);
+    }
+
+    #[test]
+    fn median_edges_use_existing_cells() {
+        let f = Image { width: 2, height: 1, data: vec![[1.0f32, 5.0], [3.0, 7.0]] };
+        let m = median_flow(&f);
+        assert_eq!(m.get(0, 0), [1.0, 5.0]);
+        assert_eq!(m.get(1, 0), [1.0, 5.0]);
+    }
+
+    #[test]
+    fn recovers_known_shift_1280_seed7() {
+        let prev = noise(1280, 800, 7);
         let cur = shift(&prev, 12, -8);
         let flow = estimate_flow(&pyramid(&prev), &pyramid(&cur));
         let (mut hits, mut total) = (0, 0);

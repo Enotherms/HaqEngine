@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rg32f) uniform readonly image2D src;
+layout(set = 0, binding = 1, rg32f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Push {
+    uint w;
+    uint h;
+} pc;
+
+void main() {
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    if (b.x >= int(pc.w) || b.y >= int(pc.h)) {
+        return;
+    }
+    float xs[9];
+    float ys[9];
+    int n = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 c = b + ivec2(dx, dy);
+            if (c.x >= 0 && c.y >= 0 && c.x < int(pc.w) && c.y < int(pc.h)) {
+                vec2 v = imageLoad(src, c).rg;
+                xs[n] = v.x;
+                ys[n] = v.y;
+                n++;
+            }
+        }
+    }
+    for (int i = 1; i < n; i++) {
+        float kx = xs[i];
+        float ky = ys[i];
+        int j = i - 1;
+        while (j >= 0 && xs[j] > kx) {
+            xs[j + 1] = xs[j];
+            j--;
+        }
+        xs[j + 1] = kx;
+        j = i - 1;
+        while (j >= 0 && ys[j] > ky) {
+            ys[j + 1] = ys[j];
+            j--;
+        }
+        ys[j + 1] = ky;
+    }
+    int mid = (n - 1) / 2;
+    imageStore(dst, b, vec4(xs[mid], ys[mid], 0.0, 0.0));
+}

@@ -7,7 +7,7 @@ use haqengine_core::{
     blend, checker, compare_f32, compare_rg32f, compare_rgba8, gradient, luma_downsample, noise, shift, CompareReport,
     Image, Rgba8,
 };
-use haqengine_shaders::{BLEND, BLOCK_MATCH, LUMA_DOWNSAMPLE, LUMA_REDUCE, WARP_BLEND};
+use haqengine_shaders::{BLEND, BLOCK_MATCH, FLOW_MEDIAN, LUMA_DOWNSAMPLE, LUMA_REDUCE, WARP_BLEND};
 
 pub const LUMA_TOLERANCE: f32 = 1e-5;
 pub const BLEND_TOLERANCE: u8 = 1;
@@ -29,6 +29,10 @@ pub struct Case {
 
 fn groups(w: u32, h: u32) -> [u32; 2] {
     [w.div_ceil(8), h.div_ceil(8)]
+}
+
+fn block_groups(blocks_w: u32, blocks_h: u32) -> [u32; 2] {
+    groups(blocks_w, blocks_h)
 }
 
 fn luma_case(gpu: &Gpu, input: &Image<Rgba8>) -> Result<CaseResult, String> {
@@ -124,33 +128,50 @@ struct Flows {
 fn gpu_flows(gpu: &Gpu, prev: &Frame, cur: &Frame, time: &mut f64) -> Result<Flows, String> {
     let dummy = gpu.create_storage_image(vk::Format::R32G32_SFLOAT, 1, 1)?;
     let mut by_level: Vec<Option<StorageImage>> = (0..LEVELS).map(|_| None).collect();
+    let mut medians: Vec<StorageImage> = Vec::new();
     let mut checks = vec![CompareReport { max_diff: 0.0, worst: None, over_tolerance: 0 }; LEVELS];
     let result = (|| {
+        let mut coarse: Option<usize> = None;
         for level in (0..LEVELS).rev() {
             let (pl, cl) = (&prev.levels[level], &cur.levels[level]);
             let (bw, bh) = (pl.width.div_ceil(BLOCK), pl.height.div_ceil(BLOCK));
             let out = gpu.create_storage_image(vk::Format::R32G32_SFLOAT, bw, bh)?;
             gpu.clear(&out, CANARY_FLOAT)?;
-            let coarse = by_level.get(level + 1).and_then(|c| c.as_ref());
-            let radius = if coarse.is_some() { RADIUS_FINE } else { RADIUS_COARSE };
-            let (cw, ch) = coarse.map_or((1, 1), |c| (c.width, c.height));
+            let coarse_img = coarse.map(|i| &medians[i]);
+            let radius = if coarse_img.is_some() { RADIUS_FINE } else { RADIUS_COARSE };
+            let (cw, ch) = coarse_img.map_or((1, 1), |c| (c.width, c.height));
             let push = push_bytes(&[
                 pl.width.to_le_bytes(),
                 pl.height.to_le_bytes(),
                 cw.to_le_bytes(),
                 ch.to_le_bytes(),
                 radius.to_le_bytes(),
-                (coarse.is_some() as u32).to_le_bytes(),
+                (coarse_img.is_some() as u32).to_le_bytes(),
             ]);
-            *time += gpu.run(&BLOCK_MATCH, &[pl, cl, coarse.unwrap_or(&dummy), &out], &push, groups(bw, bh))?;
-            let cpu_coarse: Option<Flow> = coarse.map(|c| gpu.read_rg32f(c)).transpose()?;
+            *time += gpu.run(&BLOCK_MATCH, &[pl, cl, coarse_img.unwrap_or(&dummy), &out], &push, block_groups(bw, bh))?;
+            let cpu_coarse: Option<Flow> = coarse_img.map(|c| gpu.read_rg32f(c)).transpose()?;
+            let gpu_flow = gpu.read_rg32f(&out)?;
             let expected = flow::block_match(&gpu.read_r32f(pl)?, &gpu.read_r32f(cl)?, cpu_coarse.as_ref(), radius);
-            checks[level] = compare_rg32f(&expected, &gpu.read_rg32f(&out)?, 0.0);
+            let mut report = compare_rg32f(&expected, &gpu_flow, 0.0);
+            if level > 0 {
+                let median = gpu.create_storage_image(vk::Format::R32G32_SFLOAT, bw, bh)?;
+                gpu.clear(&median, CANARY_FLOAT)?;
+                let push = push_bytes(&[bw.to_le_bytes(), bh.to_le_bytes()]);
+                *time += gpu.run(&FLOW_MEDIAN, &[&out, &median], &push, groups(bw, bh))?;
+                let median_check = compare_rg32f(&flow::median_flow(&gpu_flow), &gpu.read_rg32f(&median)?, 0.0);
+                report = merge(&[report, median_check]);
+                medians.push(median);
+                coarse = Some(medians.len() - 1);
+            }
+            checks[level] = report;
             by_level[level] = Some(out);
         }
         Ok(())
     })();
     gpu.destroy_image(dummy);
+    for m in medians {
+        gpu.destroy_image(m);
+    }
     let images: Vec<StorageImage> = by_level.into_iter().flatten().collect();
     if let Err(e) = result {
         for img in images {
