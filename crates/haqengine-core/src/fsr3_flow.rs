@@ -155,9 +155,10 @@ pub fn of_schedule(width: u32, height: u32, frame_index: u32) -> Vec<OfDispatch>
     out
 }
 
-/// An FSR 3 level-0 flow texel as a HaqEngine vector: `cur(p) ≈ prev(p − v)`, in pixels.
+/// An FSR 3 level-0 flow texel as a HaqEngine vector: `cur(p) ≈ prev(p − v)`, in pixels. FSR 3
+/// stores the opposite vector, from the current frame back to the previous one.
 pub fn ffx_to_haq(v: [i16; 2]) -> [f32; 2] {
-    [v[0] as f32, v[1] as f32]
+    [-(v[0] as f32), -(v[1] as f32)]
 }
 
 #[cfg(test)]
@@ -243,6 +244,13 @@ mod tests {
         let last = even.last().unwrap();
         assert_eq!(last.pass, PASS_FILTER);
         assert_eq!(last.bind[1], (1, OfRes::Output));
+    }
+
+    #[test]
+    fn ffx_vectors_point_back_to_the_previous_frame() {
+        assert_eq!(ffx_to_haq([-12, 8]), [12.0, -8.0]);
+        assert_eq!(ffx_to_haq([96, 0]), [-96.0, 0.0]);
+        assert_eq!(ffx_to_haq([0, 0]), [0.0, 0.0]);
     }
 
     #[test]

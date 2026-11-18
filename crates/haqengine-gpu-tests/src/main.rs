@@ -3,6 +3,7 @@
 //! Usage: `haqengine-gpu-tests [--validation] [--filter <text>] [--self-test-fail]`
 
 mod cases;
+mod fsr3;
 mod gpu;
 mod report;
 
@@ -44,6 +45,7 @@ fn main() {
         }
     };
     println!("device: {}", gpu.device_name);
+    println!("subgroup size {} (arithmetic in compute: {})", gpu.subgroup_size, gpu.subgroup_ok);
     let mut outcomes = Vec::new();
     for case in cases::all_cases(args.self_test_fail) {
         if args.filter.as_deref().is_some_and(|f| !case.name.contains(f)) {

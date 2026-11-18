@@ -1,5 +1,6 @@
 //! The GPU test cases: each runs one shader on a test image and compares with the CPU reference.
 
+use crate::fsr3::run_sequence;
 use crate::gpu::{push_bytes, Gpu, StorageImage};
 use ash::vk;
 use haqengine_core::flow::{self, Flow, BLOCK, LEVELS, RADIUS_COARSE, RADIUS_FINE};
@@ -550,6 +551,162 @@ fn varied_flow(width: u32, height: u32) -> Flow {
     flow
 }
 
+/// `n + 1` frames of a pan: frame `k` is the base noise moved by `k·(dx, dy)` pixels.
+fn pan_frames(width: u32, height: u32, dx: i32, dy: i32, n: u32, seed: u64) -> Vec<Image<Rgba8>> {
+    let base = noise(width + n * dx.unsigned_abs(), height + n * dy.unsigned_abs(), seed);
+    let (cx, cy) = (n as i32 * dx.max(0), n as i32 * dy.max(0));
+    (0..=n as i32)
+        .map(|k| {
+            let mut f = Image::new(width, height, [0u8, 0, 0, 255]);
+            for y in 0..height as i32 {
+                for x in 0..width as i32 {
+                    f.set(x as u32, y as u32, base.get((x - k * dx + cx) as u32, (y - k * dy + cy) as u32));
+                }
+            }
+            f
+        })
+        .collect()
+}
+
+const FSR3_FRAMES: u32 = 7;
+
+fn near(v: [f32; 2], want: [f32; 2]) -> bool {
+    (v[0] - want[0]).abs() <= 1.0 && (v[1] - want[1]).abs() <= 1.0
+}
+
+fn fsr3_hits(flow: &Flow, want: [f32; 2], keep: impl Fn(u32, u32) -> bool) -> (u32, u32) {
+    let (mut hits, mut total) = (0, 0);
+    for by in 2..flow.height.saturating_sub(2) {
+        for bx in 2..flow.width.saturating_sub(2) {
+            if keep(bx, by) {
+                total += 1;
+                hits += near(flow.get(bx, by), want) as u32;
+            }
+        }
+    }
+    (hits, total)
+}
+
+fn require_fsr3(flow: &Flow, want: [f32; 2], what: &str, keep: impl Fn(u32, u32) -> bool) -> Result<(), String> {
+    let (hits, total) = fsr3_hits(flow, want, keep);
+    if total == 0 || hits * 100 < total * 95 {
+        return Err(format!("{what}: {hits}/{total} blocks within 1 px of {want:?}, need 95%; most common {}", common(flow)));
+    }
+    Ok(())
+}
+
+fn common(flow: &Flow) -> String {
+    let mut counts: Vec<([f32; 2], u32)> = Vec::new();
+    for v in &flow.data {
+        match counts.iter_mut().find(|(c, _)| c == v) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((*v, 1)),
+        }
+    }
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+    counts.iter().take(3).map(|(v, n)| format!("{v:?}x{n}")).collect::<Vec<_>>().join(" ")
+}
+
+/// True when the 8×8 block's content was inside the previous frame of a `(dx, dy)` pan.
+fn seen_before(bx: u32, by: u32, width: u32, height: u32, dx: i32, dy: i32) -> bool {
+    let (x0, y0) = ((bx * 8) as i32 - dx, (by * 8) as i32 - dy);
+    x0 >= 0 && y0 >= 0 && x0 + 8 <= width as i32 && y0 + 8 <= height as i32
+}
+
+fn fsr3_ready(gpu: &Gpu) -> Result<(), String> {
+    if gpu.subgroup_ok {
+        Ok(())
+    } else {
+        Err("the device lacks subgroup arithmetic in compute".into())
+    }
+}
+
+fn fsr3_result(gpu_us: f64) -> CaseResult {
+    CaseResult { report: CompareReport { max_diff: 0.0, worst: None, over_tolerance: 0 }, gpu_us, tolerance: 1.0 }
+}
+
+fn fsr3_shift_case(gpu: &Gpu, width: u32, height: u32, dx: i32, dy: i32, frames: u32) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let (flow, _, us, _) = run_sequence(gpu, &pan_frames(width, height, dx, dy, frames, 61))?;
+    require_fsr3(&flow, [dx as f32, dy as f32], "pan", |bx, by| seen_before(bx, by, width, height, dx, dy))?;
+    Ok(fsr3_result(us))
+}
+
+fn fsr3_black_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let black = Image::new(1280, 800, [0u8, 0, 0, 255]);
+    let frames: Vec<_> = (0..=FSR3_FRAMES).map(|_| black.clone()).collect();
+    let (flow, _, us, _) = run_sequence(gpu, &frames)?;
+    if let Some(v) = flow.data.iter().find(|v| **v != [0.0, 0.0]) {
+        return Err(format!("flat black gave vector {v:?}"));
+    }
+    Ok(fsr3_result(us))
+}
+
+fn fsr3_square_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let square = checker(96, 96, 6);
+    let (sx, sy) = (592u32, 352u32);
+    let frames: Vec<_> = pan_frames(1280, 800, 16, 0, FSR3_FRAMES, 51)
+        .into_iter()
+        .map(|mut f| {
+            for y in 0..square.height {
+                for x in 0..square.width {
+                    f.set(sx + x, sy + y, square.get(x, y));
+                }
+            }
+            f
+        })
+        .collect();
+    let (flow, _, us, _) = run_sequence(gpu, &frames)?;
+    let inside = |bx: u32, by: u32| bx * 8 >= sx + 8 && bx * 8 + 8 <= sx + 88 && by * 8 >= sy + 8 && by * 8 + 8 <= sy + 88;
+    let far = |bx: u32, by: u32| {
+        let (x0, y0, x1, y1) = (bx * 8, by * 8, bx * 8 + 8, by * 8 + 8);
+        x1 + 32 <= sx || x0 >= sx + 96 + 32 || y1 + 32 <= sy || y0 >= sy + 96 + 32
+    };
+    require_fsr3(&flow, [0.0, 0.0], "square", inside)?;
+    require_fsr3(&flow, [16.0, 0.0], "background", far)?;
+    Ok(fsr3_result(us))
+}
+
+fn fsr3_scene_cut_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let mut frames = pan_frames(1280, 800, 12, -8, FSR3_FRAMES, 71);
+    let (_, calm, _, _) = run_sequence(gpu, &frames)?;
+    frames.push(gradient(1280, 800));
+    let (_, cut, us, _) = run_sequence(gpu, &frames)?;
+    let value = |s: [u32; 3]| f32::from_bits(s[0]);
+    println!(
+        "      scene change value calm {:.3} history {:#x}, cut {:.3} history {:#x}",
+        value(calm),
+        calm[1],
+        value(cut),
+        cut[1]
+    );
+    if calm[1] & 1 != 0 || cut[1] & 1 == 0 {
+        return Err(format!("history bits calm {:#x} cut {:#x}: expected the cut only on the new frame", calm[1], cut[1]));
+    }
+    Ok(fsr3_result(us))
+}
+
+fn fsr3_pipeline_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let frames = pan_frames(1280, 800, 12, -8, FSR3_FRAMES, 81);
+    let (flow, _, us, passes) = run_sequence(gpu, &frames)?;
+    require_fsr3(&flow, [12.0, -8.0], "pan", |_, _| true)?;
+    let names = ["prepare luma", "pyramid", "scd histogram", "scd divergence", "search", "filter", "scale"];
+    let detail: Vec<String> = names.iter().zip(passes.passes).map(|(n, t)| format!("{n} {t:.0}")).collect();
+    println!("      fsr3 flow pipeline total {us:.1} us (budget 2000 us): {}", detail.join(", "));
+    let levels: Vec<String> = passes.search_by_level.iter().enumerate().map(|(l, t)| format!("L{l} {t:.0}")).collect();
+    println!("      fsr3 search by level: {}", levels.join(", "));
+    let (prev, cur) = (&frames[frames.len() - 2], &frames[frames.len() - 1]);
+    let battery = flow::estimate_flow(&flow::pyramid(prev), &flow::pyramid(cur));
+    let (bh, bt) = interior_hits(&battery, [6.0, -4.0]);
+    let (fh, ft) = fsr3_hits(&flow, [12.0, -8.0], |_, _| true);
+    println!("      recovery fsr3 {fh}/{ft} (within 1 px), battery {bh}/{bt} (exact)");
+    Ok(fsr3_result(us))
+}
+
 fn case(name: &str, run: impl Fn(&Gpu) -> Result<CaseResult, String> + 'static) -> Case {
     Case { name: name.to_string(), run: Box::new(run) }
 }
@@ -648,6 +805,16 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
             warp_packed_case(g, f, &packed::to_packed(f, &prev), &packed::to_packed(f, &cur), &varied_flow(1281, 801), &[0.5], 1.0)
         }),
     ]);
+    cases.extend([
+        case("fsr3 flow 1280x800 shift(12,-8)", |g| fsr3_shift_case(g, 1280, 800, 12, -8, FSR3_FRAMES)),
+        case("fsr3 flow 1281x801 shift(-6,4)", |g| fsr3_shift_case(g, 1281, 801, -6, 4, FSR3_FRAMES)),
+        case("fsr3 flow large shift 96px", |g| fsr3_shift_case(g, 1280, 800, 96, 0, FSR3_FRAMES)),
+        case("fsr3 flow flat black", fsr3_black_case),
+        case("fsr3 flow still square over moving background", fsr3_square_case),
+        case("fsr3 flow second frame parity", |g| fsr3_shift_case(g, 1280, 800, 12, -8, FSR3_FRAMES + 1)),
+        case("fsr3 scene cut detection", fsr3_scene_cut_case),
+        case("fsr3 flow pipeline 1280x800 total", fsr3_pipeline_case),
+    ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
             blend_case(g, &noise(64, 64, 4), &gradient(64, 64), 0.5, 0.6)
@@ -694,6 +861,14 @@ mod tests {
             "warp still square over moving background",
             "warp_blend 1281x801 t=0.5 varied flow",
             "warp packed bgra8 1281x801 t=0.5 varied flow",
+            "fsr3 flow 1280x800 shift(12,-8)",
+            "fsr3 flow 1281x801 shift(-6,4)",
+            "fsr3 flow large shift 96px",
+            "fsr3 flow flat black",
+            "fsr3 flow still square over moving background",
+            "fsr3 flow second frame parity",
+            "fsr3 scene cut detection",
+            "fsr3 flow pipeline 1280x800 total",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

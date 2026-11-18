@@ -2,7 +2,7 @@
 
 use ash::vk;
 use haqengine_core::{Image, Rgba8};
-use haqengine_shaders::Shader;
+use haqengine_shaders::{BindingKind, Fsr3Pass, Shader};
 use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -51,6 +51,8 @@ pub struct Gpu {
     memory: vk::PhysicalDeviceMemoryProperties,
     lost: AtomicBool,
     pub device_name: String,
+    pub subgroup_size: u32,
+    pub subgroup_ok: bool,
 }
 
 /// Index of the device to test on: a discrete or integrated GPU first, never a CPU renderer
@@ -135,10 +137,24 @@ impl Gpu {
             let (physical, family, valid_bits) =
                 pick_device(&types).map(|i| candidates[i]).ok_or("no GPU with a compute queue")?;
             let props = instance.get_physical_device_properties(physical);
+            let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+            instance.get_physical_device_properties2(physical, &mut props2);
+            let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC;
+            let subgroup_ok = subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
+                && subgroup.supported_operations.contains(needed);
+            let subgroup_size = subgroup.subgroup_size;
+            let supported = instance.get_physical_device_features(physical);
+            let features = vk::PhysicalDeviceFeatures::default()
+                .shader_storage_image_extended_formats(supported.shader_storage_image_extended_formats == vk::TRUE);
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
             let device = instance
-                .create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&queue_info), None)
+                .create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_features(&features),
+                    None,
+                )
                 .map_err(|e| err("creating the device", e))?;
             let queue = device.get_device_queue(family, 0);
             let pool = device
@@ -169,6 +185,8 @@ impl Gpu {
                 memory,
                 lost: AtomicBool::new(false),
                 device_name: props.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                subgroup_size,
+                subgroup_ok,
             })
         }
     }
@@ -301,7 +319,10 @@ impl Gpu {
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
                         .usage(
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+                            vk::ImageUsageFlags::STORAGE
+                                | vk::ImageUsageFlags::SAMPLED
+                                | vk::ImageUsageFlags::TRANSFER_SRC
+                                | vk::ImageUsageFlags::TRANSFER_DST,
                         )
                         .initial_layout(vk::ImageLayout::UNDEFINED),
                     None,
@@ -400,6 +421,22 @@ impl Gpu {
         let bytes: Vec<u8> = src.data.iter().flatten().copied().collect();
         unsafe { self.copy_in(&img, &bytes)? };
         Ok(img)
+    }
+
+    /// Replaces the contents of an existing `R8G8B8A8_UNORM` image.
+    pub fn write_rgba8(&self, img: &StorageImage, src: &Image<Rgba8>) -> Result<(), String> {
+        let bytes: Vec<u8> = src.data.iter().flatten().copied().collect();
+        unsafe { self.copy_in(img, &bytes) }
+    }
+
+    pub fn read_rg16i(&self, img: &StorageImage) -> Result<Image<[i16; 2]>, String> {
+        let n = (img.width * img.height) as usize;
+        let bytes = unsafe { self.copy_out(img, n * 4)? };
+        let data = bytes
+            .chunks_exact(4)
+            .map(|c| [i16::from_le_bytes([c[0], c[1]]), i16::from_le_bytes([c[2], c[3]])])
+            .collect();
+        Ok(Image { width: img.width, height: img.height, data })
     }
 
     pub fn upload_u32(&self, src: &Image<u32>) -> Result<StorageImage, String> {
@@ -559,6 +596,160 @@ impl Gpu {
             d.destroy_descriptor_set_layout(set_layout, None);
             d.destroy_shader_module(module, None);
             time
+        }
+    }
+
+    /// Runs one dispatch of an FSR 3 pass and returns its GPU time in µs. `images` maps binding
+    /// numbers to images; `constants` fills the pass's uniform buffers in binding order.
+    pub fn run_fsr3(
+        &self,
+        pass: &Fsr3Pass,
+        images: &[(u32, &StorageImage)],
+        constants: &[&[u8]],
+        groups: [u32; 3],
+    ) -> Result<f64, String> {
+        let kind_of = |k: BindingKind| match k {
+            BindingKind::StorageImage => vk::DescriptorType::STORAGE_IMAGE,
+            BindingKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
+            BindingKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+        };
+        let mut cb_bindings: Vec<u32> =
+            pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).map(|b| b.0).collect();
+        cb_bindings.sort_unstable();
+        if cb_bindings.len() != constants.len() {
+            return Err(format!("{} needs {} constant blocks, got {}", pass.name, cb_bindings.len(), constants.len()));
+        }
+        for (b, kind) in pass.bindings {
+            if *kind != BindingKind::UniformBuffer && !images.iter().any(|(n, _)| n == b) {
+                return Err(format!("{} binding {b} has no image", pass.name));
+            }
+        }
+        unsafe {
+            let d = &self.device;
+            let mut buffers = Vec::new();
+            let result = (|| {
+                for bytes in constants {
+                    let (buffer, memory) = self.host_buffer(bytes.len() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+                    buffers.push((buffer, memory));
+                    let ptr = d
+                        .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+                        .map_err(|e| err("mapping memory", e))?;
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+                    d.unmap_memory(memory);
+                }
+                let code = ash::util::read_spv(&mut std::io::Cursor::new(pass.spirv)).map_err(|e| e.to_string())?;
+                let module = d
+                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+                    .map_err(|e| err("creating the shader module", e))?;
+                let layout_bindings: Vec<_> = pass
+                    .bindings
+                    .iter()
+                    .map(|(b, k)| {
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(*b)
+                            .descriptor_type(kind_of(*k))
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    })
+                    .collect();
+                let set_layout = d
+                    .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings), None)
+                    .map_err(|e| err("creating the set layout", e))?;
+                let set_layouts = [set_layout];
+                let layout = d
+                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts), None)
+                    .map_err(|e| err("creating the pipeline layout", e))?;
+                let stage = vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(module)
+                    .name(c"main");
+                let pipeline = d
+                    .create_compute_pipelines(
+                        vk::PipelineCache::null(),
+                        &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
+                        None,
+                    )
+                    .map_err(|(_, e)| err("creating the pipeline", e))?[0];
+                let sizes: Vec<_> = [vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::UNIFORM_BUFFER]
+                    .into_iter()
+                    .map(|ty| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(pass.bindings.len() as u32))
+                    .collect();
+                let desc_pool = d
+                    .create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)
+                    .map_err(|e| err("creating the descriptor pool", e))?;
+                let set = d
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&set_layouts),
+                    )
+                    .map_err(|e| err("allocating the descriptor set", e))?[0];
+                let image_infos: Vec<(u32, vk::DescriptorType, [vk::DescriptorImageInfo; 1])> = pass
+                    .bindings
+                    .iter()
+                    .filter(|(_, k)| *k != BindingKind::UniformBuffer)
+                    .map(|(b, k)| {
+                        let img = images.iter().find(|(n, _)| n == b).map(|(_, i)| *i).expect("checked above");
+                        (
+                            *b,
+                            kind_of(*k),
+                            [vk::DescriptorImageInfo::default().image_view(img.view).image_layout(vk::ImageLayout::GENERAL)],
+                        )
+                    })
+                    .collect();
+                let buffer_infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = cb_bindings
+                    .iter()
+                    .zip(&buffers)
+                    .zip(constants)
+                    .map(|((b, (buffer, _)), bytes)| {
+                        (*b, [vk::DescriptorBufferInfo::default().buffer(*buffer).range(bytes.len() as u64)])
+                    })
+                    .collect();
+                let mut writes: Vec<vk::WriteDescriptorSet> = image_infos
+                    .iter()
+                    .map(|(b, ty, info)| {
+                        vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(*ty).image_info(info)
+                    })
+                    .collect();
+                writes.extend(buffer_infos.iter().map(|(b, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(*b)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(info)
+                }));
+                d.update_descriptor_sets(&writes, &[]);
+                let submitted = self.submit(|cmd| {
+                    d.cmd_reset_query_pool(cmd, self.query_pool, 0, 2);
+                    d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                    d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+                    d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
+                });
+                let time = submitted.and_then(|_| {
+                    if !self.timestamps {
+                        return Ok(f64::NAN);
+                    }
+                    let mut stamps = [0u64; 2];
+                    d.get_query_pool_results(self.query_pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
+                        .map_err(|e| err("reading timestamps", e))?;
+                    Ok(stamps[1].wrapping_sub(stamps[0]) as f64 * self.timestamp_period_ns as f64 / 1000.0)
+                });
+                if !self.is_lost() {
+                    d.destroy_descriptor_pool(desc_pool, None);
+                    d.destroy_pipeline(pipeline, None);
+                    d.destroy_pipeline_layout(layout, None);
+                    d.destroy_descriptor_set_layout(set_layout, None);
+                    d.destroy_shader_module(module, None);
+                }
+                time
+            })();
+            if !self.is_lost() {
+                for (buffer, memory) in buffers {
+                    d.destroy_buffer(buffer, None);
+                    d.free_memory(memory, None);
+                }
+            }
+            result
         }
     }
 }
