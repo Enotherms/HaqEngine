@@ -1,7 +1,7 @@
 //! FSR 3 optical flow on the GPU at half resolution: every image and both schedules are created
 //! once, and each frame only uploads the packed frame and patches the frame number.
 
-use crate::gpu::{Gpu, StorageImage};
+use crate::gpu::{Bind, Gpu, StorageImage};
 use ash::vk;
 use haqengine_core::fsr3_flow::{
     ffx_to_haq, half_size, of_schedule, of_sizes, set_frame_index, OfDispatch, OfInput, OfRes, OF_LEVELS, PASS_SEARCH,
@@ -79,7 +79,7 @@ impl Fsr3Flow {
         Ok(flow)
     }
 
-    fn image(&self, res: OfRes) -> Result<&StorageImage, String> {
+    pub fn image(&self, res: OfRes) -> Result<&StorageImage, String> {
         self.images.iter().find(|(r, _)| *r == res).map(|(_, i)| i).ok_or_else(|| format!("no image for {res:?}"))
     }
 
@@ -91,8 +91,8 @@ impl Fsr3Flow {
         gpu.write_u32(self.image(OfRes::Raw)?, frame)?;
         let mut total = 0.0;
         for d in &self.schedules[self.odd as usize] {
-            let images: Vec<(u32, &StorageImage)> =
-                d.bind.iter().map(|(b, r)| self.image(*r).map(|i| (*b, i))).collect::<Result<_, _>>()?;
+            let images: Vec<(u32, Bind)> =
+                d.bind.iter().map(|(b, r)| self.image(*r).map(|i| (*b, Bind::Image(i)))).collect::<Result<_, _>>()?;
             let mut constants = d.constants;
             set_frame_index(&mut constants, self.frame_index);
             let pass = OF_PASSES[d.pass];

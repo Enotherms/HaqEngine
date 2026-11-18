@@ -1,7 +1,7 @@
 //! The GPU test cases: each runs one shader on a test image and compares with the CPU reference.
 
 use crate::fsr3::run_sequence;
-use crate::gpu::{push_bytes, Gpu, StorageImage};
+use crate::gpu::{push_bytes, Bind, Gpu, StorageImage};
 use ash::vk;
 use haqengine_core::flow::{self, Flow, BLOCK, LEVELS, RADIUS_COARSE, RADIUS_FINE};
 use haqengine_core::{
@@ -641,7 +641,11 @@ fn require_border(flow: &Flow, want: [f32; 2], keep: impl Fn(u32, u32) -> bool) 
 }
 
 fn fsr3_ready(gpu: &Gpu) -> Result<(), String> {
-    fsr3_requirements(gpu.subgroup_ok, gpu.subgroup_size, gpu.extended_formats, gpu.robust_images)
+    fsr3_requirements(gpu.subgroup_ok, gpu.subgroup_size, gpu.extended_formats, gpu.robust_images)?;
+    if !gpu.write_without_format {
+        return Err("the device lacks shaderStorageImage{Read,Write}WithoutFormat".into());
+    }
+    Ok(())
 }
 
 /// What FSR 3's passes need from the device: subgroup basic, arithmetic and quad operations in
@@ -788,6 +792,79 @@ fn fsr3_memory_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(fsr3_result(0.0))
 }
 
+const CANARIES: [[f32; 4]; 2] = [[1.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]];
+
+fn canary_rgb(c: [f32; 4]) -> [u8; 3] {
+    [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8]
+}
+
+/// Runs every frame through a fresh interpolation, pre-filling the output with `canary`, and
+/// returns each frame's output and the last frame's times.
+fn interp_run(
+    gpu: &Gpu,
+    frames: &[Image<Rgba8>],
+    canary: [f32; 4],
+) -> Result<(Vec<Image<Rgba8>>, f64, crate::fsr3_interp::InterpTimes), String> {
+    let first = frames.first().ok_or("no frames")?;
+    let mut fi = crate::fsr3_interp::Fsr3Interp::new(gpu, first.width, first.height, FSR3_FORMAT)?;
+    let result = (|| {
+        let (mut outs, mut last) = (Vec::with_capacity(frames.len()), 0.0);
+        for f in frames {
+            fi.fill_output(gpu, canary)?;
+            last = fi.run_frame(gpu, f)?;
+            outs.push(fi.read_output(gpu)?);
+        }
+        Ok((outs, last, fi.times))
+    })();
+    fi.destroy(gpu);
+    result
+}
+
+/// Pixels both canary runs left untouched, which no pass wrote.
+fn unwritten(a: &Image<Rgba8>, b: &Image<Rgba8>) -> usize {
+    let (ca, cb) = (canary_rgb(CANARIES[0]), canary_rgb(CANARIES[1]));
+    a.data.iter().zip(&b.data).filter(|(x, y)| x[..3] == ca && y[..3] == cb).count()
+}
+
+fn interp_prepare_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let us = crate::fsr3_interp::prepare_is_constant(gpu, 1280, 800)?;
+    Ok(fsr3_result(us))
+}
+
+fn interp_reset_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let frames = pan_frames(1280, 800, 12, -8, 9, 101);
+    let (a, us, _) = interp_run(gpu, &frames, CANARIES[0])?;
+    let (b, _, _) = interp_run(gpu, &frames, CANARIES[1])?;
+    let differs = a[0].data.iter().zip(&frames[0].data).filter(|(o, f)| o[..3] != f[..3]).count();
+    if differs > 0 {
+        return Err(format!("frame 0 differs from the current frame in {differs} pixels"));
+    }
+    for k in 1..frames.len() {
+        let n = unwritten(&a[k], &b[k]);
+        if n > 0 {
+            return Err(format!("frame {k}: {n} pixels were never written"));
+        }
+    }
+    Ok(fsr3_result(us))
+}
+
+/// Interpolation's own images, measured as the driver allocates them, stay within 24 MiB at
+/// 1280×800; the two real frames and the flow are counted elsewhere.
+fn interp_memory_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let fi = crate::fsr3_interp::Fsr3Interp::new(gpu, 1280, 800, FSR3_FORMAT)?;
+    let (owned, count) = (fi.owned_bytes(), fi.owned_images());
+    fi.destroy(gpu);
+    let texels = haqengine_core::fsr3_interp::fi_memory_bytes(1280, 800);
+    println!("      fsr3 interp owns {owned} bytes in {count} images and 1 buffer ({texels} bytes of texels)");
+    if owned > 24 << 20 {
+        return Err(format!("interpolation owns {owned} bytes, budget 24 MiB"));
+    }
+    Ok(fsr3_result(0.0))
+}
+
 fn luma_half_case(gpu: &Gpu, f: PackedFormat, img: &Image<Rgba8>) -> Result<CaseResult, String> {
     let input = packed::to_packed(f, img);
     let expected = haqengine_core::fsr3_flow::luma_half_reference(f, &input);
@@ -802,7 +879,7 @@ fn luma_half_case(gpu: &Gpu, f: PackedFormat, img: &Image<Rgba8>) -> Result<Case
     let result = (|| {
         gpu.clear_u32(&dst, 0xAB)?;
         let push = push_bytes(&[img.width.to_le_bytes(), img.height.to_le_bytes(), f.code().to_le_bytes()]);
-        let us = gpu.run_fsr3(&haqengine_shaders::OF_LUMA_HALF, &[(0, &src), (1, &dst)], &[], &push, [
+        let us = gpu.run_fsr3(&haqengine_shaders::OF_LUMA_HALF, &[(0, Bind::Image(&src)), (1, Bind::Image(&dst))], &[], &push, [
             expected.width.div_ceil(8),
             expected.height.div_ceil(8),
             1,
@@ -931,6 +1008,9 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("fsr3 flow pipeline 1280x800 total", fsr3_pipeline_case),
         case("fsr3 flow odd shift(7,-3)", fsr3_odd_case),
         case("fsr3 flow memory within budget", fsr3_memory_case),
+        case("fsr3 interp prepare is constant", interp_prepare_case),
+        case("fsr3 interp first frames after reset", interp_reset_case),
+        case("fsr3 interp memory within budget", interp_memory_case),
     ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
@@ -999,6 +1079,9 @@ mod tests {
             "of_luma_half matches CPU",
             "fsr3 flow odd shift(7,-3)",
             "fsr3 flow memory within budget",
+            "fsr3 interp prepare is constant",
+            "fsr3 interp first frames after reset",
+            "fsr3 interp memory within budget",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

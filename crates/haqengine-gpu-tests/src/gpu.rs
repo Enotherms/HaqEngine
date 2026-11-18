@@ -37,6 +37,23 @@ pub struct StorageImage {
     pub width: u32,
     pub height: u32,
     pub bytes: u64,
+    pub mip_views: Vec<vk::ImageView>,
+}
+
+/// A host-visible storage buffer.
+pub struct GpuBuffer {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub size: u64,
+}
+
+/// What an FSR 3 binding points at: a whole image, one mip level of it, or a storage buffer.
+/// Sampler bindings are filled with the device's linear-clamp sampler.
+#[derive(Clone, Copy)]
+pub enum Bind<'a> {
+    Image(&'a StorageImage),
+    Mip(&'a StorageImage, u32),
+    Buffer(&'a GpuBuffer),
 }
 
 pub struct Gpu {
@@ -47,6 +64,7 @@ pub struct Gpu {
     queue: vk::Queue,
     pool: vk::CommandPool,
     query_pool: vk::QueryPool,
+    sampler: vk::Sampler,
     timestamps: bool,
     timestamp_period_ns: f32,
     memory: vk::PhysicalDeviceMemoryProperties,
@@ -56,6 +74,8 @@ pub struct Gpu {
     pub subgroup_ok: bool,
     pub extended_formats: bool,
     pub robust_images: bool,
+    /// `shaderStorageImageWriteWithoutFormat` and `shaderStorageImageReadWithoutFormat`.
+    pub write_without_format: bool,
 }
 
 /// Index of the device to test on: a discrete or integrated GPU first, never a CPU renderer
@@ -149,6 +169,8 @@ impl Gpu {
             let subgroup_size = subgroup.subgroup_size;
             let supported = instance.get_physical_device_features(physical);
             let extended_formats = supported.shader_storage_image_extended_formats == vk::TRUE;
+            let write_without_format = supported.shader_storage_image_write_without_format == vk::TRUE
+                && supported.shader_storage_image_read_without_format == vk::TRUE;
             let has_robustness = instance
                 .enumerate_device_extension_properties(physical)
                 .map(|exts| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::ext::image_robustness::NAME)))
@@ -162,7 +184,9 @@ impl Gpu {
             let mut robust_enable = vk::PhysicalDeviceImageRobustnessFeatures::default().robust_image_access(true);
             let device_extensions = [ash::ext::image_robustness::NAME.as_ptr()];
             let features = vk::PhysicalDeviceFeatures::default()
-                .shader_storage_image_extended_formats(supported.shader_storage_image_extended_formats == vk::TRUE);
+                .shader_storage_image_extended_formats(extended_formats)
+                .shader_storage_image_write_without_format(write_without_format)
+                .shader_storage_image_read_without_format(write_without_format);
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
             let mut device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_features(&features);
@@ -186,6 +210,19 @@ impl Gpu {
                 )
                 .map_err(|e| err("creating the query pool", e))?;
             let memory = instance.get_physical_device_memory_properties(physical);
+            let sampler = device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .max_lod(vk::LOD_CLAMP_NONE),
+                    None,
+                )
+                .map_err(|e| err("creating the sampler", e))?;
             Ok(Gpu {
                 _entry: entry,
                 instance,
@@ -194,6 +231,7 @@ impl Gpu {
                 queue,
                 pool,
                 query_pool,
+                sampler,
                 timestamps: valid_bits > 0,
                 timestamp_period_ns: props.limits.timestamp_period,
                 memory,
@@ -203,6 +241,7 @@ impl Gpu {
                 subgroup_ok,
                 extended_formats,
                 robust_images,
+                write_without_format,
             })
         }
     }
@@ -332,6 +371,12 @@ impl Gpu {
     }
 
     pub fn create_storage_image(&self, format: vk::Format, width: u32, height: u32) -> Result<StorageImage, String> {
+        self.create_image(format, width, height, 1)
+    }
+
+    /// A device-local image with `mips` levels in `GENERAL` layout; with more than one level it
+    /// also gets one view per level for storage writes.
+    pub fn create_image(&self, format: vk::Format, width: u32, height: u32, mips: u32) -> Result<StorageImage, String> {
         unsafe {
             let d = &self.device;
             let image = d
@@ -340,7 +385,7 @@ impl Gpu {
                         .image_type(vk::ImageType::TYPE_2D)
                         .format(format)
                         .extent(vk::Extent3D { width, height, depth: 1 })
-                        .mip_levels(1)
+                        .mip_levels(mips)
                         .array_layers(1)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
@@ -365,38 +410,48 @@ impl Gpu {
                     return Err(e);
                 }
             };
-            let free = |view: Option<vk::ImageView>| {
-                if let Some(v) = view {
-                    d.destroy_image_view(v, None);
+            let free = |views: &[vk::ImageView]| {
+                for v in views {
+                    d.destroy_image_view(*v, None);
                 }
                 d.destroy_image(image, None);
                 d.free_memory(memory, None);
             };
             if let Err(e) = d.bind_image_memory(image, memory, 0) {
-                free(None);
+                free(&[]);
                 return Err(err("binding image memory", e));
             }
-            let view = match d.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(color_range()),
-                None,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    free(None);
-                    return Err(err("creating an image view", e));
-                }
+            let make_view = |range: vk::ImageSubresourceRange| {
+                d.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(range),
+                    None,
+                )
             };
+            let mut views = Vec::with_capacity(mips as usize + 1);
+            let levels = std::iter::once(color_range()).chain(
+                (0..if mips > 1 { mips } else { 0 }).map(|m| color_range().base_mip_level(m).level_count(1)),
+            );
+            for range in levels {
+                match make_view(range) {
+                    Ok(v) => views.push(v),
+                    Err(e) => {
+                        free(&views);
+                        return Err(err("creating an image view", e));
+                    }
+                }
+            }
             if let Err(e) = self.submit(|cmd| self.transition(cmd, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL)) {
                 if !self.is_lost() {
-                    free(Some(view));
+                    free(&views);
                 }
                 return Err(e);
             }
-            Ok(StorageImage { image, memory, view, width, height, bytes: req.size })
+            let view = views.remove(0);
+            Ok(StorageImage { image, memory, view, width, height, bytes: req.size, mip_views: views })
         }
     }
 
@@ -405,6 +460,9 @@ impl Gpu {
             return;
         }
         unsafe {
+            for v in &img.mip_views {
+                self.device.destroy_image_view(*v, None);
+            }
             self.device.destroy_image_view(img.view, None);
             self.device.destroy_image(img.image, None);
             self.device.free_memory(img.memory, None);
@@ -472,6 +530,50 @@ impl Gpu {
         let bytes: Vec<u8> = src.data.iter().flatten().copied().collect();
         unsafe { self.copy_in(&img, &bytes)? };
         Ok(img)
+    }
+
+    /// Replaces the contents of an existing `R8G8B8A8_UNORM` image.
+    pub fn write_rgba8(&self, img: &StorageImage, src: &Image<Rgba8>) -> Result<(), String> {
+        let bytes: Vec<u8> = src.data.iter().flatten().copied().collect();
+        unsafe { self.copy_in(img, &bytes) }
+    }
+
+    pub fn create_storage_buffer(&self, size: u64) -> Result<GpuBuffer, String> {
+        let (buffer, memory) = unsafe { self.host_buffer(size, vk::BufferUsageFlags::STORAGE_BUFFER)? };
+        let buf = GpuBuffer { buffer, memory, size };
+        if let Err(e) = self.write_buffer(&buf, &vec![0u8; size as usize]) {
+            self.destroy_buffer(buf);
+            return Err(e);
+        }
+        Ok(buf)
+    }
+
+    pub fn write_buffer(&self, buf: &GpuBuffer, bytes: &[u8]) -> Result<(), String> {
+        unsafe {
+            let len = bytes.len().min(buf.size as usize);
+            let ptr = self
+                .device
+                .map_memory(buf.memory, 0, buf.size, vk::MemoryMapFlags::empty())
+                .map_err(|e| err("mapping memory", e))?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
+            self.device.unmap_memory(buf.memory);
+        }
+        Ok(())
+    }
+
+    pub fn destroy_buffer(&self, buf: GpuBuffer) {
+        if self.is_lost() {
+            return;
+        }
+        unsafe {
+            self.device.destroy_buffer(buf.buffer, None);
+            self.device.free_memory(buf.memory, None);
+        }
+    }
+
+    /// Mip 0 of an image as raw bytes, `texel_bytes` per texel.
+    pub fn read_raw(&self, img: &StorageImage, texel_bytes: usize) -> Result<Vec<u8>, String> {
+        unsafe { self.copy_out(img, (img.width * img.height) as usize * texel_bytes) }
     }
 
     pub fn write_u32(&self, img: &StorageImage, src: &Image<u32>) -> Result<(), String> {
@@ -662,7 +764,7 @@ impl Gpu {
     pub fn run_fsr3(
         &self,
         pass: &Fsr3Pass,
-        images: &[(u32, &StorageImage)],
+        binds: &[(u32, Bind)],
         constants: &[&[u8]],
         push: &[u8],
         groups: [u32; 3],
@@ -674,9 +776,6 @@ impl Gpu {
             BindingKind::Sampler => vk::DescriptorType::SAMPLER,
             BindingKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
         };
-        if let Some((b, k)) = pass.bindings.iter().find(|(_, k)| matches!(k, BindingKind::Sampler | BindingKind::StorageBuffer)) {
-            return Err(format!("{} binding {b} is a {k:?}, which this runner cannot bind yet", pass.name));
-        }
         let mut cb_bindings: Vec<u32> =
             pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).map(|b| b.0).collect();
         cb_bindings.sort_unstable();
@@ -687,12 +786,20 @@ impl Gpu {
             return Err(format!("{} needs {} push bytes, got {}", pass.name, pass.push_size, push.len()));
         }
         for (b, kind) in pass.bindings {
-            if *kind != BindingKind::UniformBuffer && !images.iter().any(|(n, _)| n == b) {
-                return Err(format!("{} binding {b} has no image", pass.name));
+            let bound = binds.iter().find(|(n, _)| n == b).map(|(_, x)| *x);
+            let fits = match (kind, bound) {
+                (BindingKind::UniformBuffer | BindingKind::Sampler, None) => true,
+                (BindingKind::StorageBuffer, Some(Bind::Buffer(_))) => true,
+                (BindingKind::StorageImage | BindingKind::SampledImage, Some(Bind::Image(_))) => true,
+                (BindingKind::StorageImage, Some(Bind::Mip(img, m))) => (m as usize) < img.mip_views.len(),
+                _ => false,
+            };
+            if !fits {
+                return Err(format!("{} binding {b} ({kind:?}) is not bound to a matching resource", pass.name));
             }
         }
         let mut owned = Owned::default();
-        let result = unsafe { self.dispatch_fsr3(pass, images, constants, push, groups, &cb_bindings, &kind_of, &mut owned) };
+        let result = unsafe { self.dispatch_fsr3(pass, binds, constants, push, groups, &cb_bindings, &kind_of, &mut owned) };
         if !self.is_lost() {
             unsafe { owned.free(&self.device) };
         }
@@ -703,7 +810,7 @@ impl Gpu {
     unsafe fn dispatch_fsr3(
         &self,
         pass: &Fsr3Pass,
-        images: &[(u32, &StorageImage)],
+        binds: &[(u32, Bind)],
         constants: &[&[u8]],
         push: &[u8],
         groups: [u32; 3],
@@ -759,7 +866,13 @@ impl Gpu {
             )
             .map_err(|(_, e)| err("creating the pipeline", e))?[0];
         owned.pipeline = pipeline;
-        let sizes: Vec<_> = [vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::UNIFORM_BUFFER]
+        let sizes: Vec<_> = [
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::SAMPLER,
+            vk::DescriptorType::STORAGE_BUFFER,
+        ]
             .into_iter()
             .map(|ty| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(pass.bindings.len() as u32))
             .collect();
@@ -773,11 +886,22 @@ impl Gpu {
         let image_infos: Vec<(u32, vk::DescriptorType, [vk::DescriptorImageInfo; 1])> = pass
             .bindings
             .iter()
-            .filter(|(_, k)| *k != BindingKind::UniformBuffer)
             .filter_map(|(b, k)| {
-                images.iter().find(|(n, _)| n == b).map(|(_, img)| {
-                    (*b, kind_of(*k), [vk::DescriptorImageInfo::default().image_view(img.view).image_layout(vk::ImageLayout::GENERAL)])
-                })
+                let bound = binds.iter().find(|(n, _)| n == b).map(|(_, x)| *x);
+                let view = match (k, bound) {
+                    (BindingKind::Sampler, _) => return Some((*b, kind_of(*k), [vk::DescriptorImageInfo::default().sampler(self.sampler)])),
+                    (_, Some(Bind::Image(img))) => img.view,
+                    (_, Some(Bind::Mip(img, m))) => img.mip_views[m as usize],
+                    _ => return None,
+                };
+                Some((*b, kind_of(*k), [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL)]))
+            })
+            .collect();
+        let storage_infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = binds
+            .iter()
+            .filter_map(|(b, x)| match x {
+                Bind::Buffer(buf) => Some((*b, [vk::DescriptorBufferInfo::default().buffer(buf.buffer).range(buf.size)])),
+                _ => None,
             })
             .collect();
         let buffer_infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = cb_bindings
@@ -795,6 +919,13 @@ impl Gpu {
                 .dst_set(set)
                 .dst_binding(*b)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(info)
+        }));
+        writes.extend(storage_infos.iter().map(|(b, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(*b)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(info)
         }));
         d.update_descriptor_sets(&writes, &[]);
@@ -861,6 +992,7 @@ impl Drop for Gpu {
         }
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_query_pool(self.query_pool, None);
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
@@ -875,7 +1007,7 @@ impl Drop for Gpu {
 fn color_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .level_count(1)
+        .level_count(vk::REMAINING_MIP_LEVELS)
         .layer_count(1)
 }
 

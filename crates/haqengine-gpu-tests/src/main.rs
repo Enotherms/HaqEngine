@@ -4,6 +4,7 @@
 
 mod cases;
 mod fsr3;
+mod fsr3_interp;
 mod gpu;
 mod report;
 
