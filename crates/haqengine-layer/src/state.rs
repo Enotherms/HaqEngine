@@ -18,6 +18,8 @@ pub struct InstanceData {
     pub next_gipa: vk::PFN_vkGetInstanceProcAddr,
     pub instance: ash::Instance,
     pub surface: ash::khr::surface::InstanceFn,
+    /// The `apiVersion` the app asked for (1.0 when it gave none).
+    pub api_version: u32,
 }
 
 pub struct DeviceData {
@@ -32,6 +34,8 @@ pub struct DeviceData {
     pub set_loader_data: Option<crate::loader_abi::PfnSetDeviceLoaderData>,
     /// Battery-mode pipelines, created on the first battery swapchain.
     pub pipelines: std::sync::OnceLock<Result<Arc<crate::pipelines::Pipelines>, vk::Result>>,
+    /// Whether this device can run Quality mode, or why not.
+    pub quality: Result<(), String>,
 }
 
 pub static INSTANCES: LazyLock<HandleMap<Arc<InstanceData>>> = LazyLock::new(HandleMap::new);
@@ -120,6 +124,7 @@ pub mod test_support {
             },
             instance: unsafe { ash::Instance::load_with(instance_load, instance) },
             surface: ash::khr::surface::InstanceFn::load(instance_load),
+            api_version: vk::API_VERSION_1_0,
         });
         let handle = vk::Device::from_raw(fake_handle());
         let data = Arc::new(DeviceData {
@@ -131,6 +136,7 @@ pub mod test_support {
             queue_families,
             set_loader_data: None,
             pipelines: std::sync::OnceLock::new(),
+            quality: Err("test device".into()),
         });
         DEVICES.insert(dispatch_key(handle), Arc::clone(&data));
         (handle, data)

@@ -53,6 +53,8 @@ unsafe fn create_instance_inner(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let next_create: vk::PFN_vkCreateInstance = std::mem::transmute(next_create);
+    let app = (*create_info).p_application_info;
+    let api_version = if app.is_null() || (*app).api_version == 0 { vk::API_VERSION_1_0 } else { (*app).api_version };
     let result = next_create(create_info, allocator, out);
     if result != vk::Result::SUCCESS {
         return result;
@@ -61,7 +63,7 @@ unsafe fn create_instance_inner(
     let handle = *out;
     let instance = ash::Instance::load(&ash::StaticFn { get_instance_proc_addr: next_gipa }, handle);
     let surface = ash::khr::surface::InstanceFn::load(|name| std::mem::transmute(next_gipa(handle, name.as_ptr())));
-    INSTANCES.insert(dispatch_key(handle), Arc::new(InstanceData { next_gipa, instance, surface }));
+    INSTANCES.insert(dispatch_key(handle), Arc::new(InstanceData { next_gipa, instance, surface, api_version }));
     log_loaded();
     vk::Result::SUCCESS
 }
