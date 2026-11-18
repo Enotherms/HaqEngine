@@ -17,12 +17,17 @@ pub fn dispatch_key<H: vk::Handle>(h: H) -> usize {
 pub struct InstanceData {
     pub next_gipa: vk::PFN_vkGetInstanceProcAddr,
     pub instance: ash::Instance,
+    pub surface: ash::khr::surface::InstanceFn,
 }
 
 pub struct DeviceData {
     pub next_gdpa: vk::PFN_vkGetDeviceProcAddr,
     pub device: ash::Device,
     pub swapchain: ash::khr::swapchain::DeviceFn,
+    pub physical_device: vk::PhysicalDevice,
+    pub instance: Arc<InstanceData>,
+    /// Read once at device creation.
+    pub queue_families: Vec<vk::QueueFamilyProperties>,
 }
 
 pub static INSTANCES: LazyLock<HandleMap<Arc<InstanceData>>> = LazyLock::new(HandleMap::new);
@@ -31,6 +36,64 @@ pub static LOG: LazyLock<Logger> = LazyLock::new(|| {
     let settings = Settings::from_lookup(|k| std::env::var(k).ok());
     Logger::open(settings.log_path.as_deref(), LOG_CAP_BYTES)
 });
+
+/// Fake Vulkan objects for unit tests on the Mac.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use ash::vk::Handle;
+    use std::ffi::{c_char, c_void, CStr};
+
+    unsafe extern "system" fn gdpa_nothing(_: vk::Device, _: *const c_char) -> vk::PFN_vkVoidFunction {
+        None
+    }
+
+    /// A handle whose first word (the dispatch key) is a fresh, unique address.
+    pub fn fake_handle() -> u64 {
+        let word: &'static mut usize = Box::leak(Box::new(0));
+        *word = word as *mut usize as usize;
+        word as *mut usize as u64
+    }
+
+    /// A device whose ash tables resolve names through `load`, registered in `DEVICES`.
+    /// Its next-layer `vkGetDeviceProcAddr` returns nothing.
+    pub fn fake_device(
+        load: impl Fn(&CStr) -> *const c_void + Copy,
+        queue_families: Vec<vk::QueueFamilyProperties>,
+    ) -> (vk::Device, Arc<DeviceData>) {
+        fake_device_with_gdpa(load, queue_families, gdpa_nothing)
+    }
+
+    /// Like `fake_device`, with a chosen next-layer `vkGetDeviceProcAddr`.
+    pub fn fake_device_with_gdpa(
+        load: impl Fn(&CStr) -> *const c_void + Copy,
+        queue_families: Vec<vk::QueueFamilyProperties>,
+        next_gdpa: vk::PFN_vkGetDeviceProcAddr,
+    ) -> (vk::Device, Arc<DeviceData>) {
+        let instance = vk::Instance::from_raw(fake_handle());
+        let instance = Arc::new(InstanceData {
+            next_gipa: {
+                unsafe extern "system" fn gipa(_: vk::Instance, _: *const c_char) -> vk::PFN_vkVoidFunction {
+                    None
+                }
+                gipa
+            },
+            instance: unsafe { ash::Instance::load_with(|_| std::ptr::null(), instance) },
+            surface: ash::khr::surface::InstanceFn::load(|_| std::ptr::null()),
+        });
+        let handle = vk::Device::from_raw(fake_handle());
+        let data = Arc::new(DeviceData {
+            next_gdpa,
+            device: unsafe { ash::Device::load_with(load, handle) },
+            swapchain: ash::khr::swapchain::DeviceFn::load(load),
+            physical_device: vk::PhysicalDevice::null(),
+            instance,
+            queue_families,
+        });
+        DEVICES.insert(dispatch_key(handle), Arc::clone(&data));
+        (handle, data)
+    }
+}
 
 #[cfg(test)]
 mod tests {

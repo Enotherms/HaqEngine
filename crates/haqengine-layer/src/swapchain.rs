@@ -181,25 +181,15 @@ mod tests {
         vk::Result::SUCCESS
     }
 
-    unsafe extern "system" fn fake_gdpa(_: vk::Device, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
-        None
-    }
-
     /// A device whose next layer only provides `vkQueuePresentKHR`, and a queue handle whose
     /// dispatch key is not in `DEVICES`.
     fn fake_device_and_stray_queue() -> (Arc<DeviceData>, vk::Queue) {
-        let device_word: &'static usize = Box::leak(Box::new(0x0dd0_0001));
-        let queue_word: &'static usize = Box::leak(Box::new(0x0dd0_0002));
-        let handle = vk::Device::from_raw(device_word as *const usize as u64);
         let load = |name: &std::ffi::CStr| {
             if name == c"vkQueuePresentKHR" { fake_present as *const std::ffi::c_void } else { std::ptr::null() }
         };
-        let data = DeviceData {
-            next_gdpa: fake_gdpa,
-            device: unsafe { ash::Device::load_with(load, handle) },
-            swapchain: ash::khr::swapchain::DeviceFn::load(load),
-        };
-        (Arc::new(data), vk::Queue::from_raw(queue_word as *const usize as u64))
+        let (handle, data) = crate::state::test_support::fake_device(load, vec![]);
+        DEVICES.remove(dispatch_key(handle));
+        (data, vk::Queue::from_raw(crate::state::test_support::fake_handle()))
     }
 
     #[test]

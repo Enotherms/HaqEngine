@@ -34,6 +34,10 @@ impl<T: Clone> HandleMap<T> {
     pub fn remove(&self, key: usize) -> Option<T> {
         self.write().remove(&key)
     }
+    /// Keeps only the entries whose value passes `keep`. Not for per-frame use.
+    pub fn retain(&self, mut keep: impl FnMut(&T) -> bool) {
+        self.write().retain(|_, v| keep(v));
+    }
     pub fn len(&self) -> usize {
         self.read().len()
     }

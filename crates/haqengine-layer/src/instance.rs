@@ -55,8 +55,10 @@ unsafe fn create_instance_inner(
         return result;
     }
 
-    let instance = ash::Instance::load(&ash::StaticFn { get_instance_proc_addr: next_gipa }, *out);
-    INSTANCES.insert(dispatch_key(*out), Arc::new(InstanceData { next_gipa, instance }));
+    let handle = *out;
+    let instance = ash::Instance::load(&ash::StaticFn { get_instance_proc_addr: next_gipa }, handle);
+    let surface = ash::khr::surface::InstanceFn::load(|name| std::mem::transmute(next_gipa(handle, name.as_ptr())));
+    INSTANCES.insert(dispatch_key(handle), Arc::new(InstanceData { next_gipa, instance, surface }));
     log_loaded();
     vk::Result::SUCCESS
 }

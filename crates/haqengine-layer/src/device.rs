@@ -51,13 +51,19 @@ unsafe fn create_device_inner(
     let load = |name: &CStr| std::mem::transmute(next_gdpa(handle, name.as_ptr()));
     let device = ash::Device::load_with(load, handle);
     let swapchain = ash::khr::swapchain::DeviceFn::load(load);
-    DEVICES.insert(dispatch_key(handle), Arc::new(DeviceData { next_gdpa, device, swapchain }));
+    let queue_families = instance.instance.get_physical_device_queue_family_properties(physical_device);
+    DEVICES.insert(
+        dispatch_key(handle),
+        Arc::new(DeviceData { next_gdpa, device, swapchain, physical_device, instance, queue_families }),
+    );
     vk::Result::SUCCESS
 }
 
 pub unsafe extern "system" fn destroy_device(device: vk::Device, allocator: *const vk::AllocationCallbacks) {
     guard("vkDestroyDevice", (), || unsafe {
-        if let Some(data) = DEVICES.remove(dispatch_key(device)) {
+        let key = dispatch_key(device);
+        if let Some(data) = DEVICES.remove(key) {
+            crate::queue::forget_device(key);
             data.device.destroy_device(allocator.as_ref());
         }
     })
@@ -68,14 +74,16 @@ pub fn device_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
     match name.to_bytes() {
         b"vkGetDeviceProcAddr" => crate::erase(crate::vkGetDeviceProcAddr as *const ()),
         b"vkDestroyDevice" => crate::erase(destroy_device as *const ()),
+        b"vkGetDeviceQueue" => crate::erase(crate::queue::get_device_queue as *const ()),
         _ => None,
     }
 }
 
-/// Our replacement for an extension function. Only handed out when the next layer
+/// Our replacement for an extension or Vulkan 1.1+ function. Only handed out when the next layer
 /// provides the real one, so a disabled extension stays invisible.
 pub fn extension_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
     match name.to_bytes() {
+        b"vkGetDeviceQueue2" => crate::erase(crate::queue::get_device_queue2 as *const ()),
         b"vkCreateSwapchainKHR" => crate::erase(crate::swapchain::create_swapchain as *const ()),
         b"vkDestroySwapchainKHR" => crate::erase(crate::swapchain::destroy_swapchain as *const ()),
         b"vkQueuePresentKHR" => crate::erase(crate::swapchain::queue_present as *const ()),
