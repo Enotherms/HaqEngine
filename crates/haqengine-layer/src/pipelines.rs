@@ -3,8 +3,8 @@
 use ash::vk;
 use haqengine_core::PackedFormat;
 use haqengine_shaders::{
-    BindingKind, Fsr3Pass, Shader, BLOCK_MATCH, FI_BLEND_PACKED, FLOW_MEDIAN, LUMA_DOWNSAMPLE_PACKED, LUMA_REDUCE, OF_PASSES,
-    WARP_BLEND_PACKED,
+    BindingKind, Fsr3Pass, Shader, BATTERY_BLEND_PACKED, BLOCK_MATCH, FI_BLEND_PACKED, FLOW_MEDIAN, LUMA_DOWNSAMPLE_PACKED,
+    LUMA_REDUCE, OF_PASSES,
 };
 
 /// The packed layout of a swapchain format, or `None` when battery mode cannot read it.
@@ -107,7 +107,7 @@ impl Pipelines {
             (&LUMA_REDUCE, 2, 8),
             (&BLOCK_MATCH, 4, 24),
             (&FLOW_MEDIAN, 2, 8),
-            (&WARP_BLEND_PACKED, 6, 24),
+            (&BATTERY_BLEND_PACKED, 6, 24),
         ];
         for (shader, bindings, push) in specs {
             match create_pass(d, shader, bindings, push) {
