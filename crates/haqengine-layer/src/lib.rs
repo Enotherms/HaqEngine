@@ -12,6 +12,7 @@ pub mod instance;
 pub mod loader_abi;
 pub mod pipelines;
 pub mod plan;
+pub mod quality;
 pub mod queue;
 pub mod state;
 pub mod swapchain;

@@ -36,6 +36,8 @@ pub struct DeviceData {
     pub pipelines: std::sync::OnceLock<Result<Arc<crate::pipelines::Pipelines>, vk::Result>>,
     /// Whether this device can run Quality mode, or why not.
     pub quality: Result<(), String>,
+    /// Quality-mode pipelines, created on the first Quality swapchain.
+    pub quality_pipelines: std::sync::OnceLock<Result<Arc<crate::pipelines::QualityPipelines>, vk::Result>>,
 }
 
 pub static INSTANCES: LazyLock<HandleMap<Arc<InstanceData>>> = LazyLock::new(HandleMap::new);
@@ -137,6 +139,7 @@ pub mod test_support {
             set_loader_data: None,
             pipelines: std::sync::OnceLock::new(),
             quality: Err("test device".into()),
+            quality_pipelines: std::sync::OnceLock::new(),
         });
         DEVICES.insert(dispatch_key(handle), Arc::clone(&data));
         (handle, data)

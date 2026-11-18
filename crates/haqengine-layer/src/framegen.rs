@@ -1,6 +1,8 @@
 //! Per-swapchain resources for generated frames. Created once per swapchain, never per frame.
 
 use crate::battery::BatteryResources;
+use crate::pipelines::QualityPipelines;
+use crate::quality::QualityResources;
 use crate::pipelines::Pipelines;
 use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
@@ -39,8 +41,6 @@ pub struct Slot {
     pub cmd: vk::CommandBuffer,
     pub fence: vk::Fence,
     pub acquired: vk::Semaphore,
-    pub copy_ready: vk::Semaphore,
-    pub real_ready: vk::Semaphore,
 }
 
 /// Command pool and slots, created on the first generating present (the queue family is only known then).
@@ -53,6 +53,9 @@ pub struct Ready {
     pub timestamp_period_ns: f32,
     /// Whether a slot's timestamps were written and can be read.
     pub stamped: Vec<bool>,
+    /// One "ready to present" semaphore per swapchain image. A present may still hold its
+    /// semaphore until that image is acquired again, so it is reused only for the same image.
+    pub image_ready: Vec<vk::Semaphore>,
 }
 
 pub struct GenStats {
@@ -72,6 +75,16 @@ pub struct GenState {
     pub stats: GenStats,
     pub battery: Option<BatteryResources>,
     pub battery_failed: bool,
+    pub quality: Option<QualityResources>,
+    pub quality_failed: bool,
+}
+
+/// Which engine recorded a present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    Copy,
+    Battery,
+    Quality,
 }
 
 pub struct FrameGen {
@@ -79,16 +92,19 @@ pub struct FrameGen {
     pub extent: vk::Extent2D,
     /// Battery mode's packed layout for this swapchain, or `None` for copy mode.
     pub battery_format: Option<PackedFormat>,
+    /// Whether this swapchain runs Quality mode (falling back to Battery if it cannot start).
+    pub quality: bool,
     pub disabled: AtomicBool,
     pub state: Mutex<GenState>,
 }
 
 impl FrameGen {
-    pub fn new(images: Vec<vk::Image>, extent: vk::Extent2D, battery_format: Option<PackedFormat>) -> FrameGen {
+    pub fn new(images: Vec<vk::Image>, extent: vk::Extent2D, battery_format: Option<PackedFormat>, quality: bool) -> FrameGen {
         FrameGen {
             images,
             extent,
             battery_format,
+            quality: quality && battery_format.is_some(),
             disabled: AtomicBool::new(false),
             state: Mutex::new(GenState {
                 ready: None,
@@ -105,6 +121,8 @@ impl FrameGen {
                 },
                 battery: None,
                 battery_failed: false,
+                quality: None,
+                quality_failed: false,
             }),
         }
     }
@@ -144,6 +162,7 @@ impl FrameGen {
             queries,
             timestamp_period_ns,
             stamped: vec![false; slot_count],
+            image_ready: Vec::with_capacity(self.images.len()),
         };
         let result = (|| -> Result<(), vk::Result> {
             let cmds = d.allocate_command_buffers(
@@ -165,12 +184,13 @@ impl FrameGen {
             for cmd in cmds {
                 let fence = d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?;
                 let sem = || d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None);
-                let slot = Slot { cmd, fence, acquired: vk::Semaphore::null(), copy_ready: vk::Semaphore::null(), real_ready: vk::Semaphore::null() };
-                ready.slots.push(slot);
+                ready.slots.push(Slot { cmd, fence, acquired: vk::Semaphore::null() });
                 let last = ready.slots.last_mut().expect("just pushed");
                 last.acquired = sem()?;
-                last.copy_ready = sem()?;
-                last.real_ready = sem()?;
+            }
+            for _ in 0..self.images.len() {
+                let s = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                ready.image_ready.push(s);
             }
             Ok(())
         })();
@@ -198,6 +218,9 @@ impl FrameGen {
         if let Some(battery) = state.battery.take() {
             battery.destroy(&device.device);
         }
+        if let Some(quality) = state.quality.take() {
+            quality.destroy(&device.device);
+        }
     }
 }
 
@@ -209,14 +232,15 @@ unsafe fn destroy_ready(device: &DeviceData, ready: &Ready) {
         let _ = d.wait_for_fences(&fences, true, 1_000_000_000);
     }
     for s in &ready.slots {
-        for sem in [s.acquired, s.copy_ready, s.real_ready] {
-            if sem != vk::Semaphore::null() {
-                d.destroy_semaphore(sem, None);
-            }
+        if s.acquired != vk::Semaphore::null() {
+            d.destroy_semaphore(s.acquired, None);
         }
         if s.fence != vk::Fence::null() {
             d.destroy_fence(s.fence, None);
         }
+    }
+    for sem in &ready.image_ready {
+        d.destroy_semaphore(*sem, None);
     }
     d.destroy_command_pool(ready.pool, None);
     if ready.queries != vk::QueryPool::null() {
@@ -251,6 +275,9 @@ impl FrameGen {
             if let Some(b) = st.battery.as_mut() {
                 b.forget_previous();
             }
+            if let Some(q) = st.quality.as_mut() {
+                q.forget_previous();
+            }
             let r = next_present(queue, pi);
             record(st, id, start, false, skipped);
             r
@@ -273,7 +300,7 @@ impl FrameGen {
         let slot = {
             let ready = st.ready.as_ref().expect("ensure_ready succeeded");
             let s = &ready.slots[slot_index];
-            Slot { cmd: s.cmd, fence: s.fence, acquired: s.acquired, copy_ready: s.copy_ready, real_ready: s.real_ready }
+            Slot { cmd: s.cmd, fence: s.fence, acquired: s.acquired }
         };
         st.next = st.next.wrapping_add(1);
         let d = &device.device;
@@ -311,7 +338,7 @@ impl FrameGen {
             self.disable(id, "image index out of range", vk::Result::ERROR_UNKNOWN);
             return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
         };
-        let used_battery = match self.record_frame(&mut st, id, device, slot.cmd, slot_index, game_image, spare_image) {
+        let recorded = match self.record_frame(&mut st, id, device, slot.cmd, slot_index, game_image, spare_image) {
             Ok(b) => b,
             Err(e) => {
                 self.disable(id, "recording the frame", e);
@@ -325,7 +352,14 @@ impl FrameGen {
         }
         waits[n] = slot.acquired;
         let stages = [vk::PipelineStageFlags::TRANSFER; MAX_WAITS + 1];
-        let signals = [slot.copy_ready, slot.real_ready];
+        let ready_sems = st.ready.as_ref().map(|r| (r.image_ready.len(), r.image_ready.as_slice()));
+        let Some((copy_ready, real_ready)) = ready_sems
+            .and_then(|(n, sems)| present_semaphore_indices(n, spare, game_index).map(|(c, r)| (sems[c], sems[r])))
+        else {
+            self.disable(id, "present semaphores for the images", vk::Result::ERROR_UNKNOWN);
+            return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
+        };
+        let signals = [copy_ready, real_ready];
         let cmds = [slot.cmd];
         let submit = vk::SubmitInfo::default()
             .wait_semaphores(&waits[..=n])
@@ -344,7 +378,12 @@ impl FrameGen {
         if let Some(ready) = st.ready.as_mut() {
             ready.stamped[slot_index] = ready.queries != vk::QueryPool::null();
         }
-        if used_battery {
+        if recorded == Recorded::Quality {
+            if let Some(q) = st.quality.as_mut() {
+                q.submitted();
+            }
+        }
+        if recorded == Recorded::Battery {
             if let Some(dir) = DUMP_DIR.as_ref().filter(|_| st.stats.generated % DUMP_CHECK_EVERY == 0) {
                 let trigger = dir.join("now");
                 if trigger.exists() {
@@ -359,7 +398,7 @@ impl FrameGen {
                 b.submitted();
             }
         }
-        let copy_wait = [slot.copy_ready];
+        let copy_wait = [copy_ready];
         let copy_indices = [spare];
         let swapchains = [swapchain];
         let copy_present = vk::PresentInfoKHR::default()
@@ -367,7 +406,7 @@ impl FrameGen {
             .swapchains(&swapchains)
             .image_indices(&copy_indices);
         let r_copy = next_present(queue, &copy_present);
-        let real_wait = [slot.real_ready];
+        let real_wait = [real_ready];
         let mut real_present = *pi;
         real_present.wait_semaphore_count = 1;
         real_present.p_wait_semaphores = real_wait.as_ptr();
@@ -376,8 +415,8 @@ impl FrameGen {
         combine_present_results(r_copy, r_real)
     }
 
-    /// Records this present's commands: battery interpolation when available, otherwise a copy,
-    /// bracketed by timestamps. Returns whether battery mode recorded the frame.
+    /// Records this present's commands: Quality or Battery interpolation when available, otherwise
+    /// a copy, bracketed by timestamps. Returns which engine recorded the frame.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_frame(
         &self,
@@ -388,7 +427,7 @@ impl FrameGen {
         slot_index: usize,
         game: vk::Image,
         spare: vk::Image,
-    ) -> Result<bool, vk::Result> {
+    ) -> Result<Recorded, vk::Result> {
         let d = &device.device;
         d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -398,22 +437,59 @@ impl FrameGen {
             d.cmd_reset_query_pool(cmd, queries, first, 2);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, first);
         }
-        let pipelines = self.battery_pipelines(st, id, device);
-        let used_battery = match (pipelines, st.battery.as_mut()) {
-            (Some(p), Some(b)) => {
-                b.record(d, cmd, &p, game, spare);
-                true
-            }
-            _ => {
-                self.record_copy_body(d, cmd, game, spare);
-                false
+        let quality = self.quality_pipelines(st, id, device);
+        let recorded = if let (Some(p), Some(q)) = (quality, st.quality.as_mut()) {
+            q.record(d, cmd, &p, game, spare, slot_index);
+            Recorded::Quality
+        } else {
+            match (self.battery_pipelines(st, id, device), st.battery.as_mut()) {
+                (Some(p), Some(b)) => {
+                    b.record(d, cmd, &p, game, spare);
+                    Recorded::Battery
+                }
+                _ => {
+                    self.record_copy_body(d, cmd, game, spare);
+                    Recorded::Copy
+                }
             }
         };
         if queries != vk::QueryPool::null() {
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, first + 1);
         }
         d.end_command_buffer(cmd)?;
-        Ok(used_battery)
+        Ok(recorded)
+    }
+
+    /// The device's Quality pipelines with this swapchain's resources created, or `None` when the
+    /// swapchain does not run Quality (or after a creation failure, logged once; Battery takes over).
+    unsafe fn quality_pipelines(&self, st: &mut GenState, id: u64, device: &DeviceData) -> Option<Arc<QualityPipelines>> {
+        if !self.quality || st.quality_failed {
+            return None;
+        }
+        let format = self.battery_format?;
+        let pipelines = match device.quality_pipelines.get_or_init(|| QualityPipelines::create(&device.device).map(Arc::new)) {
+            Ok(p) => Arc::clone(p),
+            Err(e) => {
+                st.quality_failed = true;
+                LOG.log(&format!("quality mode off for swapchain {id}: creating pipelines {e:?}; using battery"));
+                return None;
+            }
+        };
+        if st.quality.is_none() {
+            let slots = st.ready.as_ref().map_or(0, |r| r.slots.len());
+            match QualityResources::create(device, &pipelines, self.extent, format, slots) {
+                Ok(q) => {
+                    LOG.log(&format!("swapchain {id}: quality resources {} bytes in 2 allocations", q.bytes));
+                    st.quality = Some(q);
+                }
+                Err(e) => {
+                    st.quality_failed = true;
+                    LOG.log(&format!("quality mode off for swapchain {id}: creating resources {e:?}; using battery"));
+                    return None;
+                }
+            }
+        }
+        Some(pipelines)
     }
 
     /// The device's battery pipelines with this swapchain's resources created, or `None` for copy
@@ -577,6 +653,13 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: 
 pub const ACQUIRE_TIMEOUT_NS: u64 = 50_000_000;
 
 /// The worst of the two present results, so the game always learns about a stale or lost swapchain.
+/// The image semaphores a generated present signals: the spare image's (shown first) and the game
+/// image's. `None` when an index is out of range or both name the same image.
+pub fn present_semaphore_indices(images: usize, spare: u32, game: u32) -> Option<(usize, usize)> {
+    let (s, g) = (spare as usize, game as usize);
+    (s < images && g < images && s != g).then_some((s, g))
+}
+
 pub fn combine_present_results(copy: vk::Result, real: vk::Result) -> vk::Result {
     fn severity(r: vk::Result) -> u8 {
         match r {
@@ -624,6 +707,14 @@ mod tests {
         assert_eq!(combine_present_results(R::ERROR_OUT_OF_DATE_KHR, R::ERROR_DEVICE_LOST), R::ERROR_DEVICE_LOST);
         assert_eq!(combine_present_results(R::SUCCESS, R::SUCCESS), R::SUCCESS);
         assert_eq!(combine_present_results(R::ERROR_SURFACE_LOST_KHR, R::SUBOPTIMAL_KHR), R::ERROR_SURFACE_LOST_KHR);
+    }
+
+    #[test]
+    fn present_semaphores_follow_images() {
+        assert_eq!(present_semaphore_indices(4, 2, 3), Some((2, 3)));
+        assert_eq!(present_semaphore_indices(4, 0, 0), None);
+        assert_eq!(present_semaphore_indices(4, 4, 1), None);
+        assert_eq!(present_semaphore_indices(4, 1, 7), None);
     }
 
     #[test]

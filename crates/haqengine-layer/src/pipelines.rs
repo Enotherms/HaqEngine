@@ -2,7 +2,10 @@
 
 use ash::vk;
 use haqengine_core::PackedFormat;
-use haqengine_shaders::{Shader, BLOCK_MATCH, FLOW_MEDIAN, LUMA_DOWNSAMPLE_PACKED, LUMA_REDUCE, WARP_BLEND_PACKED};
+use haqengine_shaders::{
+    BindingKind, Fsr3Pass, Shader, BLOCK_MATCH, FI_BLEND_PACKED, FLOW_MEDIAN, LUMA_DOWNSAMPLE_PACKED, LUMA_REDUCE, OF_PASSES,
+    WARP_BLEND_PACKED,
+};
 
 /// The packed layout of a swapchain format, or `None` when battery mode cannot read it.
 pub fn packed_format(f: vk::Format) -> Option<PackedFormat> {
@@ -128,6 +131,131 @@ impl Pipelines {
         for p in [&self.luma, &self.reduce, &self.block_match, &self.median, &self.warp] {
             destroy_pass(d, p);
         }
+    }
+}
+
+/// One Quality pass, built from its binding table: uniform buffers are dynamic, so one descriptor
+/// set serves every frame slot.
+pub struct FsrPass {
+    pub set_layout: vk::DescriptorSetLayout,
+    pub layout: vk::PipelineLayout,
+    pub pipeline: vk::Pipeline,
+    pub pass: &'static Fsr3Pass,
+}
+
+/// The descriptor type HaqEngine binds for a binding kind.
+pub fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
+    match k {
+        BindingKind::StorageImage => vk::DescriptorType::STORAGE_IMAGE,
+        BindingKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
+        BindingKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+        BindingKind::Sampler => vk::DescriptorType::SAMPLER,
+        BindingKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+    }
+}
+
+unsafe fn create_fsr_pass(d: &ash::Device, pass: &'static Fsr3Pass) -> Result<FsrPass, vk::Result> {
+    let words = spirv_words(pass.spirv);
+    let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
+    let bindings: Vec<_> = pass
+        .bindings
+        .iter()
+        .map(|(b, k)| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(*b)
+                .descriptor_type(descriptor_type(*k))
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        })
+        .collect();
+    let set_layout = match d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) {
+        Ok(l) => l,
+        Err(e) => {
+            d.destroy_shader_module(module, None);
+            return Err(e);
+        }
+    };
+    let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(pass.push_size)];
+    let set_layouts = [set_layout];
+    let info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    let info = if pass.push_size > 0 { info.push_constant_ranges(&ranges) } else { info };
+    let layout = match d.create_pipeline_layout(&info, None) {
+        Ok(l) => l,
+        Err(e) => {
+            d.destroy_descriptor_set_layout(set_layout, None);
+            d.destroy_shader_module(module, None);
+            return Err(e);
+        }
+    };
+    let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+    let created = d.create_compute_pipelines(
+        vk::PipelineCache::null(),
+        &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
+        None,
+    );
+    d.destroy_shader_module(module, None);
+    match created {
+        Ok(p) => Ok(FsrPass { set_layout, layout, pipeline: p[0], pass }),
+        Err((_, e)) => {
+            d.destroy_pipeline_layout(layout, None);
+            d.destroy_descriptor_set_layout(set_layout, None);
+            Err(e)
+        }
+    }
+}
+
+unsafe fn destroy_fsr_pass(d: &ash::Device, p: &FsrPass) {
+    d.destroy_pipeline(p.pipeline, None);
+    d.destroy_pipeline_layout(p.layout, None);
+    d.destroy_descriptor_set_layout(p.set_layout, None);
+}
+
+/// Every pass Quality mode records: the flow passes it schedules (by `OF_PASSES` index; AMD's
+/// prepare-luma pass, index 0, is never built) and the packed blend.
+pub struct QualityPipelines {
+    pub flow: Vec<Option<FsrPass>>,
+    pub blend: FsrPass,
+}
+
+impl QualityPipelines {
+    /// # Safety
+    /// `d` must be a live device with Quality's features enabled.
+    pub unsafe fn create(d: &ash::Device) -> Result<QualityPipelines, vk::Result> {
+        let mut flow: Vec<Option<FsrPass>> = Vec::with_capacity(OF_PASSES.len());
+        let free = |flow: &[Option<FsrPass>]| {
+            for p in flow.iter().flatten() {
+                destroy_fsr_pass(d, p);
+            }
+        };
+        for (i, pass) in OF_PASSES.iter().enumerate() {
+            if i == haqengine_core::fsr3_flow::PASS_PREPARE_LUMA {
+                flow.push(None);
+                continue;
+            }
+            match create_fsr_pass(d, pass) {
+                Ok(p) => flow.push(Some(p)),
+                Err(e) => {
+                    free(&flow);
+                    return Err(e);
+                }
+            }
+        }
+        match create_fsr_pass(d, &FI_BLEND_PACKED) {
+            Ok(blend) => Ok(QualityPipelines { flow, blend }),
+            Err(e) => {
+                free(&flow);
+                Err(e)
+            }
+        }
+    }
+
+    /// # Safety
+    /// `d` must be the device the pipelines were created on, idle for them.
+    pub unsafe fn destroy(&self, d: &ash::Device) {
+        for p in self.flow.iter().flatten() {
+            destroy_fsr_pass(d, p);
+        }
+        destroy_fsr_pass(d, &self.blend);
     }
 }
 
