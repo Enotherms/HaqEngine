@@ -1,7 +1,7 @@
 //! Device-level hooks: create, destroy and the device-level function table.
 
 use crate::guard::guard;
-use crate::loader_abi::find_device_link;
+use crate::loader_abi::{find_device_link, find_device_loader_data};
 use crate::state::{dispatch_key, DeviceData, DEVICES, INSTANCES};
 use ash::vk;
 use std::ffi::CStr;
@@ -27,6 +27,7 @@ unsafe fn create_device_inner(
     let Some(instance) = INSTANCES.get(dispatch_key(physical_device)) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
+    let set_loader_data = find_device_loader_data((*create_info).p_next);
     let Some(info) = find_device_link((*create_info).p_next) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
@@ -54,7 +55,15 @@ unsafe fn create_device_inner(
     let queue_families = instance.instance.get_physical_device_queue_family_properties(physical_device);
     DEVICES.insert(
         dispatch_key(handle),
-        Arc::new(DeviceData { next_gdpa, device, swapchain, physical_device, instance, queue_families }),
+        Arc::new(DeviceData {
+            next_gdpa,
+            device,
+            swapchain,
+            physical_device,
+            instance,
+            queue_families,
+            set_loader_data,
+        }),
     );
     vk::Result::SUCCESS
 }

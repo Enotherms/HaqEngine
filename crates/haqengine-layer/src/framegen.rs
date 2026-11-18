@@ -102,6 +102,16 @@ impl FrameGen {
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(self.images.len() as u32 + 2),
             )?;
+            let Some(set_loader_data) = device.set_loader_data else {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            };
+            for cmd in &cmds {
+                let r = set_loader_data(d.handle(), cmd.as_raw() as *mut std::ffi::c_void);
+                if r != vk::Result::SUCCESS {
+                    d.free_command_buffers(pool, &cmds);
+                    return Err(r);
+                }
+            }
             for cmd in cmds {
                 let fence = d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?;
                 let sem = || d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None);

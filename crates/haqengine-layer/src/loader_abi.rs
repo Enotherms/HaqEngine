@@ -7,6 +7,12 @@ use std::ffi::c_void;
 pub const LAYER_NEGOTIATE_INTERFACE_STRUCT: u32 = 1;
 /// `VK_LAYER_LINK_INFO` in `VkLayerFunction`.
 pub const VK_LAYER_LINK_INFO: u32 = 0;
+/// `VK_LOADER_DATA_CALLBACK` in `VkLayerFunction`.
+pub const VK_LOADER_DATA_CALLBACK: u32 = 1;
+
+/// `PFN_vkSetDeviceLoaderData`: gives a layer-created dispatchable object (e.g. a command buffer)
+/// the loader's dispatch table, so layers below can find its device.
+pub type PfnSetDeviceLoaderData = unsafe extern "system" fn(vk::Device, *mut c_void) -> vk::Result;
 
 #[repr(C)]
 pub struct NegotiateLayerInterface {
@@ -49,6 +55,7 @@ pub struct LayerDeviceLink {
 #[repr(C)]
 pub union LayerDeviceCreateInfoU {
     pub p_layer_info: *mut LayerDeviceLink,
+    pub pfn_set_device_loader_data: Option<PfnSetDeviceLoaderData>,
     pub other: *const c_void,
 }
 
@@ -96,6 +103,24 @@ pub unsafe fn find_device_link(p_next: *const c_void) -> Option<*mut LayerDevice
     None
 }
 
+/// Finds the loader's `pfnSetDeviceLoaderData` callback in a device `pNext` chain.
+///
+/// # Safety
+/// `p_next` must be null or the head of a valid Vulkan `pNext` chain.
+pub unsafe fn find_device_loader_data(p_next: *const c_void) -> Option<PfnSetDeviceLoaderData> {
+    let mut cur = p_next as *const vk::BaseInStructure;
+    while !cur.is_null() {
+        if (*cur).s_type == vk::StructureType::LOADER_DEVICE_CREATE_INFO {
+            let info = cur as *const LayerDeviceCreateInfo;
+            if (*info).function == VK_LOADER_DATA_CALLBACK {
+                return (*info).u.pfn_set_device_loader_data;
+            }
+        }
+        cur = (*cur).p_next;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +160,30 @@ mod tests {
         };
         let found = unsafe { find_instance_link(&head as *const _ as *const c_void) };
         assert_eq!(found, Some(&wanted as *const _ as *mut LayerInstanceCreateInfo));
+    }
+
+    unsafe extern "system" fn fake_set_data(_: vk::Device, _: *mut c_void) -> vk::Result {
+        vk::Result::SUCCESS
+    }
+
+    #[test]
+    fn find_device_loader_data_finds_callback_after_link() {
+        let callback = LayerDeviceCreateInfo {
+            s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+            p_next: ptr::null(),
+            function: VK_LOADER_DATA_CALLBACK,
+            u: LayerDeviceCreateInfoU { pfn_set_device_loader_data: Some(fake_set_data) },
+        };
+        let link_info = LayerDeviceCreateInfo {
+            s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+            p_next: &callback as *const _ as *const c_void,
+            function: VK_LAYER_LINK_INFO,
+            u: LayerDeviceCreateInfoU { other: ptr::null() },
+        };
+        let found = unsafe { find_device_loader_data(&link_info as *const _ as *const c_void) };
+        assert_eq!(found.map(|f| f as usize), Some(fake_set_data as *const () as usize));
+        assert!(unsafe { find_device_loader_data(ptr::null()) }.is_none());
+        assert!(unsafe { find_device_loader_data(&callback as *const _ as *const c_void) }.is_some());
     }
 
     #[test]

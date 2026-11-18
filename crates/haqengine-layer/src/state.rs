@@ -28,6 +28,8 @@ pub struct DeviceData {
     pub instance: Arc<InstanceData>,
     /// Read once at device creation.
     pub queue_families: Vec<vk::QueueFamilyProperties>,
+    /// The loader's callback for dispatchable objects HaqEngine creates (command buffers).
+    pub set_loader_data: Option<crate::loader_abi::PfnSetDeviceLoaderData>,
 }
 
 pub static INSTANCES: LazyLock<HandleMap<Arc<InstanceData>>> = LazyLock::new(HandleMap::new);
@@ -125,6 +127,7 @@ pub mod test_support {
             physical_device: vk::PhysicalDevice::null(),
             instance,
             queue_families,
+            set_loader_data: None,
         });
         DEVICES.insert(dispatch_key(handle), Arc::clone(&data));
         (handle, data)
