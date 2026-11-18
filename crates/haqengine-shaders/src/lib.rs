@@ -306,6 +306,15 @@ pub const FI_PASSES: [&Fsr3Pass; 11] = [
     &FI_BLEND,
 ];
 
+/// HaqEngine's zero-first blend on Battery's flow at time `t`, packed: bindings 0 = prev `r32ui`,
+/// 1 = cur `r32ui`, 2 = level-0 flow `rg32f`, 3 = output `r32ui`, 4/5 = prev/cur level-0 luma
+/// `r32f` (the same layout as `WARP_BLEND_PACKED`); push `{ w, h, flow_w, flow_h, t: f32, format }`.
+pub const BATTERY_BLEND_PACKED: Shader = Shader {
+    name: "battery_blend_packed",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/battery_blend_packed.spv")),
+    local_size: [8, 8],
+};
+
 /// Every shader HaqEngine ships.
 pub fn all() -> &'static [Shader] {
     &[
@@ -317,6 +326,7 @@ pub fn all() -> &'static [Shader] {
         FLOW_MEDIAN,
         LUMA_DOWNSAMPLE_PACKED,
         WARP_BLEND_PACKED,
+        BATTERY_BLEND_PACKED,
     ]
 }
 
@@ -497,6 +507,6 @@ mod tests {
     #[test]
     fn all_lists_every_shader() {
         let names: Vec<&str> = all().iter().map(|s| s.name).collect();
-        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed"]);
+        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed", "battery_blend_packed"]);
     }
 }

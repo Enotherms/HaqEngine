@@ -112,6 +112,20 @@ fn gpu_frame(gpu: &Gpu, frame: &Image<Rgba8>, time: &mut f64) -> Result<Frame, S
     build_pyramid(gpu, color, None, time)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_warp_packed(
+    gpu: &Gpu,
+    f: PackedFormat,
+    prev: &StorageImage,
+    cur: &StorageImage,
+    flow_img: &StorageImage,
+    prev_luma: &StorageImage,
+    cur_luma: &StorageImage,
+    t: f32,
+) -> Result<(Image<u32>, f64), String> {
+    run_warp_packed_with(gpu, &WARP_BLEND_PACKED, f, prev, cur, flow_img, prev_luma, cur_luma, t)
+}
+
 fn gpu_frame_packed(gpu: &Gpu, f: PackedFormat, frame: &Image<u32>, time: &mut f64) -> Result<Frame, String> {
     let color = gpu.upload_u32(frame)?;
     build_pyramid(gpu, color, Some(f), time)
@@ -169,8 +183,9 @@ fn luma_packed_case(gpu: &Gpu, f: PackedFormat, input: &Image<u32>) -> Result<Ca
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_warp_packed(
+fn run_warp_packed_with(
     gpu: &Gpu,
+    shader: &haqengine_shaders::Shader,
     f: PackedFormat,
     prev: &StorageImage,
     cur: &StorageImage,
@@ -191,7 +206,7 @@ fn run_warp_packed(
             f.code().to_le_bytes(),
         ]);
         let us = gpu.run(
-            &WARP_BLEND_PACKED,
+            shader,
             &[prev, cur, flow_img, &dst, prev_luma, cur_luma],
             &push,
             groups(prev.width, prev.height),
@@ -1182,6 +1197,238 @@ fn interp_pipeline_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(fsr3_result(us))
 }
 
+/// One frame pair through Battery on the GPU: its flow, then M3c's warp and the new blend.
+struct BatteryPair {
+    old: Image<Rgba8>,
+    new: Image<u32>,
+    new_rgba: Image<Rgba8>,
+    flow: Flow,
+    prev_luma: Image<f32>,
+    cur_luma: Image<f32>,
+    flow_us: f64,
+    blend_us: f64,
+}
+
+fn unpack_image(f: PackedFormat, img: &Image<u32>) -> Image<Rgba8> {
+    let data = img
+        .data
+        .iter()
+        .map(|w| {
+            let c = packed::unpack(f, *w);
+            [0, 1, 2, 3].map(|i| (c[i] * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8)
+        })
+        .collect();
+    Image { width: img.width, height: img.height, data }
+}
+
+fn battery_pair(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgba8>) -> Result<BatteryPair, String> {
+    let (pp, cp) = (packed::to_packed(f, prev), packed::to_packed(f, cur));
+    let mut setup = 0.0;
+    let fp = gpu_frame_packed(gpu, f, &pp, &mut setup)?;
+    let mut flow_us = 0.0;
+    let fc = match gpu_frame_packed(gpu, f, &cp, &mut flow_us) {
+        Ok(x) => x,
+        Err(e) => {
+            fp.destroy(gpu);
+            return Err(e);
+        }
+    };
+    let result = (|| {
+        let flows = gpu_flows(gpu, &fp, &fc, &mut flow_us)?;
+        let run = || -> Result<_, String> {
+            let (old, _) = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], 0.5)?;
+            let (new, blend_us) = run_warp_packed_with(
+                gpu,
+                &haqengine_shaders::BATTERY_BLEND_PACKED,
+                f,
+                &fp.color,
+                &fc.color,
+                &flows.images[0],
+                &fp.levels[0],
+                &fc.levels[0],
+                0.5,
+            )?;
+            Ok((old, new, blend_us, gpu.read_rg32f(&flows.images[0])?, gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?))
+        };
+        let r = run();
+        for img in flows.images {
+            gpu.destroy_image(img);
+        }
+        let (old, new, blend_us, flow, prev_luma, cur_luma) = r?;
+        Ok(BatteryPair { old: unpack_image(f, &old), new_rgba: unpack_image(f, &new), new, flow, prev_luma, cur_luma, flow_us, blend_us })
+    })();
+    fp.destroy(gpu);
+    fc.destroy(gpu);
+    result
+}
+
+fn battery_parity_case(gpu: &Gpu, f: PackedFormat) -> Result<CaseResult, String> {
+    let square = checker(96, 96, 6);
+    let mut frames = pan_frames(1280, 800, 12, -8, 1, 201);
+    for fr in &mut frames {
+        paste(fr, &square, (592, 352));
+    }
+    let pair = battery_pair(gpu, f, &frames[0], &frames[1])?;
+    let (pp, cp) = (packed::to_packed(f, &frames[0]), packed::to_packed(f, &frames[1]));
+    let expected = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, 0.5);
+    Ok(CaseResult { report: packed::compare_packed(f, &expected, &pair.new, 1.0), gpu_us: pair.blend_us, tolerance: 1.0 })
+}
+
+fn battery_result(us: f64) -> CaseResult {
+    CaseResult { report: CompareReport { max_diff: 0.0, worst: None, over_tolerance: 0 }, gpu_us: us, tolerance: 1.0 }
+}
+
+fn battery_compare(what: &str, new: f64, old: f64, bar: f64, slack: f64) -> Result<(), String> {
+    println!("      {what}: new blend {new:.3}, M3c warp {old:.3} (8-bit steps)");
+    if new.is_nan() || new > bar || new > old + slack {
+        return Err(format!("{what}: new {new:.3} vs old {old:.3}, bar {bar} and old + {slack}"));
+    }
+    Ok(())
+}
+
+const BF: PackedFormat = PackedFormat::Bgra8;
+
+fn battery_pan_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let frames = pan_frames(1280, 800, 12, -8, 1, 211);
+    let truth = pan_at(1280, 800, 12, -8, 1, 211, 1);
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let keep = |x: u32, y: u32| x >= 48 && y >= 48 && x + 48 < 1280 && y + 48 < 800;
+    battery_compare("pan", mean_err(&pair.new_rgba, &truth, keep), mean_err(&pair.old, &truth, keep), 2.0, 0.5)?;
+    Ok(battery_result(pair.blend_us))
+}
+
+fn battery_overlay_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let mut bar = Image::new(200, 40, [255u8, 255, 255, 255]);
+    for y in 0..40 {
+        for x in (0..200).filter(|x| x % 8 < 2) {
+            bar.set(x, y, [0, 0, 0, 255]);
+        }
+    }
+    let at = (100u32, 700u32);
+    let mut frames = pan_frames(1280, 800, 12, -8, 1, 221);
+    for f in &mut frames {
+        paste(f, &bar, at);
+    }
+    let mut truth = pan_at(1280, 800, 12, -8, 1, 221, 1);
+    paste(&mut truth, &bar, at);
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let on_bar = |x: u32, y: u32| x >= at.0 && x < at.0 + 200 && y >= at.1 && y < at.1 + 40;
+    battery_compare("overlay", mean_err(&pair.new_rgba, &truth, on_bar), mean_err(&pair.old, &truth, on_bar), 5.0, 0.0)?;
+    Ok(battery_result(pair.blend_us))
+}
+
+fn battery_square_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let square = checker(96, 96, 6);
+    let at = (592u32, 352u32);
+    let mut frames = pan_frames(1280, 800, 16, 0, 1, 231);
+    for f in &mut frames {
+        paste(f, &square, at);
+    }
+    let mut truth = pan_at(1280, 800, 16, 0, 1, 231, 1);
+    paste(&mut truth, &square, at);
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let dist = |x: u32, y: u32| {
+        let dx = (at.0 as i32 - x as i32).max(x as i32 - (at.0 + 95) as i32).max(0);
+        let dy = (at.1 as i32 - y as i32).max(y as i32 - (at.1 + 95) as i32).max(0);
+        dx.max(dy)
+    };
+    let inside = |x: u32, y: u32| x >= at.0 + 8 && x < at.0 + 88 && y >= at.1 + 8 && y < at.1 + 88;
+    let band = |x: u32, y: u32| !inside(x, y) && dist(x, y) < 24;
+    battery_compare("square", mean_err(&pair.new_rgba, &truth, inside), mean_err(&pair.old, &truth, inside), 2.0, 0.5)?;
+    battery_compare("edge band", mean_err(&pair.new_rgba, &truth, band), mean_err(&pair.old, &truth, band), 255.0, 0.5)?;
+    Ok(battery_result(pair.blend_us))
+}
+
+fn battery_slow_object_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let head = noise(40, 40, 181);
+    let mut frames = pan_frames(1280, 800, 24, 0, 1, 241);
+    for (k, f) in frames.iter_mut().enumerate() {
+        paste(f, &head, (600 + 2 * k as u32, 380));
+    }
+    let mut truth = pan_at(1280, 800, 24, 0, 1, 241, 1);
+    paste(&mut truth, &head, (601, 380));
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let on_head = |x: u32, y: u32| (603..637).contains(&x) && (382..418).contains(&y);
+    let rim = |x: u32, y: u32| !on_head(x, y) && x + 8 >= 601 && x < 649 && y + 8 >= 380 && y < 428;
+    battery_compare("slow head", mean_err(&pair.new_rgba, &truth, on_head), mean_err(&pair.old, &truth, on_head), 255.0, 0.5)?;
+    battery_compare("slow head rim", mean_err(&pair.new_rgba, &truth, rim), mean_err(&pair.old, &truth, rim), 255.0, 5.0)?;
+    Ok(battery_result(pair.blend_us))
+}
+
+fn battery_ghost_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let bg = Image::new(1280, 800, [200u8, 200, 200, 255]);
+    let square = checker(200, 200, 10);
+    let frames: Vec<Image<Rgba8>> = (0..2)
+        .map(|k| {
+            let mut f = bg.clone();
+            paste(&mut f, &square, (200 + 16 * k, 300));
+            f
+        })
+        .collect();
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let (mut ghosts, mut total) = (0usize, 0usize);
+    for y in 300..500 {
+        for x in 0..1280 {
+            if frames[0].get(x, y) == frames[1].get(x, y) {
+                continue;
+            }
+            total += 1;
+            let o = pair.new_rgba.get(x, y);
+            let near = |v: u8| (0..3).all(|i| o[i].abs_diff(v) <= 8);
+            ghosts += (!near(0) && !near(200) && !near(255)) as usize;
+        }
+    }
+    println!("      ghosts: {ghosts}/{total} changed pixels are a blend");
+    if total == 0 || ghosts * 1000 > total {
+        return Err(format!("ghosts: {ghosts}/{total}, at most 0.1%"));
+    }
+    Ok(battery_result(pair.blend_us))
+}
+
+/// A menu-like still screen (light text bars on a dark panel) whose brightness drops 10%: pixels
+/// outside the two frames' values (by more than 2 steps) are false matches on the fine pattern;
+/// the new blend may not have more than 10% more of them than M3c's warp.
+fn battery_menu_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let mut menu = Image::new(1280, 800, [30u8, 34, 48, 255]);
+    for row in 0..12u32 {
+        for y in 120 + row * 48..120 + row * 48 + 18 {
+            for x in 160..(160 + 300 + (row * 37) % 400) {
+                let v = if (x / 6 + y / 3) % 3 == 0 { 120 } else { 235 };
+                menu.set(x, y, [v, v, v, 255]);
+            }
+        }
+    }
+    let dim = Image { width: 1280, height: 800, data: menu.data.iter().map(|p| [p[0] * 9 / 10, p[1] * 9 / 10, p[2] * 9 / 10, 255]).collect() };
+    let pair = battery_pair(gpu, BF, &menu, &dim)?;
+    let mut outside = 0usize;
+    for y in 0..800 {
+        for x in 0..1280 {
+            let (a, b, o) = (menu.get(x, y), dim.get(x, y), pair.new_rgba.get(x, y));
+            outside += (0..3).any(|i| o[i] + 2 < a[i].min(b[i]) || o[i] > a[i].max(b[i]) + 2) as usize;
+        }
+    }
+    let old_outside = (0..800u32)
+        .flat_map(|y| (0..1280u32).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let (a, b, o) = (menu.get(x, y), dim.get(x, y), pair.old.get(x, y));
+            (0..3).any(|i| o[i] + 2 < a[i].min(b[i]) || o[i] > a[i].max(b[i]) + 2)
+        })
+        .count();
+    println!("      menu fade: {outside} pixels outside the two frames (M3c warp {old_outside})");
+    if outside * 10 > old_outside * 11 {
+        return Err(format!("menu fade: {outside} pixels outside the two frames, M3c warp {old_outside}"));
+    }
+    Ok(battery_result(pair.blend_us))
+}
+
+fn battery_total_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let frames = pan_frames(1280, 800, 12, -8, 1, 251);
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let total = pair.flow_us + pair.blend_us;
+    println!("      battery with the new blend: total {total:.1} us (budget 2500 us): flow {:.0}, blend {:.0}", pair.flow_us, pair.blend_us);
+    Ok(battery_result(total))
+}
+
 fn luma_half_case(gpu: &Gpu, f: PackedFormat, img: &Image<Rgba8>) -> Result<CaseResult, String> {
     let input = packed::to_packed(f, img);
     let expected = haqengine_core::fsr3_flow::luma_half_reference(f, &input);
@@ -1339,6 +1586,15 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("fsr3 interp pipeline total", interp_pipeline_case),
         case("fsr3 interp scene cut takes current frame", interp_cut_case),
         case("fsr3 interp no ghosts behind a moving object", interp_ghost_case),
+        case("battery blend matches CPU bgra8", |g| battery_parity_case(g, PackedFormat::Bgra8)),
+        case("battery blend matches CPU a2b10g10r10", |g| battery_parity_case(g, PackedFormat::A2b10g10r10)),
+        case("battery blend pan", battery_pan_case),
+        case("battery blend static overlay", battery_overlay_case),
+        case("battery blend still square", battery_square_case),
+        case("battery blend small slow object", battery_slow_object_case),
+        case("battery blend no ghosts", battery_ghost_case),
+        case("battery blend menu fade", battery_menu_case),
+        case("battery blend pipeline total", battery_total_case),
     ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
@@ -1421,6 +1677,15 @@ mod tests {
             "fsr3 interp no ghosts behind a moving object",
             "fi_blend_packed matches CPU bgra8",
             "fi_blend_packed matches CPU a2b10g10r10",
+            "battery blend matches CPU bgra8",
+            "battery blend matches CPU a2b10g10r10",
+            "battery blend pan",
+            "battery blend static overlay",
+            "battery blend still square",
+            "battery blend small slow object",
+            "battery blend no ghosts",
+            "battery blend menu fade",
+            "battery blend pipeline total",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

@@ -1,0 +1,151 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D prev_frame;
+layout(set = 0, binding = 1, r32ui) uniform readonly uimage2D cur_frame;
+layout(set = 0, binding = 2, rg32f) uniform readonly image2D flow;
+layout(set = 0, binding = 3, r32ui) uniform writeonly uimage2D dst;
+layout(set = 0, binding = 4, r32f) uniform readonly image2D prev_luma;
+layout(set = 0, binding = 5, r32f) uniform readonly image2D cur_luma;
+
+layout(push_constant) uniform Push {
+    uint w;
+    uint h;
+    uint flow_w;
+    uint flow_h;
+    float t;
+    uint format;
+} pc;
+
+const int BLOCK = 16;
+const uint DISAGREE8 = 288u;
+
+vec4 unpack_pixel(uint w) {
+    if (pc.format == 2u) {
+        return vec4(
+            float(w & 1023u) / 1023.0,
+            float((w >> 10u) & 1023u) / 1023.0,
+            float((w >> 20u) & 1023u) / 1023.0,
+            float(w >> 30u) / 3.0
+        );
+    }
+    vec4 b = vec4(float(w & 255u), float((w >> 8u) & 255u), float((w >> 16u) & 255u), float(w >> 24u)) / 255.0;
+    return pc.format == 1u ? b.zyxw : b;
+}
+
+uint quantize(float c, float m) {
+    precise float v = clamp(c, 0.0, 1.0) * m;
+    precise float r = v + 0.5;
+    return uint(floor(r));
+}
+
+uint pack_pixel(vec4 c) {
+    if (pc.format == 2u) {
+        return quantize(c.r, 1023.0) | (quantize(c.g, 1023.0) << 10u) | (quantize(c.b, 1023.0) << 20u)
+            | (quantize(c.a, 3.0) << 30u);
+    }
+    vec4 o = pc.format == 1u ? c.zyxw : c;
+    return quantize(o.x, 255.0) | (quantize(o.y, 255.0) << 8u) | (quantize(o.z, 255.0) << 16u)
+        | (quantize(o.w, 255.0) << 24u);
+}
+
+vec4 load(bool previous, ivec2 q) {
+    return unpack_pixel(previous ? imageLoad(prev_frame, q).r : imageLoad(cur_frame, q).r);
+}
+
+int luma_at(bool previous, ivec2 c) {
+    ivec2 size = previous ? imageSize(prev_luma) : imageSize(cur_luma);
+    c = clamp(c, ivec2(0), size - ivec2(1));
+    float l = previous ? imageLoad(prev_luma, c).r : imageLoad(cur_luma, c).r;
+    precise float q = clamp(l, 0.0, 1.0) * 255.0;
+    precise float r = q + 0.5;
+    return int(floor(r));
+}
+
+vec4 bilinear(bool previous, vec2 p) {
+    vec2 c = clamp(p, vec2(0.0), vec2(float(pc.w - 1u), float(pc.h - 1u)));
+    ivec2 p0 = ivec2(floor(c));
+    ivec2 p1 = min(p0 + ivec2(1), ivec2(int(pc.w) - 1, int(pc.h) - 1));
+    vec2 f = c - vec2(p0);
+    vec4 a = load(previous, p0);
+    vec4 b = load(previous, ivec2(p1.x, p0.y));
+    vec4 c0 = load(previous, ivec2(p0.x, p1.y));
+    vec4 d = load(previous, p1);
+    return mix(mix(a, b, f.x), mix(c0, d, f.x), f.y);
+}
+
+vec2 vector_at(ivec2 block) {
+    return imageLoad(flow, block).xy * 2.0;
+}
+
+shared int win_prev[6][8][8];
+shared int win_cur[6][8][8];
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    bool inside = p.x < int(pc.w) && p.y < int(pc.h);
+    if (pc.t == 0.0 || pc.t == 1.0) {
+        if (inside) {
+            uint w = pc.t == 0.0 ? imageLoad(prev_frame, p).r : imageLoad(cur_frame, p).r;
+            imageStore(dst, p, uvec4(w, 0u, 0u, 0u));
+        }
+        return;
+    }
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8;
+    ivec2 own = min(origin / BLOCK, ivec2(int(pc.flow_w) - 1, int(pc.flow_h) - 1));
+    ivec2 offsets[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    vec2 cands[6];
+    cands[0] = vec2(0.0);
+    int n = 1;
+    for (int i = 0; i < 5; i++) {
+        ivec2 b = own + offsets[i];
+        if (b.x < 0 || b.y < 0 || b.x >= int(pc.flow_w) || b.y >= int(pc.flow_h)) {
+            continue;
+        }
+        vec2 v = vector_at(b);
+        bool seen = false;
+        for (int j = 0; j < n; j++) {
+            seen = seen || cands[j] == v;
+        }
+        if (!seen) {
+            cands[n] = v;
+            n++;
+        }
+    }
+    ivec2 base_prev[6];
+    ivec2 base_cur[6];
+    for (int i = 0; i < n; i++) {
+        base_prev[i] = ivec2(floor((vec2(origin) - pc.t * cands[i]) / 2.0)) - ivec2(1);
+        base_cur[i] = ivec2(floor((vec2(origin) + (1.0 - pc.t) * cands[i]) / 2.0)) - ivec2(1);
+        win_prev[i][l.y][l.x] = luma_at(true, base_prev[i] + l);
+        win_cur[i][l.y][l.x] = luma_at(false, base_cur[i] + l);
+    }
+    barrier();
+    if (!inside) {
+        return;
+    }
+    vec2 pf = vec2(p);
+    uint best_cost = 0xFFFFFFFFu;
+    vec2 best = vec2(0.0);
+    for (int i = 0; i < n; i++) {
+        ivec2 ca = ivec2(floor((pf - pc.t * cands[i]) / 2.0)) - base_prev[i];
+        ivec2 cb = ivec2(floor((pf + (1.0 - pc.t) * cands[i]) / 2.0)) - base_cur[i];
+        uint cost = 0u;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                uint weight = (dx == 0 && dy == 0) ? 4u : 1u;
+                cost += weight * uint(abs(win_prev[i][ca.y + dy][ca.x + dx] - win_cur[i][cb.y + dy][cb.x + dx]));
+            }
+        }
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = cands[i];
+        }
+    }
+    vec4 a = bilinear(true, pf - pc.t * best);
+    vec4 b = bilinear(false, pf + (1.0 - pc.t) * best);
+    vec3 c = best_cost > DISAGREE8 ? (pc.t >= 0.5 ? b.rgb : a.rgb) : a.rgb * (1.0 - pc.t) + b.rgb * pc.t;
+    imageStore(dst, p, uvec4(pack_pixel(vec4(c, 1.0)), 0u, 0u, 0u));
+}
