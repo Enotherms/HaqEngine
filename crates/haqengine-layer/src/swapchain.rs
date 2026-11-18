@@ -287,10 +287,17 @@ pub unsafe fn fifo_present_info<'a>(pi: &vk::PresentInfoKHR<'a>, chain: &'a mut 
     match chain.copy_prefix(pi.p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT, present_ext_size) {
         PrefixCopy::Copied { head, target } => {
             let info = &mut *(target as *mut vk::SwapchainPresentModeInfoEXT);
-            if info.swapchain_count as usize > FIFO_MODES.len() {
+            let n = info.swapchain_count as usize;
+            if n > chain.modes.len() || n != pi.swapchain_count as usize || info.p_present_modes.is_null() {
                 return None;
             }
-            info.p_present_modes = FIFO_MODES.as_ptr();
+            let game_modes = std::slice::from_raw_parts(info.p_present_modes, n);
+            let swapchains = std::slice::from_raw_parts(pi.p_swapchains, n);
+            for (i, (sc, mode)) in swapchains.iter().zip(game_modes).enumerate() {
+                let fifo_only = SWAPCHAINS.get(sc.as_raw()).is_some_and(|s| s.fifo_only_modes);
+                chain.modes[i] = if fifo_only { vk::PresentModeKHR::FIFO } else { *mode };
+            }
+            info.p_present_modes = chain.modes.as_ptr();
             let mut out = *pi;
             out.p_next = head;
             Some(out)
@@ -576,6 +583,43 @@ mod tests {
         assert_eq!(game_modes, [vk::PresentModeKHR::IMMEDIATE], "the game's struct must not change");
         let seen = PRESENTED_MODES.lock().unwrap();
         seen.iter().rev().find(|(sc, _)| *sc == handle).map(|(_, m)| m.clone()).expect("presented")
+    }
+
+    #[test]
+    fn present_mode_info_rewrites_only_fifo_only_swapchains() {
+        use std::ffi::{c_void, CStr};
+        let load = |name: &CStr| -> *const c_void {
+            if name == c"vkQueuePresentKHR" { capture_present_modes as *const c_void } else { std::ptr::null() }
+        };
+        let (device, data) = crate::state::test_support::fake_device(load, vec![]);
+        let (a, b) = (0x5c_7001u64, 0x5c_7002u64);
+        SWAPCHAINS.created(a, SwapchainInfo { device: Some(Arc::clone(&data)), fifo_only_modes: true, ..info(a) });
+        SWAPCHAINS.created(b, SwapchainInfo { device: Some(data), fifo_only_modes: false, ..info(b) });
+        let queue = vk::Queue::from_raw(device.as_raw());
+        let game_modes = [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX];
+        let mode_info = vk::SwapchainPresentModeInfoEXT {
+            swapchain_count: 2,
+            p_present_modes: game_modes.as_ptr(),
+            ..Default::default()
+        };
+        let swapchains = [vk::SwapchainKHR::from_raw(a), vk::SwapchainKHR::from_raw(b)];
+        let indices = [0u32, 0];
+        let present = vk::PresentInfoKHR {
+            p_next: &mode_info as *const _ as *const c_void,
+            swapchain_count: 2,
+            p_swapchains: swapchains.as_ptr(),
+            p_image_indices: indices.as_ptr(),
+            ..Default::default()
+        };
+        let r = unsafe { queue_present(queue, &present) };
+        SWAPCHAINS.destroyed(a);
+        SWAPCHAINS.destroyed(b);
+        DEVICES.remove(dispatch_key(device));
+        assert_eq!(r, vk::Result::SUCCESS);
+        let seen = PRESENTED_MODES.lock().unwrap();
+        let modes = seen.iter().rev().find(|(sc, _)| *sc == a).map(|(_, m)| m.clone()).expect("presented");
+        assert_eq!(modes, [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX]);
+        assert_eq!(game_modes, [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX]);
     }
 
     #[test]
