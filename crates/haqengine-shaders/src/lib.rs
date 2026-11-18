@@ -70,6 +70,88 @@ pub const WARP_BLEND_PACKED: Shader = Shader {
     local_size: [8, 8],
 };
 
+/// How a descriptor binding of an FSR 3 pass is declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    StorageImage,
+    SampledImage,
+    UniformBuffer,
+}
+
+/// One FidelityFX FSR 3 compute pass (SDK v1.1.4), compiled as SPIR-V 1.3.
+#[derive(Debug, Clone, Copy)]
+pub struct Fsr3Pass {
+    pub name: &'static str,
+    pub spirv: &'static [u8],
+    pub local_size: [u32; 3],
+    pub bindings: &'static [(u32, BindingKind)],
+}
+
+use BindingKind::{SampledImage as Srv, StorageImage as Uav, UniformBuffer as Cb};
+
+/// Colour to 8-bit luma: 0 = colour, 1 = luma level 0 (`r8ui`), 2 = constants.
+pub const OF_PREPARE_LUMA: Fsr3Pass = Fsr3Pass {
+    name: "of_prepare_luma",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/of_prepare_luma.spv")),
+    local_size: [16, 16, 1],
+    bindings: &[(0, Srv), (1, Uav), (2, Cb)],
+};
+
+/// Luma levels 1 to 6 from level 0: 0..=6 = luma levels (`r8ui`), 7 = constants, 8 = SPD constants.
+pub const OF_LUMINANCE_PYRAMID: Fsr3Pass = Fsr3Pass {
+    name: "of_luminance_pyramid",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/of_luminance_pyramid.spv")),
+    local_size: [256, 1, 1],
+    bindings: &[(0, Uav), (1, Uav), (2, Uav), (3, Uav), (4, Uav), (5, Uav), (6, Uav), (7, Cb), (8, Cb)],
+};
+
+/// Scene-change histograms: 0 = luma, 1 = histogram (`r32ui`), 2 = constants.
+pub const OF_SCD_HISTOGRAM: Fsr3Pass = Fsr3Pass {
+    name: "of_scd_histogram",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/of_scd_histogram.spv")),
+    local_size: [32, 8, 1],
+    bindings: &[(0, Srv), (1, Uav), (2, Cb)],
+};
+
+/// Scene-change verdict: 0 = histogram, 1 = previous histogram (`r32f`), 2 = temp, 3 = output
+/// (`r32ui`), 4 = constants.
+pub const OF_SCD_DIVERGENCE: Fsr3Pass = Fsr3Pass {
+    name: "of_scd_divergence",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/of_scd_divergence.spv")),
+    local_size: [256, 1, 1],
+    bindings: &[(0, Uav), (1, Uav), (2, Uav), (3, Uav), (4, Cb)],
+};
+
+/// Block search for one level: 0 = current luma, 1 = previous luma, 2 = flow (`rg16i`), 3 = scene
+/// change output, 4 = constants.
+pub const OF_SEARCH: Fsr3Pass = Fsr3Pass {
+    name: "of_search",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/of_search.spv")),
+    local_size: [64, 1, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Uav), (3, Uav), (4, Cb)],
+};
+
+/// Flow filter for one level: 0 = searched flow, 1 = filtered flow (`rg16i`), 2 = constants.
+pub const OF_FILTER: Fsr3Pass = Fsr3Pass {
+    name: "of_filter",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/of_filter.spv")),
+    local_size: [16, 4, 1],
+    bindings: &[(0, Srv), (1, Uav), (2, Cb)],
+};
+
+/// Flow of one level scaled to the next finer level: 0 = current luma, 1 = previous luma, 2 = flow,
+/// 3 = next level flow, 4 = scene change output, 5 = constants.
+pub const OF_SCALE: Fsr3Pass = Fsr3Pass {
+    name: "of_scale",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/of_scale.spv")),
+    local_size: [4, 4, 4],
+    bindings: &[(0, Srv), (1, Srv), (2, Srv), (3, Uav), (4, Uav), (5, Cb)],
+};
+
+/// The FSR 3 optical flow passes, in dispatch order; indices are used by the schedule.
+pub const OF_PASSES: [&Fsr3Pass; 7] =
+    [&OF_PREPARE_LUMA, &OF_LUMINANCE_PYRAMID, &OF_SCD_HISTOGRAM, &OF_SCD_DIVERGENCE, &OF_SEARCH, &OF_FILTER, &OF_SCALE];
+
 /// Every shader HaqEngine ships.
 pub fn all() -> &'static [Shader] {
     &[
@@ -103,6 +185,49 @@ mod tests {
             let version = u32::from_le_bytes(s.spirv[4..8].try_into().unwrap());
             assert_eq!(version, 0x0001_0000, "{} is SPIR-V {:#x}", s.name, version);
         }
+    }
+
+    fn words(spirv: &[u8]) -> Vec<u32> {
+        spirv.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+    }
+
+    fn decorated_bindings(spirv: &[u8]) -> Vec<u32> {
+        let w = words(spirv);
+        let mut out = Vec::new();
+        let mut i = 5;
+        while i < w.len() {
+            let (count, op) = ((w[i] >> 16) as usize, w[i] & 0xffff);
+            if op == 71 && count >= 4 && w[i + 2] == 33 {
+                out.push(w[i + 3]);
+            }
+            i += count.max(1);
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn fsr3_passes_are_spirv_1_3() {
+        assert_eq!(OF_PASSES.len(), 7);
+        for p in OF_PASSES {
+            assert_eq!(words(p.spirv)[0], 0x0723_0203, "{}", p.name);
+            assert_eq!(words(p.spirv)[1], 0x0001_0300, "{}", p.name);
+        }
+    }
+
+    #[test]
+    fn fsr3_bindings_match_spirv() {
+        for p in OF_PASSES {
+            let mut table: Vec<u32> = p.bindings.iter().map(|b| b.0).collect();
+            table.sort_unstable();
+            assert_eq!(decorated_bindings(p.spirv), table, "{}", p.name);
+        }
+    }
+
+    #[test]
+    fn fsr3_pass_order() {
+        let names: Vec<&str> = OF_PASSES.iter().map(|p| p.name).collect();
+        assert_eq!(names, ["of_prepare_luma", "of_luminance_pyramid", "of_scd_histogram", "of_scd_divergence", "of_search", "of_filter", "of_scale"]);
     }
 
     #[test]
