@@ -402,6 +402,28 @@ impl Gpu {
         Ok(img)
     }
 
+    pub fn upload_r32f(&self, src: &Image<f32>) -> Result<StorageImage, String> {
+        let img = self.create_storage_image(vk::Format::R32_SFLOAT, src.width, src.height)?;
+        let bytes: Vec<u8> = src.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        unsafe { self.copy_in(&img, &bytes)? };
+        Ok(img)
+    }
+
+    pub fn upload_rg32f(&self, src: &Image<[f32; 2]>) -> Result<StorageImage, String> {
+        let img = self.create_storage_image(vk::Format::R32G32_SFLOAT, src.width, src.height)?;
+        let bytes: Vec<u8> = src.data.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        unsafe { self.copy_in(&img, &bytes)? };
+        Ok(img)
+    }
+
+    pub fn read_rg32f(&self, img: &StorageImage) -> Result<Image<[f32; 2]>, String> {
+        let n = (img.width * img.height) as usize;
+        let bytes = unsafe { self.copy_out(img, n * 8)? };
+        let f = |c: &[u8]| f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let data = bytes.chunks_exact(8).map(|c| [f(&c[..4]), f(&c[4..])]).collect();
+        Ok(Image { width: img.width, height: img.height, data })
+    }
+
     pub fn read_r32f(&self, img: &StorageImage) -> Result<Image<f32>, String> {
         let n = (img.width * img.height) as usize;
         let bytes = unsafe { self.copy_out(img, n * 4)? };

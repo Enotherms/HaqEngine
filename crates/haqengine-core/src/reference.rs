@@ -59,6 +59,17 @@ pub fn compare_f32(expected: &Image<f32>, actual: &Image<f32>, tol: f32) -> Comp
     compare(expected, actual, tol, |e, a| if a.is_nan() { f32::INFINITY } else { (e - a).abs() })
 }
 
+/// Compares two-component float images (motion vectors); NaN in `actual` counts as over tolerance.
+pub fn compare_rg32f(expected: &Image<[f32; 2]>, actual: &Image<[f32; 2]>, tol: f32) -> CompareReport {
+    compare(expected, actual, tol, |e, a| {
+        if a[0].is_nan() || a[1].is_nan() {
+            f32::INFINITY
+        } else {
+            (e[0] - a[0]).abs().max((e[1] - a[1]).abs())
+        }
+    })
+}
+
 /// Compares RGBA8 images channel by channel.
 pub fn compare_rgba8(expected: &Image<Rgba8>, actual: &Image<Rgba8>, tol_per_channel: u8) -> CompareReport {
     compare(expected, actual, tol_per_channel as f32, |e, a| {
@@ -136,6 +147,18 @@ mod tests {
         assert_eq!(r.over_tolerance, 1);
         let w = r.worst.unwrap();
         assert_eq!((w.x, w.y), (3, 1));
+    }
+
+    #[test]
+    fn compare_rg32f_exact_and_nan() {
+        let expected = Image::new(3, 2, [6.0f32, -4.0]);
+        assert_eq!(compare_rg32f(&expected, &expected, 0.0).over_tolerance, 0);
+        let mut actual = expected.clone();
+        actual.set(1, 1, [6.0, f32::NAN]);
+        actual.set(2, 0, [5.0, -4.0]);
+        let r = compare_rg32f(&expected, &actual, 0.0);
+        assert_eq!(r.over_tolerance, 2);
+        assert_eq!(r.worst.map(|w| (w.x, w.y)), Some((1, 1)));
     }
 
     #[test]
