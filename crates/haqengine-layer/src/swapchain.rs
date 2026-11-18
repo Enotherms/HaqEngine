@@ -83,6 +83,32 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, present_info: *con
 static NO_DEVICE_REPORTED: Once = Once::new();
 static MODE_INFO_UNREWRITTEN: Once = Once::new();
 
+/// The first non-FIFO mode a present's `VkSwapchainPresentModeInfoEXT` asks for on a swapchain
+/// created with a FIFO-only list, read in place without copying the chain.
+///
+/// # Safety
+/// `pi` must be a valid present.
+pub unsafe fn non_fifo_mode_on_fifo_only(pi: &vk::PresentInfoKHR) -> Option<vk::PresentModeKHR> {
+    let mut cur = pi.p_next as *const vk::BaseInStructure;
+    while !cur.is_null() && (*cur).s_type != vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT {
+        cur = (*cur).p_next;
+    }
+    if cur.is_null() || pi.p_swapchains.is_null() {
+        return None;
+    }
+    let info = &*(cur as *const vk::SwapchainPresentModeInfoEXT);
+    if info.p_present_modes.is_null() {
+        return None;
+    }
+    let n = (info.swapchain_count as usize).min(pi.swapchain_count as usize);
+    let modes = std::slice::from_raw_parts(info.p_present_modes, n);
+    let swapchains = std::slice::from_raw_parts(pi.p_swapchains, n);
+    swapchains.iter().zip(modes).find_map(|(sc, mode)| {
+        let fifo_only = SWAPCHAINS.get(sc.as_raw()).is_some_and(|s| s.fifo_only_modes);
+        (fifo_only && *mode != vk::PresentModeKHR::FIFO).then_some(*mode)
+    })
+}
+
 /// The structure types in a `pNext` chain, for diagnostics (at most 16).
 unsafe fn chain_types(p_next: *const std::ffi::c_void) -> Vec<i32> {
     let mut out = Vec::new();
@@ -92,18 +118,6 @@ unsafe fn chain_types(p_next: *const std::ffi::c_void) -> Vec<i32> {
         cur = (*cur).p_next;
     }
     out
-}
-
-/// True when a `pNext` chain contains a struct of type `s_type`.
-unsafe fn chain_has(p_next: *const std::ffi::c_void, s_type: vk::StructureType) -> bool {
-    let mut cur = p_next as *const vk::BaseInStructure;
-    while !cur.is_null() {
-        if (*cur).s_type == s_type {
-            return true;
-        }
-        cur = (*cur).p_next;
-    }
-    false
 }
 
 /// FIFO repeated, for rewritten present-mode lists (create: 1 entry; present: one per swapchain).
@@ -272,16 +286,15 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
             let mut chain = ChainCopy::new();
             let fifo_only = any_fifo_only(&*present_info);
             let rewritten = if fifo_only { fifo_present_info(&*present_info, &mut chain) } else { None };
-            if fifo_only
-                && rewritten.is_none()
-                && chain_has((*present_info).p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT)
-            {
-                MODE_INFO_UNREWRITTEN.call_once(|| {
-                    LOG.log(&format!(
-                        "warning: per-present mode info could not be rewritten to FIFO; chain {:?}",
-                        chain_types((*present_info).p_next)
-                    ))
-                });
+            if fifo_only && rewritten.is_none() {
+                if let Some(mode) = non_fifo_mode_on_fifo_only(&*present_info) {
+                    MODE_INFO_UNREWRITTEN.call_once(|| {
+                        LOG.log(&format!(
+                            "warning: present asks for {mode:?} on a FIFO-only swapchain and could not be rewritten; chain {:?}",
+                            chain_types((*present_info).p_next)
+                        ))
+                    });
+                }
             }
             let present_info: *const vk::PresentInfoKHR = match rewritten.as_ref() {
                 Some(pi) => pi,
@@ -619,6 +632,34 @@ mod tests {
         assert_eq!(game_modes, [vk::PresentModeKHR::IMMEDIATE], "the game's struct must not change");
         let seen = PRESENTED_MODES.lock().unwrap();
         seen.iter().rev().find(|(sc, _)| *sc == handle).map(|(_, m)| m.clone()).expect("presented")
+    }
+
+    #[test]
+    fn non_fifo_modes_found_only_for_fifo_only_swapchains() {
+        use std::ffi::c_void;
+        let (a, b) = (0x5c_8001u64, 0x5c_8002u64);
+        SWAPCHAINS.created(a, SwapchainInfo { fifo_only_modes: true, ..info(a) });
+        SWAPCHAINS.created(b, SwapchainInfo { fifo_only_modes: false, ..info(b) });
+        let swapchains = [vk::SwapchainKHR::from_raw(a), vk::SwapchainKHR::from_raw(b)];
+        let check = |modes: [vk::PresentModeKHR; 2]| {
+            let mode_info = vk::SwapchainPresentModeInfoEXT {
+                swapchain_count: 2,
+                p_present_modes: modes.as_ptr(),
+                ..Default::default()
+            };
+            let unknown = vk::ApplicationInfo { p_next: &mode_info as *const _ as *const c_void, ..Default::default() };
+            let pi = vk::PresentInfoKHR {
+                p_next: &unknown as *const _ as *const c_void,
+                swapchain_count: 2,
+                p_swapchains: swapchains.as_ptr(),
+                ..Default::default()
+            };
+            unsafe { non_fifo_mode_on_fifo_only(&pi) }
+        };
+        assert_eq!(check([vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX]), None);
+        assert_eq!(check([vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO]), Some(vk::PresentModeKHR::MAILBOX));
+        SWAPCHAINS.destroyed(a);
+        SWAPCHAINS.destroyed(b);
     }
 
     #[test]
