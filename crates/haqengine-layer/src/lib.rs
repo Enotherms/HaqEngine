@@ -2,6 +2,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod device;
+pub mod extensions;
 pub mod framegen;
 pub mod guard;
 pub mod instance;
@@ -52,6 +53,9 @@ fn instance_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCreateInstance" => erase(instance::create_instance as *const ()),
         b"vkDestroyInstance" => erase(instance::destroy_instance as *const ()),
         b"vkCreateDevice" => erase(device::create_device as *const ()),
+        b"vkEnumerateDeviceExtensionProperties" => {
+            erase(extensions::enumerate_device_extension_properties as *const ())
+        }
         _ => None,
     }
 }
@@ -148,6 +152,12 @@ mod tests {
         let f = unsafe { vkGetDeviceProcAddr(handle, c"vkGetDeviceQueue2".as_ptr()) };
         assert_eq!(f.map(|f| f as usize), Some(queue::get_device_queue2 as *const () as usize));
         DEVICES.remove(dispatch_key(handle));
+    }
+
+    #[test]
+    fn gipa_returns_own_enumerate_device_extensions() {
+        let f = unsafe { vkGetInstanceProcAddr(vk::Instance::null(), c"vkEnumerateDeviceExtensionProperties".as_ptr()) };
+        assert_eq!(f.map(|f| f as usize), Some(extensions::enumerate_device_extension_properties as *const () as usize));
     }
 
     #[test]
