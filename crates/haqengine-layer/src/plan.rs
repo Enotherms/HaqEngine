@@ -12,6 +12,27 @@ pub struct SwapchainPlan {
     pub present_mode: vk::PresentModeKHR,
 }
 
+/// Like `plan_swapchain`, also told whether the game chains `VkSwapchainPresentModesCreateInfoEXT`
+/// (it then switches present modes itself, so FIFO cannot be forced).
+pub fn plan_swapchain_with(
+    ci: &vk::SwapchainCreateInfoKHR,
+    caps: &vk::SurfaceCapabilitiesKHR,
+    multiplier: u32,
+    queue_can_transfer: bool,
+    game_manages_present_modes: bool,
+) -> SwapchainPlan {
+    if multiplier >= 2 && game_manages_present_modes {
+        return SwapchainPlan {
+            generate: false,
+            reason: "game manages present modes (swapchain_maintenance1)",
+            min_image_count: ci.min_image_count,
+            image_usage: ci.image_usage,
+            present_mode: ci.present_mode,
+        };
+    }
+    plan_swapchain(ci, caps, multiplier, queue_can_transfer)
+}
+
 /// Plans a swapchain from the game's create info and the surface capabilities.
 pub fn plan_swapchain(
     ci: &vk::SwapchainCreateInfoKHR,
@@ -124,6 +145,14 @@ mod tests {
         let p = plan_swapchain(&c, &caps(3, all_usage()), 2, true);
         assert_unchanged(&p, &c);
         assert_eq!(p.reason, "no room for an extra image");
+    }
+
+    #[test]
+    fn plan_off_when_game_manages_present_modes() {
+        let c = ci(3, vk::PresentModeKHR::IMMEDIATE);
+        let p = plan_swapchain_with(&c, &caps(8, all_usage()), 2, true, true);
+        assert_unchanged(&p, &c);
+        assert!(p.reason.contains("present modes"));
     }
 
     #[test]

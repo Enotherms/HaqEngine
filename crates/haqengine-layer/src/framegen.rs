@@ -438,9 +438,10 @@ pub fn acquire_outcome(result: vk::Result, index: u32) -> AcquireAction {
     }
 }
 
-/// True for presents HaqEngine can duplicate: one swapchain and no extension structs.
+/// True for presents HaqEngine can duplicate: exactly one swapchain. Extension structs in `pNext`
+/// (e.g. `VkPresentIdKHR`) are kept on the real present; the copy is presented without them.
 pub fn present_shape_ok(pi: &vk::PresentInfoKHR) -> bool {
-    pi.swapchain_count == 1 && !pi.p_swapchains.is_null() && !pi.p_image_indices.is_null() && pi.p_next.is_null()
+    pi.swapchain_count == 1 && !pi.p_swapchains.is_null() && !pi.p_image_indices.is_null()
 }
 
 #[cfg(test)]
@@ -483,7 +484,7 @@ mod tests {
         assert!(!present_shape_ok(&two));
         let ext = 0u64;
         let chained = vk::PresentInfoKHR { p_next: &ext as *const u64 as *const std::ffi::c_void, ..one };
-        assert!(!present_shape_ok(&chained));
+        assert!(present_shape_ok(&chained));
         let none = vk::PresentInfoKHR { swapchain_count: 1, p_swapchains: std::ptr::null(), ..Default::default() };
         assert!(!present_shape_ok(&none));
     }

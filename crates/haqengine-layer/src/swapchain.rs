@@ -2,7 +2,7 @@
 
 use crate::guard::guard;
 use crate::framegen::FrameGen;
-use crate::plan::plan_swapchain;
+use crate::plan::plan_swapchain_with;
 use crate::state::{device_can_transfer, dispatch_key, multiplier, DeviceData, DEVICES, LOG};
 use ash::vk;
 use ash::vk::Handle;
@@ -79,6 +79,18 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, present_info: *con
 }
 static NO_DEVICE_REPORTED: Once = Once::new();
 
+/// True when a `pNext` chain contains a struct of type `s_type`.
+unsafe fn chain_has(p_next: *const std::ffi::c_void, s_type: vk::StructureType) -> bool {
+    let mut cur = p_next as *const vk::BaseInStructure;
+    while !cur.is_null() {
+        if (*cur).s_type == s_type {
+            return true;
+        }
+        cur = (*cur).p_next;
+    }
+    false
+}
+
 unsafe fn create_swapchain_inner(
     device: vk::Device,
     create_info: *const vk::SwapchainCreateInfoKHR,
@@ -96,7 +108,9 @@ unsafe fn create_swapchain_inner(
             ci.surface,
             &mut caps,
         );
-        (r == vk::Result::SUCCESS).then(|| plan_swapchain(ci, &caps, multiplier(), device_can_transfer(&data)))
+        let manages_modes = chain_has(ci.p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT);
+        (r == vk::Result::SUCCESS)
+            .then(|| plan_swapchain_with(ci, &caps, multiplier(), device_can_transfer(&data), manages_modes))
     });
     let mut planned = *ci;
     if let Some(p) = plan.filter(|p| p.generate) {
