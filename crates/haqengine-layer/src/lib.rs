@@ -6,6 +6,7 @@ pub mod guard;
 pub mod instance;
 pub mod loader_abi;
 pub mod state;
+pub mod swapchain;
 
 use ash::vk;
 use loader_abi::NegotiateLayerInterface;
@@ -81,7 +82,11 @@ pub unsafe extern "system" fn vkGetDeviceProcAddr(device: vk::Device, p_name: *c
             return Some(f);
         }
         let data = DEVICES.get(dispatch_key(device))?;
-        (data.next_gdpa)(device, p_name)
+        let next = (data.next_gdpa)(device, p_name);
+        match (next, device::extension_hook(name)) {
+            (Some(_), Some(ours)) => Some(ours),
+            _ => next,
+        }
     })
 }
 
@@ -115,6 +120,29 @@ mod tests {
     #[test]
     fn negotiate_rejects_version_below_2() {
         assert_eq!(negotiate(1).0, vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+
+    unsafe extern "system" fn gdpa_nothing(_: vk::Device, _: *const c_char) -> vk::PFN_vkVoidFunction {
+        None
+    }
+
+    #[test]
+    fn gdpa_hides_swapchain_hooks_when_next_layer_lacks_them() {
+        use ash::vk::Handle;
+        let table: Box<usize> = Box::new(0x5eed);
+        let handle = vk::Device::from_raw(&*table as *const usize as u64);
+        let load = |_: &CStr| ptr::null();
+        let data = state::DeviceData {
+            next_gdpa: gdpa_nothing,
+            device: unsafe { ash::Device::load_with(load, handle) },
+            swapchain: ash::khr::swapchain::DeviceFn::load(load),
+        };
+        DEVICES.insert(dispatch_key(handle), std::sync::Arc::new(data));
+        for name in [c"vkCreateSwapchainKHR", c"vkDestroySwapchainKHR", c"vkQueuePresentKHR"] {
+            assert!(unsafe { vkGetDeviceProcAddr(handle, name.as_ptr()) }.is_none(), "{name:?}");
+        }
+        assert!(unsafe { vkGetDeviceProcAddr(handle, c"vkDestroyDevice".as_ptr()) }.is_some());
+        DEVICES.remove(dispatch_key(handle));
     }
 
     #[test]

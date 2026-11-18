@@ -63,11 +63,22 @@ pub unsafe extern "system" fn destroy_device(device: vk::Device, allocator: *con
     })
 }
 
-/// Our replacement for a device-level function, if HaqEngine hooks it.
+/// Our replacement for a core device-level function, if HaqEngine hooks it.
 pub fn device_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
     match name.to_bytes() {
         b"vkGetDeviceProcAddr" => crate::erase(crate::vkGetDeviceProcAddr as *const ()),
         b"vkDestroyDevice" => crate::erase(destroy_device as *const ()),
+        _ => None,
+    }
+}
+
+/// Our replacement for an extension function. Only handed out when the next layer
+/// provides the real one, so a disabled extension stays invisible.
+pub fn extension_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
+    match name.to_bytes() {
+        b"vkCreateSwapchainKHR" => crate::erase(crate::swapchain::create_swapchain as *const ()),
+        b"vkDestroySwapchainKHR" => crate::erase(crate::swapchain::destroy_swapchain as *const ()),
+        b"vkQueuePresentKHR" => crate::erase(crate::swapchain::queue_present as *const ()),
         _ => None,
     }
 }
