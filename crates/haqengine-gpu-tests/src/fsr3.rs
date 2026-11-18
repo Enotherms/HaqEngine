@@ -1,37 +1,42 @@
-//! FSR 3 optical flow on the GPU: every image of the schedule, created once and reused per frame.
+//! FSR 3 optical flow on the GPU at half resolution: every image and both schedules are created
+//! once, and each frame only uploads the packed frame and patches the frame number.
 
 use crate::gpu::{Gpu, StorageImage};
 use ash::vk;
-use haqengine_core::fsr3_flow::{ffx_to_haq, of_schedule, of_sizes, OfRes, OF_LEVELS, PASS_SEARCH};
-use haqengine_core::{Image, Rgba8};
-use haqengine_shaders::OF_PASSES;
-
-const SCD_HISTOGRAM_WIDTH: u32 = 256 * 9;
-
-/// The optical flow state of one frame size.
-pub struct Fsr3Flow {
-    pub width: u32,
-    pub height: u32,
-    images: Vec<(OfRes, StorageImage)>,
-    frame_index: u32,
-    pub times: PassTimes,
-}
-
-/// GPU time of one frame per pass, and of the search per pyramid level, in µs.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PassTimes {
-    pub passes: [f64; 7],
-    pub search_by_level: [f64; OF_LEVELS],
-}
+use haqengine_core::fsr3_flow::{
+    ffx_to_haq, half_size, of_schedule, of_sizes, set_frame_index, OfDispatch, OfInput, OfRes, OF_LEVELS, PASS_SEARCH,
+    SCD_HISTOGRAM_WIDTH,
+};
+use haqengine_core::packed::PackedFormat;
+use haqengine_core::Image;
+use haqengine_shaders::{BindingKind, OF_PASSES};
 
 /// The scene-change words FSR 3 writes: value (as `f32` bits), history bits, completed groups.
 pub type ScdOutput = [u32; 3];
 
+/// GPU time of one frame per pass, and of the search per pyramid level, in µs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PassTimes {
+    pub passes: [f64; 8],
+    pub search_by_level: [f64; OF_LEVELS],
+}
+
+/// The optical flow state for packed frames of one size.
+pub struct Fsr3Flow {
+    pub width: u32,
+    pub height: u32,
+    images: Vec<(OfRes, StorageImage)>,
+    schedules: [Vec<OfDispatch>; 2],
+    frame_index: u32,
+    pub times: PassTimes,
+}
+
 impl Fsr3Flow {
-    pub fn new(gpu: &Gpu, width: u32, height: u32) -> Result<Fsr3Flow, String> {
-        let sizes = of_sizes(width, height);
+    pub fn new(gpu: &Gpu, width: u32, height: u32, format: PackedFormat) -> Result<Fsr3Flow, String> {
+        let (hw, hh) = half_size(width, height);
+        let sizes = of_sizes(hw, hh);
         let mut wanted: Vec<(OfRes, vk::Format, (u32, u32))> = vec![
-            (OfRes::Color, vk::Format::R8G8B8A8_UNORM, (width, height)),
+            (OfRes::Raw, vk::Format::R32_UINT, (width, height)),
             (OfRes::Output, vk::Format::R16G16_SINT, sizes.flow[0]),
             (OfRes::ScdHistogram, vk::Format::R32_UINT, (SCD_HISTOGRAM_WIDTH, 1)),
             (OfRes::ScdPreviousHistogram, vk::Format::R32_SFLOAT, (SCD_HISTOGRAM_WIDTH, 1)),
@@ -44,9 +49,24 @@ impl Fsr3Flow {
                 wanted.push((OfRes::Flow(slot, level as u32), vk::Format::R16G16_SINT, sizes.flow[level]));
             }
         }
-        let mut flow = Fsr3Flow { width, height, images: Vec::new(), frame_index: 0, times: PassTimes::default() };
+        let input = OfInput::PackedHalf { format: format.code(), full_width: width, full_height: height };
+        let mut flow = Fsr3Flow {
+            width,
+            height,
+            images: Vec::with_capacity(wanted.len()),
+            schedules: [of_schedule(hw, hh, 0, input), of_schedule(hw, hh, 1, input)],
+            frame_index: 0,
+            times: PassTimes::default(),
+        };
         for (res, format, (w, h)) in wanted {
-            match gpu.create_storage_image(format, w, h).and_then(|img| gpu.clear_u32(&img, 0).map(|_| img)) {
+            let made = gpu.create_storage_image(format, w, h).and_then(|img| match gpu.clear_u32(&img, 0) {
+                Ok(()) => Ok(img),
+                Err(e) => {
+                    gpu.destroy_image(img);
+                    Err(e)
+                }
+            });
+            match made {
                 Ok(img) => flow.images.push((res, img)),
                 Err(e) => {
                     flow.destroy(gpu);
@@ -61,21 +81,26 @@ impl Fsr3Flow {
         self.images.iter().find(|(r, _)| *r == res).map(|(_, i)| i).ok_or_else(|| format!("no image for {res:?}"))
     }
 
-    /// Runs the whole schedule for the next frame and returns its GPU time in µs.
-    pub fn run_frame(&mut self, gpu: &Gpu, frame: &Image<Rgba8>) -> Result<f64, String> {
+    /// Runs the schedule for the next packed frame and returns its GPU time in µs.
+    pub fn run_frame(&mut self, gpu: &Gpu, frame: &Image<u32>) -> Result<f64, String> {
         if (frame.width, frame.height) != (self.width, self.height) {
             return Err("frame size differs from the flow size".into());
         }
-        gpu.write_rgba8(self.image(OfRes::Color)?, frame)?;
+        gpu.write_u32(self.image(OfRes::Raw)?, frame)?;
         let mut total = 0.0;
-        for d in of_schedule(self.width, self.height, self.frame_index) {
+        for d in &self.schedules[(self.frame_index & 1) as usize] {
             let images: Vec<(u32, &StorageImage)> =
                 d.bind.iter().map(|(b, r)| self.image(*r).map(|i| (*b, i))).collect::<Result<_, _>>()?;
-            let mut constants: Vec<&[u8]> = vec![&d.constants];
+            let mut constants = d.constants;
+            set_frame_index(&mut constants, self.frame_index);
+            let pass = OF_PASSES[d.pass];
+            let mut blocks: Vec<&[u8]> = vec![&constants];
             if let Some(spd) = &d.spd_constants {
-                constants.push(spd);
+                blocks.push(spd);
             }
-            let us = gpu.run_fsr3(OF_PASSES[d.pass], &images, &constants, d.groups)?;
+            let wanted = pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).count();
+            blocks.truncate(wanted);
+            let us = gpu.run_fsr3(pass, &images, &blocks, &d.push[..pass.push_size as usize], d.groups)?;
             self.times.passes[d.pass] += us;
             if d.pass == PASS_SEARCH {
                 let level = u32::from_le_bytes([d.constants[8], d.constants[9], d.constants[10], d.constants[11]]);
@@ -83,14 +108,15 @@ impl Fsr3Flow {
             }
             total += us;
         }
-        self.frame_index += 1;
+        self.frame_index = self.frame_index.saturating_add(1);
         Ok(total)
     }
 
-    /// Level-0 flow, one vector per 8×8 block of the frame, in HaqEngine's convention and pixels.
+    /// Level-0 flow, one vector per 16×16 block of the frame, in HaqEngine's convention and
+    /// full-resolution pixels.
     pub fn read_flow(&self, gpu: &Gpu) -> Result<Image<[f32; 2]>, String> {
         let raw = gpu.read_rg16i(self.image(OfRes::Output)?)?;
-        Ok(Image { width: raw.width, height: raw.height, data: raw.data.iter().map(|v| ffx_to_haq(*v)).collect() })
+        Ok(Image { width: raw.width, height: raw.height, data: raw.data.iter().map(|v| ffx_to_haq(*v, 2.0)).collect() })
     }
 
     pub fn read_scd(&self, gpu: &Gpu) -> Result<ScdOutput, String> {
@@ -108,10 +134,10 @@ impl Fsr3Flow {
 /// The last frame of a sequence: flow, scene-change output, GPU time and time per pass.
 pub type SequenceResult = (Image<[f32; 2]>, ScdOutput, f64, PassTimes);
 
-/// Runs every frame through a fresh flow state and reports on the last one.
-pub fn run_sequence(gpu: &Gpu, frames: &[Image<Rgba8>]) -> Result<SequenceResult, String> {
+/// Runs every packed frame through a fresh flow state and reports on the last one.
+pub fn run_sequence(gpu: &Gpu, format: PackedFormat, frames: &[Image<u32>]) -> Result<SequenceResult, String> {
     let first = frames.first().ok_or("no frames")?;
-    let mut flow = Fsr3Flow::new(gpu, first.width, first.height)?;
+    let mut flow = Fsr3Flow::new(gpu, first.width, first.height, format)?;
     let result = (|| {
         let mut last = 0.0;
         for f in frames {

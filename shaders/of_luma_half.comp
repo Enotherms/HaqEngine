@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D src;
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimage2D dst;
+
+layout(push_constant) uniform Push {
+    uint in_w;
+    uint in_h;
+    uint format;
+} pc;
+
+uvec3 channels(uint w) {
+    if (pc.format == 2u) {
+        return uvec3(w & 1023u, (w >> 10u) & 1023u, (w >> 20u) & 1023u);
+    }
+    uvec3 c = uvec3(w & 255u, (w >> 8u) & 255u, (w >> 16u) & 255u);
+    return pc.format == 1u ? c.zyx : c;
+}
+
+void main() {
+    uvec2 o = gl_GlobalInvocationID.xy;
+    uint out_w = (pc.in_w + 1u) / 2u;
+    uint out_h = (pc.in_h + 1u) / 2u;
+    if (o.x >= out_w || o.y >= out_h) {
+        return;
+    }
+    uint sum = 0u;
+    uint count = 0u;
+    for (uint dy = 0u; dy < 2u; dy++) {
+        for (uint dx = 0u; dx < 2u; dx++) {
+            uvec2 p = o * 2u + uvec2(dx, dy);
+            if (p.x < pc.in_w && p.y < pc.in_h) {
+                uvec3 c = channels(imageLoad(src, ivec2(p)).r);
+                sum += 2126u * c.r + 7152u * c.g + 722u * c.b;
+                count += 1u;
+            }
+        }
+    }
+    uint value;
+    if (pc.format == 2u) {
+        uint den = 10000u * count * 341u;
+        value = (sum * 85u + den / 2u) / den;
+    } else {
+        uint den = 10000u * count;
+        value = (sum + den / 2u) / den;
+    }
+    imageStore(dst, ivec2(o), uvec4(min(value, 255u), 0u, 0u, 0u));
+}

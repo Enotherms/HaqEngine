@@ -212,14 +212,24 @@ impl Gpu {
             .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None)
             .map_err(|e| err("creating a buffer", e))?;
         let req = d.get_buffer_memory_requirements(buffer);
-        let kind = self.memory_type(
-            req.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let memory = d
-            .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)
-            .map_err(|e| err("allocating buffer memory", e))?;
-        d.bind_buffer_memory(buffer, memory, 0).map_err(|e| err("binding buffer memory", e))?;
+        let memory = self
+            .memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+            .and_then(|kind| {
+                d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)
+                    .map_err(|e| err("allocating buffer memory", e))
+            });
+        let memory = match memory {
+            Ok(m) => m,
+            Err(e) => {
+                d.destroy_buffer(buffer, None);
+                return Err(e);
+            }
+        };
+        if let Err(e) = d.bind_buffer_memory(buffer, memory, 0) {
+            d.destroy_buffer(buffer, None);
+            d.free_memory(memory, None);
+            return Err(err("binding buffer memory", e));
+        }
         Ok((buffer, memory))
     }
 
@@ -329,22 +339,47 @@ impl Gpu {
                 )
                 .map_err(|e| err("creating an image", e))?;
             let req = d.get_image_memory_requirements(image);
-            let kind = self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            let memory = d
-                .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)
-                .map_err(|e| err("allocating image memory", e))?;
-            d.bind_image_memory(image, memory, 0).map_err(|e| err("binding image memory", e))?;
-            let view = d
-                .create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(format)
-                        .subresource_range(color_range()),
-                    None,
-                )
-                .map_err(|e| err("creating an image view", e))?;
-            self.submit(|cmd| self.transition(cmd, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL))?;
+            let memory = match self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL).and_then(|kind| {
+                d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)
+                    .map_err(|e| err("allocating image memory", e))
+            }) {
+                Ok(m) => m,
+                Err(e) => {
+                    d.destroy_image(image, None);
+                    return Err(e);
+                }
+            };
+            let free = |view: Option<vk::ImageView>| {
+                if let Some(v) = view {
+                    d.destroy_image_view(v, None);
+                }
+                d.destroy_image(image, None);
+                d.free_memory(memory, None);
+            };
+            if let Err(e) = d.bind_image_memory(image, memory, 0) {
+                free(None);
+                return Err(err("binding image memory", e));
+            }
+            let view = match d.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(color_range()),
+                None,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    free(None);
+                    return Err(err("creating an image view", e));
+                }
+            };
+            if let Err(e) = self.submit(|cmd| self.transition(cmd, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL)) {
+                if !self.is_lost() {
+                    free(Some(view));
+                }
+                return Err(e);
+            }
             Ok(StorageImage { image, memory, view, width, height })
         }
     }
@@ -423,10 +458,15 @@ impl Gpu {
         Ok(img)
     }
 
-    /// Replaces the contents of an existing `R8G8B8A8_UNORM` image.
-    pub fn write_rgba8(&self, img: &StorageImage, src: &Image<Rgba8>) -> Result<(), String> {
-        let bytes: Vec<u8> = src.data.iter().flatten().copied().collect();
+    pub fn write_u32(&self, img: &StorageImage, src: &Image<u32>) -> Result<(), String> {
+        let bytes: Vec<u8> = src.data.iter().flat_map(|v| v.to_le_bytes()).collect();
         unsafe { self.copy_in(img, &bytes) }
+    }
+
+    pub fn read_r8(&self, img: &StorageImage) -> Result<Image<u8>, String> {
+        let n = (img.width * img.height) as usize;
+        let data = unsafe { self.copy_out(img, n)? };
+        Ok(Image { width: img.width, height: img.height, data })
     }
 
     pub fn read_rg16i(&self, img: &StorageImage) -> Result<Image<[i16; 2]>, String> {
@@ -600,12 +640,15 @@ impl Gpu {
     }
 
     /// Runs one dispatch of an FSR 3 pass and returns its GPU time in µs. `images` maps binding
-    /// numbers to images; `constants` fills the pass's uniform buffers in binding order.
+    /// numbers to images; `constants` fills the pass's uniform buffers in binding order; `push`
+    /// holds the pass's push constants (`pass.push_size` bytes). Everything it creates is freed
+    /// on every path, unless the device is lost.
     pub fn run_fsr3(
         &self,
         pass: &Fsr3Pass,
         images: &[(u32, &StorageImage)],
         constants: &[&[u8]],
+        push: &[u8],
         groups: [u32; 3],
     ) -> Result<f64, String> {
         let kind_of = |k: BindingKind| match k {
@@ -619,137 +662,173 @@ impl Gpu {
         if cb_bindings.len() != constants.len() {
             return Err(format!("{} needs {} constant blocks, got {}", pass.name, cb_bindings.len(), constants.len()));
         }
+        if push.len() != pass.push_size as usize {
+            return Err(format!("{} needs {} push bytes, got {}", pass.name, pass.push_size, push.len()));
+        }
         for (b, kind) in pass.bindings {
             if *kind != BindingKind::UniformBuffer && !images.iter().any(|(n, _)| n == b) {
                 return Err(format!("{} binding {b} has no image", pass.name));
             }
         }
-        unsafe {
-            let d = &self.device;
-            let mut buffers = Vec::new();
-            let result = (|| {
-                for bytes in constants {
-                    let (buffer, memory) = self.host_buffer(bytes.len() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
-                    buffers.push((buffer, memory));
-                    let ptr = d
-                        .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
-                        .map_err(|e| err("mapping memory", e))?;
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-                    d.unmap_memory(memory);
-                }
-                let code = ash::util::read_spv(&mut std::io::Cursor::new(pass.spirv)).map_err(|e| e.to_string())?;
-                let module = d
-                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
-                    .map_err(|e| err("creating the shader module", e))?;
-                let layout_bindings: Vec<_> = pass
-                    .bindings
-                    .iter()
-                    .map(|(b, k)| {
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(*b)
-                            .descriptor_type(kind_of(*k))
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                    })
-                    .collect();
-                let set_layout = d
-                    .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings), None)
-                    .map_err(|e| err("creating the set layout", e))?;
-                let set_layouts = [set_layout];
-                let layout = d
-                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts), None)
-                    .map_err(|e| err("creating the pipeline layout", e))?;
-                let stage = vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::COMPUTE)
-                    .module(module)
-                    .name(c"main");
-                let pipeline = d
-                    .create_compute_pipelines(
-                        vk::PipelineCache::null(),
-                        &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
-                        None,
-                    )
-                    .map_err(|(_, e)| err("creating the pipeline", e))?[0];
-                let sizes: Vec<_> = [vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::UNIFORM_BUFFER]
-                    .into_iter()
-                    .map(|ty| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(pass.bindings.len() as u32))
-                    .collect();
-                let desc_pool = d
-                    .create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)
-                    .map_err(|e| err("creating the descriptor pool", e))?;
-                let set = d
-                    .allocate_descriptor_sets(
-                        &vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&set_layouts),
-                    )
-                    .map_err(|e| err("allocating the descriptor set", e))?[0];
-                let image_infos: Vec<(u32, vk::DescriptorType, [vk::DescriptorImageInfo; 1])> = pass
-                    .bindings
-                    .iter()
-                    .filter(|(_, k)| *k != BindingKind::UniformBuffer)
-                    .map(|(b, k)| {
-                        let img = images.iter().find(|(n, _)| n == b).map(|(_, i)| *i).expect("checked above");
-                        (
-                            *b,
-                            kind_of(*k),
-                            [vk::DescriptorImageInfo::default().image_view(img.view).image_layout(vk::ImageLayout::GENERAL)],
-                        )
-                    })
-                    .collect();
-                let buffer_infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = cb_bindings
-                    .iter()
-                    .zip(&buffers)
-                    .zip(constants)
-                    .map(|((b, (buffer, _)), bytes)| {
-                        (*b, [vk::DescriptorBufferInfo::default().buffer(*buffer).range(bytes.len() as u64)])
-                    })
-                    .collect();
-                let mut writes: Vec<vk::WriteDescriptorSet> = image_infos
-                    .iter()
-                    .map(|(b, ty, info)| {
-                        vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(*ty).image_info(info)
-                    })
-                    .collect();
-                writes.extend(buffer_infos.iter().map(|(b, info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(*b)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .buffer_info(info)
-                }));
-                d.update_descriptor_sets(&writes, &[]);
-                let submitted = self.submit(|cmd| {
-                    d.cmd_reset_query_pool(cmd, self.query_pool, 0, 2);
-                    d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                    d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-                    d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
-                    d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
-                });
-                let time = submitted.and_then(|_| {
-                    if !self.timestamps {
-                        return Ok(f64::NAN);
-                    }
-                    let mut stamps = [0u64; 2];
-                    d.get_query_pool_results(self.query_pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
-                        .map_err(|e| err("reading timestamps", e))?;
-                    Ok(stamps[1].wrapping_sub(stamps[0]) as f64 * self.timestamp_period_ns as f64 / 1000.0)
-                });
-                if !self.is_lost() {
-                    d.destroy_descriptor_pool(desc_pool, None);
-                    d.destroy_pipeline(pipeline, None);
-                    d.destroy_pipeline_layout(layout, None);
-                    d.destroy_descriptor_set_layout(set_layout, None);
-                    d.destroy_shader_module(module, None);
-                }
-                time
-            })();
-            if !self.is_lost() {
-                for (buffer, memory) in buffers {
-                    d.destroy_buffer(buffer, None);
-                    d.free_memory(memory, None);
-                }
+        let mut owned = Owned::default();
+        let result = unsafe { self.dispatch_fsr3(pass, images, constants, push, groups, &cb_bindings, &kind_of, &mut owned) };
+        if !self.is_lost() {
+            unsafe { owned.free(&self.device) };
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn dispatch_fsr3(
+        &self,
+        pass: &Fsr3Pass,
+        images: &[(u32, &StorageImage)],
+        constants: &[&[u8]],
+        push: &[u8],
+        groups: [u32; 3],
+        cb_bindings: &[u32],
+        kind_of: &dyn Fn(BindingKind) -> vk::DescriptorType,
+        owned: &mut Owned,
+    ) -> Result<f64, String> {
+        let d = &self.device;
+        for bytes in constants {
+            let (buffer, memory) = self.host_buffer(bytes.len() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+            owned.buffers.push((buffer, memory));
+            let ptr = d
+                .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| err("mapping memory", e))?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            d.unmap_memory(memory);
+        }
+        let code = ash::util::read_spv(&mut std::io::Cursor::new(pass.spirv)).map_err(|e| e.to_string())?;
+        let module = d
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+            .map_err(|e| err("creating the shader module", e))?;
+        owned.module = module;
+        let layout_bindings: Vec<_> = pass
+            .bindings
+            .iter()
+            .map(|(b, k)| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(*b)
+                    .descriptor_type(kind_of(*k))
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+        let set_layout = d
+            .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings), None)
+            .map_err(|e| err("creating the set layout", e))?;
+        owned.set_layout = set_layout;
+        let set_layouts = [set_layout];
+        let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(pass.push_size)];
+        let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        let layout_info = if pass.push_size > 0 { layout_info.push_constant_ranges(&ranges) } else { layout_info };
+        let layout = d.create_pipeline_layout(&layout_info, None).map_err(|e| err("creating the pipeline layout", e))?;
+        owned.layout = layout;
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(c"main");
+        let pipeline = d
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
+                None,
+            )
+            .map_err(|(_, e)| err("creating the pipeline", e))?[0];
+        owned.pipeline = pipeline;
+        let sizes: Vec<_> = [vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::UNIFORM_BUFFER]
+            .into_iter()
+            .map(|ty| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(pass.bindings.len() as u32))
+            .collect();
+        let desc_pool = d
+            .create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)
+            .map_err(|e| err("creating the descriptor pool", e))?;
+        owned.desc_pool = desc_pool;
+        let set = d
+            .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&set_layouts))
+            .map_err(|e| err("allocating the descriptor set", e))?[0];
+        let image_infos: Vec<(u32, vk::DescriptorType, [vk::DescriptorImageInfo; 1])> = pass
+            .bindings
+            .iter()
+            .filter(|(_, k)| *k != BindingKind::UniformBuffer)
+            .filter_map(|(b, k)| {
+                images.iter().find(|(n, _)| n == b).map(|(_, img)| {
+                    (*b, kind_of(*k), [vk::DescriptorImageInfo::default().image_view(img.view).image_layout(vk::ImageLayout::GENERAL)])
+                })
+            })
+            .collect();
+        let buffer_infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = cb_bindings
+            .iter()
+            .zip(&owned.buffers)
+            .zip(constants)
+            .map(|((b, (buffer, _)), bytes)| (*b, [vk::DescriptorBufferInfo::default().buffer(*buffer).range(bytes.len() as u64)]))
+            .collect();
+        let mut writes: Vec<vk::WriteDescriptorSet> = image_infos
+            .iter()
+            .map(|(b, ty, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(*ty).image_info(info))
+            .collect();
+        writes.extend(buffer_infos.iter().map(|(b, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(*b)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(info)
+        }));
+        d.update_descriptor_sets(&writes, &[]);
+        self.submit(|cmd| {
+            d.cmd_reset_query_pool(cmd, self.query_pool, 0, 2);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            if pass.push_size > 0 {
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
-            result
+            d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
+        })?;
+        if !self.timestamps {
+            return Ok(f64::NAN);
+        }
+        let mut stamps = [0u64; 2];
+        d.get_query_pool_results(self.query_pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
+            .map_err(|e| err("reading timestamps", e))?;
+        Ok(stamps[1].wrapping_sub(stamps[0]) as f64 * self.timestamp_period_ns as f64 / 1000.0)
+    }
+}
+
+/// Vulkan objects made for one dispatch; null handles are skipped when freeing.
+#[derive(Default)]
+struct Owned {
+    buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    module: vk::ShaderModule,
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    desc_pool: vk::DescriptorPool,
+}
+
+impl Owned {
+    unsafe fn free(self, d: &ash::Device) {
+        if self.desc_pool != vk::DescriptorPool::null() {
+            d.destroy_descriptor_pool(self.desc_pool, None);
+        }
+        if self.pipeline != vk::Pipeline::null() {
+            d.destroy_pipeline(self.pipeline, None);
+        }
+        if self.layout != vk::PipelineLayout::null() {
+            d.destroy_pipeline_layout(self.layout, None);
+        }
+        if self.set_layout != vk::DescriptorSetLayout::null() {
+            d.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+        if self.module != vk::ShaderModule::null() {
+            d.destroy_shader_module(self.module, None);
+        }
+        for (buffer, memory) in self.buffers {
+            d.destroy_buffer(buffer, None);
+            d.free_memory(memory, None);
         }
     }
 }
