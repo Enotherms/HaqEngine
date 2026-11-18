@@ -7,6 +7,10 @@ use std::path::PathBuf;
 pub struct Settings {
     /// Where to write the log, or `None` for no log.
     pub log_path: Option<PathBuf>,
+    /// Frames shown per real frame: 1 (pass-through) or 2.
+    pub multiplier: u32,
+    /// Set when the requested multiplier was clamped.
+    pub multiplier_note: Option<String>,
 }
 
 impl Settings {
@@ -21,7 +25,12 @@ impl Settings {
                 .or_else(|| non_empty("HOME").map(|h| PathBuf::from(h).join(".local/state")))
                 .map(|base| base.join("haqengine/haqengine.log")),
         };
-        Settings { log_path }
+        let (multiplier, multiplier_note) = match get("HAQENGINE_MULTIPLIER").as_deref().map(str::trim) {
+            Some("2") => (2, None),
+            Some(v @ ("3" | "4")) => (2, Some(format!("multiplier {v} requested; 3x/4x arrive in M5, using 2"))),
+            _ => (1, None),
+        };
+        Settings { log_path, multiplier, multiplier_note }
     }
 }
 
@@ -64,6 +73,31 @@ mod tests {
             Some(PathBuf::from("/home/deck/.local/state/haqengine/haqengine.log"))
         );
         assert_eq!(Settings::from_lookup(env(&[])).log_path, None);
+    }
+
+    #[test]
+    fn multiplier_defaults_to_1() {
+        assert_eq!(Settings::from_lookup(env(&[])).multiplier, 1);
+    }
+
+    #[test]
+    fn multiplier_accepts_1_and_2() {
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", "2")])).multiplier, 2);
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", "1")])).multiplier, 1);
+    }
+
+    #[test]
+    fn multiplier_clamps_3_and_4_with_note() {
+        let s = Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", "4")]));
+        assert_eq!(s.multiplier, 2);
+        assert!(s.multiplier_note.unwrap().contains("M5"));
+    }
+
+    #[test]
+    fn multiplier_rejects_garbage() {
+        for v in ["0", "9", "x", "", "-2"] {
+            assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", v)])).multiplier, 1, "{v}");
+        }
     }
 
     #[test]
