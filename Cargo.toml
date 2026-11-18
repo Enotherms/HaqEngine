@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/haqengine-core", "crates/haqengine-layer"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"
