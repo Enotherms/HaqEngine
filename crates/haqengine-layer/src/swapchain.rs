@@ -1,7 +1,9 @@
 //! Swapchain and present pass-through. M0 only counts presents and forwards everything unchanged.
 
 use crate::guard::guard;
-use crate::state::{dispatch_key, DeviceData, DEVICES, LOG};
+use crate::framegen::FrameGen;
+use crate::plan::plan_swapchain;
+use crate::state::{device_can_transfer, dispatch_key, multiplier, DeviceData, DEVICES, LOG};
 use ash::vk;
 use ash::vk::Handle;
 use haqengine_core::HandleMap;
@@ -16,6 +18,8 @@ pub struct SwapchainInfo {
     pub presents: AtomicU64,
     /// The device that created it, used when a present arrives on a queue we can't map.
     pub device: Option<Arc<DeviceData>>,
+    /// Generation resources, when this swapchain generates frames.
+    pub gen: Option<crate::framegen::FrameGen>,
 }
 
 /// Live swapchains, keyed by raw handle.
@@ -80,16 +84,39 @@ unsafe fn create_swapchain_inner(
     let Some(data) = DEVICES.get(dispatch_key(device)) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-    let result = (data.swapchain.create_swapchain_khr)(device, create_info, allocator, out);
+    let ci = &*create_info;
+    let plan = guard("swapchain plan", None, || unsafe {
+        let mut caps = vk::SurfaceCapabilitiesKHR::default();
+        let r = (data.instance.surface.get_physical_device_surface_capabilities_khr)(
+            data.physical_device,
+            ci.surface,
+            &mut caps,
+        );
+        (r == vk::Result::SUCCESS).then(|| plan_swapchain(ci, &caps, multiplier(), device_can_transfer(&data)))
+    });
+    let mut planned = *ci;
+    if let Some(p) = plan.filter(|p| p.generate) {
+        planned.min_image_count = p.min_image_count;
+        planned.image_usage = p.image_usage;
+        planned.present_mode = p.present_mode;
+    }
+    let result = (data.swapchain.create_swapchain_khr)(device, &planned, allocator, out);
     if result == vk::Result::SUCCESS {
         guard("swapchain bookkeeping", (), || unsafe {
-            let ci = &*create_info;
-            let mut images = 0u32;
-            let _ = (data.swapchain.get_swapchain_images_khr)(device, *out, &mut images, std::ptr::null_mut());
+            let mut count = 0u32;
+            let _ = (data.swapchain.get_swapchain_images_khr)(device, *out, &mut count, std::ptr::null_mut());
+            let mut images = vec![vk::Image::null(); count as usize];
+            let r = (data.swapchain.get_swapchain_images_khr)(device, *out, &mut count, images.as_mut_ptr());
+            images.truncate(count as usize);
+            let reason = match plan {
+                None => "surface capabilities unavailable",
+                Some(p) => p.reason,
+            };
+            let generate = plan.is_some_and(|p| p.generate) && r == vk::Result::SUCCESS && !images.is_empty();
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             LOG.log(&format!(
-                "swapchain {id}: {}x{} format {:?} images {images}",
-                ci.image_extent.width, ci.image_extent.height, ci.image_format
+                "swapchain {id}: {}x{} format {:?} colour {:?} images {count} mode {:?} gen {reason}",
+                ci.image_extent.width, ci.image_extent.height, ci.image_format, ci.image_color_space, planned.present_mode
             ));
             SWAPCHAINS.created(
                 (*out).as_raw(),
@@ -97,9 +124,10 @@ unsafe fn create_swapchain_inner(
                     id,
                     extent: ci.image_extent,
                     format: ci.image_format,
-                    images,
+                    images: count,
                     presents: AtomicU64::new(0),
                     device: Some(Arc::clone(&data)),
+                    gen: generate.then(|| FrameGen::new(images, ci.image_extent)),
                 },
             );
         });
@@ -112,8 +140,11 @@ unsafe fn destroy_swapchain_inner(
     swapchain: vk::SwapchainKHR,
     allocator: *const vk::AllocationCallbacks,
 ) {
-    guard("swapchain destroy log", (), || {
+    guard("swapchain destroy log", (), || unsafe {
         if let Some(info) = SWAPCHAINS.destroyed(swapchain.as_raw()) {
+            if let (Some(gen), Some(dev)) = (info.gen.as_ref(), info.device.as_ref()) {
+                gen.destroy(dev);
+            }
             LOG.log(&format!(
                 "swapchain {} destroyed after {} presents",
                 info.id,
@@ -171,7 +202,100 @@ mod tests {
             images: 3,
             presents: AtomicU64::new(0),
             device: None,
+            gen: None,
         }
+    }
+
+    static CAPTURED: std::sync::Mutex<Option<(u32, vk::ImageUsageFlags, vk::PresentModeKHR)>> =
+        std::sync::Mutex::new(None);
+
+    unsafe extern "system" fn capture_create(
+        _: vk::Device,
+        ci: *const vk::SwapchainCreateInfoKHR,
+        _: *const vk::AllocationCallbacks,
+        out: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        let ci = unsafe { &*ci };
+        *CAPTURED.lock().unwrap() = Some((ci.min_image_count, ci.image_usage, ci.present_mode));
+        unsafe { *out = vk::SwapchainKHR::from_raw(0x5c_4444) };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn two_images(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        count: *mut u32,
+        images: *mut vk::Image,
+    ) -> vk::Result {
+        unsafe {
+            if !images.is_null() {
+                *images = vk::Image::from_raw(0x1);
+                *images.add(1) = vk::Image::from_raw(0x2);
+            }
+            *count = 2;
+        }
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn all_caps(
+        _: vk::PhysicalDevice,
+        _: vk::SurfaceKHR,
+        caps: *mut vk::SurfaceCapabilitiesKHR,
+    ) -> vk::Result {
+        unsafe {
+            *caps = vk::SurfaceCapabilitiesKHR {
+                min_image_count: 2,
+                max_image_count: 8,
+                supported_usage_flags: vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+                ..Default::default()
+            };
+        }
+        vk::Result::SUCCESS
+    }
+
+    #[test]
+    fn create_swapchain_applies_plan() {
+        use std::ffi::{c_void, CStr};
+        let load = |name: &CStr| -> *const c_void {
+            match name.to_bytes() {
+                b"vkCreateSwapchainKHR" => capture_create as *const c_void,
+                b"vkGetSwapchainImagesKHR" => two_images as *const c_void,
+                _ => std::ptr::null(),
+            }
+        };
+        let instance_load = |name: &CStr| -> *const c_void {
+            if name == c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" { all_caps as *const c_void } else { std::ptr::null() }
+        };
+        let families = vec![vk::QueueFamilyProperties { queue_flags: vk::QueueFlags::GRAPHICS, ..Default::default() }];
+        let (device, _) = crate::state::test_support::fake_device_full(
+            load,
+            families,
+            crate::state::test_support::gdpa_nothing,
+            instance_load,
+        );
+        crate::state::set_test_multiplier(2);
+        let ci = vk::SwapchainCreateInfoKHR {
+            min_image_count: 3,
+            image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            present_mode: vk::PresentModeKHR::MAILBOX,
+            image_extent: vk::Extent2D { width: 1280, height: 800 },
+            ..Default::default()
+        };
+        let mut out = vk::SwapchainKHR::null();
+        let result = unsafe { create_swapchain(device, &ci, std::ptr::null(), &mut out) };
+        crate::state::set_test_multiplier(0);
+        let info = SWAPCHAINS.destroyed(out.as_raw());
+        DEVICES.remove(dispatch_key(device));
+        assert_eq!(result, vk::Result::SUCCESS);
+        let (min, usage, mode) = CAPTURED.lock().unwrap().take().unwrap();
+        assert_eq!(mode, vk::PresentModeKHR::FIFO);
+        assert_eq!(min, 4);
+        assert!(usage.contains(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST));
+        let gen = info.unwrap().gen.as_ref().map(|g| g.images.len());
+        assert_eq!(gen, Some(2));
     }
 
     static FAKE_PRESENTS: AtomicU64 = AtomicU64::new(0);

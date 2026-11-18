@@ -2,6 +2,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod device;
+pub mod framegen;
 pub mod guard;
 pub mod instance;
 pub mod loader_abi;
