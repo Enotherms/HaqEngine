@@ -301,7 +301,7 @@ impl BatteryResources {
                 }
             }
         }
-        let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(64)];
+        let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(80)];
         let pool = match d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(24).pool_sizes(&sizes), None) {
             Ok(p) => p,
             Err(e) => {
@@ -368,7 +368,7 @@ impl BatteryResources {
                 let coarse = if l + 1 < LEVELS { v(MEDIAN_BASE + l) } else { v(DUMMY) };
                 write_set(d, set, &[v(pyr(q, l)), v(pyr(p, l)), coarse, v(FLOW_BASE + l)]);
             }
-            write_set(d, self.warp_sets[p], &[v(q), v(p), v(FLOW_BASE), v(RAW_OUT)]);
+            write_set(d, self.warp_sets[p], &[v(q), v(p), v(FLOW_BASE), v(RAW_OUT), v(pyr(q, 0)), v(pyr(p, 0))]);
         }
         for l in 1..LEVELS {
             write_set(d, self.median_sets[l - 1], &[v(FLOW_BASE + l), v(MEDIAN_BASE + l - 1)]);

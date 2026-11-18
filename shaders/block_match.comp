@@ -78,18 +78,16 @@ void main() {
     prev_q[tid] = valid ? quantize(imageLoad(prev_luma, q).r) : 0;
     barrier();
 
-    ivec2 candidates[10];
+    ivec2 candidates[6];
     int n = 0;
     if (pc.use_coarse != 0u) {
         ivec2 c = ivec2(min(uint(b.x) / 2u, pc.coarse_w - 1u), min(uint(b.y) / 2u, pc.coarse_h - 1u));
         candidates[n++] = scaled(c);
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                ivec2 nb = c + ivec2(dx, dy);
-                bool inside = nb.x >= 0 && nb.y >= 0 && nb.x < int(pc.coarse_w) && nb.y < int(pc.coarse_h);
-                if ((dx != 0 || dy != 0) && inside) {
-                    candidates[n++] = scaled(nb);
-                }
+        ivec2 edges[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+        for (int e = 0; e < 4; e++) {
+            ivec2 nb = c + edges[e];
+            if (nb.x >= 0 && nb.y >= 0 && nb.x < int(pc.coarse_w) && nb.y < int(pc.coarse_h)) {
+                candidates[n++] = scaled(nb);
             }
         }
     }
@@ -108,7 +106,7 @@ void main() {
 
     ivec2 pred = candidates[0];
     int pred_score = 0x7fffffff;
-    for (int i = 0; i < m; i++) {
+    for (int i = 0; i < (m > 1 ? m : 0); i++) {
         load_window(b, candidates[i], 1, limit, tid);
         compute_sads(b, 1, tid);
         int score = 0x7fffffff;

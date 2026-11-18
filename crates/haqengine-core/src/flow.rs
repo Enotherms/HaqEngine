@@ -2,7 +2,7 @@
 //! warp-and-blend interpolation. These are the references the GPU shaders must match.
 
 use crate::image::{Image, Rgba8};
-use crate::reference::{luma_downsample, LUMA};
+use crate::reference::luma_downsample;
 
 /// Block size in pixels of the level being matched.
 pub const BLOCK: u32 = 8;
@@ -97,9 +97,8 @@ pub fn candidate_score(prev: &Image<f32>, cur: &Image<f32>, bx: u32, by: u32, c:
     best
 }
 
-/// Candidate predictions for a block, in order and without duplicates: its own coarse block, the
-/// eight neighbouring coarse blocks (row-major, those that exist), then zero. Without `coarse`,
-/// only zero.
+/// Candidate predictions for a block, in order and without duplicates: its own coarse block, its
+/// left, right, up and down neighbours (those that exist), then zero. Without `coarse`, only zero.
 pub fn predictions(coarse: Option<&Flow>, bx: u32, by: u32) -> Vec<[i32; 2]> {
     let Some(c) = coarse else { return vec![[0, 0]] };
     let scaled = |x: u32, y: u32| {
@@ -108,12 +107,10 @@ pub fn predictions(coarse: Option<&Flow>, bx: u32, by: u32) -> Vec<[i32; 2]> {
     };
     let (cx, cy) = ((bx / 2).min(c.width - 1) as i32, (by / 2).min(c.height - 1) as i32);
     let mut out = vec![scaled(cx as u32, cy as u32)];
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            let (x, y) = (cx + dx, cy + dy);
-            if (dx, dy) != (0, 0) && x >= 0 && y >= 0 && x < c.width as i32 && y < c.height as i32 {
-                out.push(scaled(x as u32, y as u32));
-            }
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        let (x, y) = (cx + dx, cy + dy);
+        if x >= 0 && y >= 0 && x < c.width as i32 && y < c.height as i32 {
+            out.push(scaled(x as u32, y as u32));
         }
     }
     out.push([0, 0]);
@@ -199,6 +196,13 @@ pub fn candidate_vectors(flow: &Flow, x: u32, y: u32) -> ([[f32; 2]; CANDIDATES]
     (out, n)
 }
 
+/// Level-0 luma (half resolution) at full-resolution position `(x, y)`, nearest, clamped.
+pub fn luma_nearest(img: &Image<f32>, x: f32, y: f32) -> f32 {
+    let lx = ((x / 2.0).floor() as i64).clamp(0, img.width as i64 - 1) as u32;
+    let ly = ((y / 2.0).floor() as i64).clamp(0, img.height as i64 - 1) as u32;
+    img.get(lx, ly)
+}
+
 /// Index and cost of the candidate whose previous and current samples agree best.
 pub fn pick(
     prev_luma_at: impl Fn(f32, f32) -> f32,
@@ -221,16 +225,17 @@ pub fn pick(
 
 /// One output pixel at time `t`: picks the best candidate vector, then blends the two samples, or
 /// takes the nearer frame's sample when they disagree. Samplers return channels in `0..=scale`.
+#[allow(clippy::too_many_arguments)]
 pub fn interpolate_pixel(
     sample_prev: impl Fn(f32, f32) -> [f32; 4],
     sample_cur: impl Fn(f32, f32) -> [f32; 4],
-    scale: f32,
+    prev_luma: &Image<f32>,
+    cur_luma: &Image<f32>,
     p: (f32, f32),
     t: f32,
     cands: &[[f32; 2]],
 ) -> [f32; 4] {
-    let luma = |c: [f32; 4]| (LUMA[0] * c[0] + LUMA[1] * c[1] + LUMA[2] * c[2]) / scale;
-    let (i, cost) = pick(|x, y| luma(sample_prev(x, y)), |x, y| luma(sample_cur(x, y)), p, t, cands);
+    let (i, cost) = pick(|x, y| luma_nearest(prev_luma, x, y), |x, y| luma_nearest(cur_luma, x, y), p, t, cands);
     let v = cands[i];
     let a = sample_prev(p.0 - t * v[0], p.1 - t * v[1]);
     let b = sample_cur(p.0 + (1.0 - t) * v[0], p.1 + (1.0 - t) * v[1]);
@@ -245,7 +250,14 @@ pub fn interpolate_pixel(
 }
 
 /// The frame at time `t` between `prev` (t = 0) and `cur` (t = 1), following `flow`.
-pub fn warp_blend(prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow: &Flow, t: f32) -> Image<Rgba8> {
+pub fn warp_blend(
+    prev: &Image<Rgba8>,
+    cur: &Image<Rgba8>,
+    prev_luma: &Image<f32>,
+    cur_luma: &Image<f32>,
+    flow: &Flow,
+    t: f32,
+) -> Image<Rgba8> {
     if t == 0.0 {
         return prev.clone();
     }
@@ -259,7 +271,8 @@ pub fn warp_blend(prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow: &Flow, t: f32) 
             let c = interpolate_pixel(
                 |sx, sy| bilinear(prev, sx, sy),
                 |sx, sy| bilinear(cur, sx, sy),
-                255.0,
+                prev_luma,
+                cur_luma,
                 (x as f32, y as f32),
                 t,
                 &cands[..n],
@@ -460,7 +473,7 @@ mod tests {
         }
         let mut expected = shift(&bg, 8, 0);
         paste(&mut expected, &square, sx, sy);
-        let new = warp_blend(&prev, &cur, &flow, 0.5);
+        let new = warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.5);
         let old = old_warp(&prev, &cur, &flow, 0.5);
         for y in sy + 8..sy + 40 {
             for x in sx + 8..sx + 40 {
@@ -494,7 +507,7 @@ mod tests {
         let prev = noise(128, 96, 2);
         let cur = shift(&prev, 8, 0);
         let flow = Image::new(8, 6, [4.0f32, 0.0]);
-        let (new, old) = (warp_blend(&prev, &cur, &flow, 0.5), old_warp(&prev, &cur, &flow, 0.5));
+        let (new, old) = (warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.5), old_warp(&prev, &cur, &flow, 0.5));
         for y in 0..96 {
             for x in 16..112 {
                 assert_eq!(new.get(x, y), old.get(x, y), "({x},{y})");
@@ -507,8 +520,29 @@ mod tests {
         let prev = Image::new(64, 48, [0u8, 0, 0, 255]);
         let cur = Image::new(64, 48, [255u8, 255, 255, 255]);
         let flow = Image::new(4, 3, [0.0f32, 0.0]);
-        assert_eq!(warp_blend(&prev, &cur, &flow, 0.5), cur);
-        assert_eq!(warp_blend(&prev, &cur, &flow, 0.4), prev);
+        assert_eq!(warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.5), cur);
+        assert_eq!(warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.4), prev);
+    }
+
+    #[test]
+    fn luma_nearest_maps_and_clamps() {
+        let img = Image { width: 3, height: 2, data: vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5] };
+        assert_eq!(luma_nearest(&img, 0.0, 0.0), 0.0);
+        assert_eq!(luma_nearest(&img, 3.9, 0.0), 0.1);
+        assert_eq!(luma_nearest(&img, 4.0, 2.5), 0.5);
+        assert_eq!(luma_nearest(&img, -7.0, 99.0), 0.3);
+    }
+
+    #[test]
+    fn predictions_use_edge_neighbours() {
+        let mut coarse = Image::new(3, 3, [0.0f32, 0.0]);
+        for y in 0..3 {
+            for x in 0..3 {
+                coarse.set(x, y, [x as f32 + 1.0, y as f32 + 1.0]);
+            }
+        }
+        let p = predictions(Some(&coarse), 2, 2);
+        assert_eq!(p, vec![[4, 4], [2, 4], [6, 4], [4, 2], [4, 6], [0, 0]]);
     }
 
     #[test]
@@ -525,8 +559,8 @@ mod tests {
         let prev = noise(64, 48, 1);
         let cur = noise(64, 48, 2);
         let flow = Image::new(4, 3, [5.0f32, 3.0]);
-        assert_eq!(warp_blend(&prev, &cur, &flow, 0.0), prev);
-        assert_eq!(warp_blend(&prev, &cur, &flow, 1.0), cur);
+        assert_eq!(warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.0), prev);
+        assert_eq!(warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 1.0), cur);
     }
 
     #[test]
@@ -534,7 +568,7 @@ mod tests {
         let prev = noise(256, 160, 3);
         let cur = shift(&prev, 8, 0);
         let flow = Image::new(16, 10, [4.0f32, 0.0]);
-        let mid = warp_blend(&prev, &cur, &flow, 0.5);
+        let mid = warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.5);
         let expected = shift(&prev, 4, 0);
         for y in 8..152 {
             for x in 8..248 {

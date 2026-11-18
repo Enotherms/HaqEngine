@@ -7,6 +7,9 @@ layout(set = 0, binding = 1, r32ui) uniform readonly uimage2D cur_frame;
 layout(set = 0, binding = 2, rg32f) uniform readonly image2D flow;
 layout(set = 0, binding = 3, r32ui) uniform writeonly uimage2D dst;
 
+layout(set = 0, binding = 4, r32f) uniform readonly image2D prev_luma;
+layout(set = 0, binding = 5, r32f) uniform readonly image2D cur_luma;
+
 layout(push_constant) uniform Push {
     uint w;
     uint h;
@@ -17,14 +20,25 @@ layout(push_constant) uniform Push {
 } pc;
 
 const uint FULL_BLOCK = 16u;
-const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float QUANT = 1023.0;
 const int DISAGREE = 96;
 
-int quantize_luma(vec4 c) {
-    precise float q = clamp(dot(c.rgb, LUMA), 0.0, 1.0) * QUANT;
+int quantize_luma(float l) {
+    precise float q = clamp(l, 0.0, 1.0) * QUANT;
     precise float r = q + 0.5;
     return int(floor(r));
+}
+
+float luma_prev_at(vec2 q) {
+    ivec2 size = imageSize(prev_luma);
+    ivec2 c = clamp(ivec2(floor(q / 2.0)), ivec2(0), size - ivec2(1));
+    return imageLoad(prev_luma, c).r;
+}
+
+float luma_cur_at(vec2 q) {
+    ivec2 size = imageSize(cur_luma);
+    ivec2 c = clamp(ivec2(floor(q / 2.0)), ivec2(0), size - ivec2(1));
+    return imageLoad(cur_luma, c).r;
 }
 
 vec4 unpack_pixel(uint w) {
@@ -95,8 +109,7 @@ void main() {
     vec2 pos = vec2(p);
     vec2 seen[5];
     int seen_count = 0;
-    vec4 best_a = vec4(0.0);
-    vec4 best_b = vec4(0.0);
+    vec2 best_v = vec2(0.0);
     int best_cost = 0x7fffffff;
     for (int i = 0; i < 5; i++) {
         ivec2 c = block + offsets[i];
@@ -112,17 +125,14 @@ void main() {
             continue;
         }
         seen[seen_count++] = v;
-        vec4 a = bilinear_prev(pos - pc.t * v);
-        vec4 b = bilinear_cur(pos + (1.0 - pc.t) * v);
-        int cost = abs(quantize_luma(a) - quantize_luma(b));
+        int cost = abs(quantize_luma(luma_prev_at(pos - pc.t * v)) - quantize_luma(luma_cur_at(pos + (1.0 - pc.t) * v)));
         if (cost < best_cost) {
             best_cost = cost;
-            best_a = a;
-            best_b = b;
+            best_v = v;
         }
     }
-    vec4 a = best_a;
-    vec4 b = best_b;
+    vec4 a = bilinear_prev(pos - pc.t * best_v);
+    vec4 b = bilinear_cur(pos + (1.0 - pc.t) * best_v);
     vec4 result = best_cost > DISAGREE ? (pc.t >= 0.5 ? b : a) : mix(a, b, pc.t);
     imageStore(dst, ip, uvec4(pack_pixel(result), 0u, 0u, 0u));
 }

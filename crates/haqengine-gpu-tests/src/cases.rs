@@ -167,12 +167,15 @@ fn luma_packed_case(gpu: &Gpu, f: PackedFormat, input: &Image<u32>) -> Result<Ca
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_warp_packed(
     gpu: &Gpu,
     f: PackedFormat,
     prev: &StorageImage,
     cur: &StorageImage,
     flow_img: &StorageImage,
+    prev_luma: &StorageImage,
+    cur_luma: &StorageImage,
     t: f32,
 ) -> Result<(Image<u32>, f64), String> {
     let dst = gpu.create_storage_image(vk::Format::R32_UINT, prev.width, prev.height)?;
@@ -186,7 +189,12 @@ fn run_warp_packed(
             t.to_le_bytes(),
             f.code().to_le_bytes(),
         ]);
-        let us = gpu.run(&WARP_BLEND_PACKED, &[prev, cur, flow_img, &dst], &push, groups(prev.width, prev.height))?;
+        let us = gpu.run(
+            &WARP_BLEND_PACKED,
+            &[prev, cur, flow_img, &dst, prev_luma, cur_luma],
+            &push,
+            groups(prev.width, prev.height),
+        )?;
         Ok((gpu.read_u32(&dst)?, us))
     })();
     gpu.destroy_image(dst);
@@ -202,20 +210,24 @@ fn warp_packed_case(
     ts: &[f32],
     tol_steps: f32,
 ) -> Result<CaseResult, String> {
+    let (lp, lc) = (packed::luma_downsample_packed(f, prev), packed::luma_downsample_packed(f, cur));
     let gp = gpu.upload_u32(prev)?;
     let gc = gpu.upload_u32(cur)?;
     let gf = gpu.upload_rg32f(flow_cpu)?;
+    let glp = gpu.upload_r32f(&lp)?;
+    let glc = gpu.upload_r32f(&lc)?;
     let result = (|| {
         let (mut reports, mut time) = (Vec::new(), 0.0);
         for &t in ts {
-            let (actual, us) = run_warp_packed(gpu, f, &gp, &gc, &gf, t)?;
+            let (actual, us) = run_warp_packed(gpu, f, &gp, &gc, &gf, &glp, &glc, t)?;
             time += us;
-            let report = packed::compare_packed(f, &packed::warp_blend_packed(f, prev, cur, flow_cpu, t), &actual, tol_steps);
+            let expected = packed::warp_blend_packed(f, prev, cur, &lp, &lc, flow_cpu, t);
+            let report = packed::compare_packed(f, &expected, &actual, tol_steps);
             reports.push(tolerate_rare(report, prev.width * prev.height)?);
         }
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: tol_steps })
     })();
-    for img in [gp, gc, gf] {
+    for img in [gp, gc, gf, glp, glc] {
         gpu.destroy_image(img);
     }
     result
@@ -239,7 +251,8 @@ fn battery_packed_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let result = (|| {
         let flows = gpu_flows(gpu, &fp, &fc, &mut time)?;
         let level0 = gpu.read_rg32f(&flows.images[0]);
-        let warp = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], 0.5);
+        let warp = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], 0.5);
+        let lumas = gpu.read_r32f(&fp.levels[0]).and_then(|a| Ok((a, gpu.read_r32f(&fc.levels[0])?)));
         let mut reports = flows.checks.clone();
         for img in flows.images {
             gpu.destroy_image(img);
@@ -249,7 +262,8 @@ fn battery_packed_case(gpu: &Gpu) -> Result<CaseResult, String> {
         time += us;
         end_to_end(&prev, &cur, &level0)?;
         require_recovery(&level0, [5.0, -3.0])?;
-        let report = packed::compare_packed(f, &packed::warp_blend_packed(f, &pp, &cp, &level0, 0.5), &actual, 1.0);
+        let (lp, lc) = lumas?;
+        let report = packed::compare_packed(f, &packed::warp_blend_packed(f, &pp, &cp, &lp, &lc, &level0, 0.5), &actual, 1.0);
         reports.push(tolerate_rare(report, pp.width * pp.height)?);
         println!("      battery packed pipeline total {time:.1} us (budget 2000 us)");
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: 1.0 })
@@ -423,9 +437,12 @@ fn flow_case(
 }
 
 fn warp_case(gpu: &Gpu, prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow_cpu: &Flow, ts: &[f32], tol: u8) -> Result<CaseResult, String> {
+    let (lp, lc) = (luma_downsample(prev), luma_downsample(cur));
     let gp = gpu.upload_rgba8(prev)?;
     let gc = gpu.upload_rgba8(cur)?;
     let gf = gpu.upload_rg32f(flow_cpu)?;
+    let glp = gpu.upload_r32f(&lp)?;
+    let glc = gpu.upload_r32f(&lc)?;
     let dst = gpu.create_storage_image(vk::Format::R8G8B8A8_UNORM, prev.width, prev.height)?;
     let result = (|| {
         let mut reports = Vec::new();
@@ -439,13 +456,13 @@ fn warp_case(gpu: &Gpu, prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow_cpu: &Flow
                 flow_cpu.height.to_le_bytes(),
                 t.to_le_bytes(),
             ]);
-            time += gpu.run(&WARP_BLEND, &[&gp, &gc, &gf, &dst], &push, groups(prev.width, prev.height))?;
-            let report = compare_rgba8(&flow::warp_blend(prev, cur, flow_cpu, t), &gpu.read_rgba8(&dst)?, tol);
+            time += gpu.run(&WARP_BLEND, &[&gp, &gc, &gf, &dst, &glp, &glc], &push, groups(prev.width, prev.height))?;
+            let report = compare_rgba8(&flow::warp_blend(prev, cur, &lp, &lc, flow_cpu, t), &gpu.read_rgba8(&dst)?, tol);
             reports.push(tolerate_rare(report, prev.width * prev.height)?);
         }
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: tol as f32 })
     })();
-    for img in [gp, gc, gf, dst] {
+    for img in [gp, gc, gf, dst, glp, glc] {
         gpu.destroy_image(img);
     }
     result
@@ -478,7 +495,12 @@ fn battery_case(gpu: &Gpu) -> Result<CaseResult, String> {
                 flows.images[0].height.to_le_bytes(),
                 0.5f32.to_le_bytes(),
             ]);
-            time += gpu.run(&WARP_BLEND, &[&fp.color, &fc.color, &flows.images[0], &dst], &push, groups(prev.width, prev.height))?;
+            time += gpu.run(
+                &WARP_BLEND,
+                &[&fp.color, &fc.color, &flows.images[0], &dst, &fp.levels[0], &fc.levels[0]],
+                &push,
+                groups(prev.width, prev.height),
+            )?;
             gpu.read_rgba8(&dst)
         })();
         gpu.destroy_image(dst);
@@ -488,7 +510,8 @@ fn battery_case(gpu: &Gpu) -> Result<CaseResult, String> {
         let level0 = level0?;
         end_to_end(&prev, &cur, &level0)?;
         require_recovery(&level0, [5.0, -3.0])?;
-        let report = compare_rgba8(&flow::warp_blend(&prev, &cur, &level0, 0.5), &warp?, BLEND_TOLERANCE);
+        let (lp, lc) = (gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?);
+        let report = compare_rgba8(&flow::warp_blend(&prev, &cur, &lp, &lc, &level0, 0.5), &warp?, BLEND_TOLERANCE);
         reports.push(tolerate_rare(report, prev.width * prev.height)?);
         println!("      battery pipeline total {time:.1} us (budget 2000 us)");
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: BLEND_TOLERANCE as f32 })

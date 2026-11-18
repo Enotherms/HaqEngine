@@ -91,7 +91,15 @@ pub fn luma_downsample_packed(f: PackedFormat, input: &Image<u32>) -> Image<f32>
 }
 
 /// `flow::warp_blend` on packed pixels.
-pub fn warp_blend_packed(f: PackedFormat, prev: &Image<u32>, cur: &Image<u32>, flow: &Flow, t: f32) -> Image<u32> {
+pub fn warp_blend_packed(
+    f: PackedFormat,
+    prev: &Image<u32>,
+    cur: &Image<u32>,
+    prev_luma: &Image<f32>,
+    cur_luma: &Image<f32>,
+    flow: &Flow,
+    t: f32,
+) -> Image<u32> {
     if t == 0.0 {
         return prev.clone();
     }
@@ -105,7 +113,8 @@ pub fn warp_blend_packed(f: PackedFormat, prev: &Image<u32>, cur: &Image<u32>, f
             let c = crate::flow::interpolate_pixel(
                 |sx, sy| bilinear_packed(f, prev, sx, sy),
                 |sx, sy| bilinear_packed(f, cur, sx, sy),
-                1.0,
+                prev_luma,
+                cur_luma,
                 (x as f32, y as f32),
                 t,
                 &cands[..n],
@@ -204,8 +213,9 @@ mod tests {
         let prev = to_packed(f, &noise(64, 48, 1));
         let cur = to_packed(f, &noise(64, 48, 2));
         let flow = Image::new(4, 3, [5.0f32, 3.0]);
-        assert_eq!(warp_blend_packed(f, &prev, &cur, &flow, 0.0), prev);
-        assert_eq!(warp_blend_packed(f, &prev, &cur, &flow, 1.0), cur);
+        let (lp, lc) = (luma_downsample_packed(f, &prev), luma_downsample_packed(f, &cur));
+        assert_eq!(warp_blend_packed(f, &prev, &cur, &lp, &lc, &flow, 0.0), prev);
+        assert_eq!(warp_blend_packed(f, &prev, &cur, &lp, &lc, &flow, 1.0), cur);
     }
 
     #[test]
@@ -213,9 +223,10 @@ mod tests {
         let prev = noise(96, 64, 5);
         let cur = noise(96, 64, 6);
         let flow = Image::new(6, 4, [3.0f32, -2.0]);
-        let expected = crate::flow::warp_blend(&prev, &cur, &flow, 0.5);
+        let (lp, lc) = (luma_downsample(&prev), luma_downsample(&cur));
+        let expected = crate::flow::warp_blend(&prev, &cur, &lp, &lc, &flow, 0.5);
         let f = PackedFormat::Rgba8;
-        let got = warp_blend_packed(f, &to_packed(f, &prev), &to_packed(f, &cur), &flow, 0.5);
+        let got = warp_blend_packed(f, &to_packed(f, &prev), &to_packed(f, &cur), &lp, &lc, &flow, 0.5);
         for (e, g) in expected.data.iter().zip(&got.data) {
             let g = unpack(f, *g);
             for c in 0..4 {
