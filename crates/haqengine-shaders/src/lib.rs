@@ -76,6 +76,8 @@ pub enum BindingKind {
     StorageImage,
     SampledImage,
     UniformBuffer,
+    Sampler,
+    StorageBuffer,
 }
 
 /// One FidelityFX FSR 3 compute pass (SDK v1.1.4), compiled as SPIR-V 1.3.
@@ -88,7 +90,7 @@ pub struct Fsr3Pass {
     pub push_size: u32,
 }
 
-use BindingKind::{SampledImage as Srv, StorageImage as Uav, UniformBuffer as Cb};
+use BindingKind::{SampledImage as Srv, Sampler as Smp, StorageBuffer as Buf, StorageImage as Uav, UniformBuffer as Cb};
 
 /// Colour to 8-bit luma: 0 = colour, 1 = luma level 0 (`r8ui`), 2 = constants.
 pub const OF_PREPARE_LUMA: Fsr3Pass = Fsr3Pass {
@@ -178,6 +180,110 @@ pub const OF_PASSES: [&Fsr3Pass; 8] = [
     &OF_LUMA_HALF,
 ];
 
+/// Clears the vector fields and masks: 0 = scene change, 1..=4 = game and flow fields, 5 = disocclusion, 6 = counters, 7 = constants.
+pub const FI_SETUP: Fsr3Pass = Fsr3Pass {
+    name: "fi_setup",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_setup.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Uav), (2, Uav), (3, Uav), (4, Uav), (5, Uav), (6, Buf), (7, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// AMD's prepare pass: 0 = game motion, 1 = depth, 2 = reconstructed previous depth, 3 = dilated motion, 4 = dilated depth.
+pub const FI_RECONSTRUCT_AND_DILATE: Fsr3Pass = Fsr3Pass {
+    name: "fi_reconstruct_and_dilate",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_reconstruct_and_dilate.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Uav), (3, Uav), (4, Uav), (5, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// Depth at the interpolated time: 0 = dilated motion, 1 = dilated depth, 2 = current frame, 3 = distortion, 4 = output.
+pub const FI_RECONSTRUCT_PREVIOUS_DEPTH: Fsr3Pass = Fsr3Pass {
+    name: "fi_reconstruct_previous_depth",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_reconstruct_previous_depth.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Srv), (3, Srv), (4, Uav), (5, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// Game vector field: 0 = dilated motion, 1 = dilated depth, 2 = previous, 3 = current, 4 = distortion, 5/6 = field x/y.
+pub const FI_GAME_MOTION_VECTOR_FIELD: Fsr3Pass = Fsr3Pass {
+    name: "fi_game_motion_vector_field",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_game_motion_vector_field.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Srv), (3, Srv), (4, Srv), (5, Uav), (6, Uav), (7, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// Game-field inpainting pyramid: 0/1 = field x/y, 2 = counters, 3..=15 = mips, 16 = constants, 17 = pyramid constants.
+pub const FI_GAME_VECTOR_FIELD_INPAINTING_PYRAMID: Fsr3Pass = Fsr3Pass {
+    name: "fi_game_vector_field_inpainting_pyramid",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_game_vector_field_inpainting_pyramid.spv")),
+    local_size: [256, 1, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Buf), (3, Uav), (4, Uav), (5, Uav), (6, Uav), (7, Uav), (8, Uav), (9, Uav), (10, Uav), (11, Uav), (12, Uav), (13, Uav), (14, Uav), (15, Uav), (16, Cb), (17, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// Flow vector field: 0 = optical flow, 1 = confidence, 2 = dilated depth, 3 = previous, 4 = current, 6/7 = field x/y.
+pub const FI_OPTICAL_FLOW_VECTOR_FIELD: Fsr3Pass = Fsr3Pass {
+    name: "fi_optical_flow_vector_field",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_optical_flow_vector_field.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Srv), (3, Srv), (4, Srv), (6, Uav), (7, Uav), (8, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// Disocclusion: 0/1 = game field x/y, 2/3/4 = depths, 5 = pyramid, 6 = distortion, 7 = mask.
+pub const FI_DISOCCLUSION_MASK: Fsr3Pass = Fsr3Pass {
+    name: "fi_disocclusion_mask",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_disocclusion_mask.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Srv), (3, Srv), (4, Srv), (5, Srv), (6, Srv), (7, Uav), (8, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// The interpolated frame: 0..=3 = fields, 4 = previous, 5 = current, 6 = disocclusion, 7 = pyramid, 8 = counters, 9 = output.
+pub const FI_INTERPOLATION: Fsr3Pass = Fsr3Pass {
+    name: "fi_interpolation",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_interpolation.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Srv), (3, Srv), (4, Srv), (5, Srv), (6, Srv), (7, Srv), (8, Buf), (9, Uav), (10, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// Output inpainting pyramid: 0 = output, 1 = counters, 2..=14 = mips, 15 = constants, 16 = pyramid constants.
+pub const FI_INPAINTING_PYRAMID: Fsr3Pass = Fsr3Pass {
+    name: "fi_inpainting_pyramid",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_inpainting_pyramid.spv")),
+    local_size: [256, 1, 1],
+    bindings: &[(0, Srv), (1, Buf), (2, Uav), (3, Uav), (4, Uav), (5, Uav), (6, Uav), (7, Uav), (8, Uav), (9, Uav), (10, Uav), (11, Uav), (12, Uav), (13, Uav), (14, Uav), (15, Cb), (16, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// Fills holes: 0 = scene change, 1 = pyramid, 2 = present frame, 3 = current, 7 = output.
+pub const FI_INPAINTING: Fsr3Pass = Fsr3Pass {
+    name: "fi_inpainting",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_inpainting.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Srv), (1, Srv), (2, Srv), (3, Srv), (7, Uav), (8, Cb), (1000, Smp)],
+    push_size: 0,
+};
+
+/// The FSR 3 interpolation passes; indices are `haqengine_core::fsr3_interp`'s `FI_*` constants.
+pub const FI_PASSES: [&Fsr3Pass; 10] = [
+    &FI_SETUP,
+    &FI_RECONSTRUCT_AND_DILATE,
+    &FI_RECONSTRUCT_PREVIOUS_DEPTH,
+    &FI_GAME_MOTION_VECTOR_FIELD,
+    &FI_GAME_VECTOR_FIELD_INPAINTING_PYRAMID,
+    &FI_OPTICAL_FLOW_VECTOR_FIELD,
+    &FI_DISOCCLUSION_MASK,
+    &FI_INTERPOLATION,
+    &FI_INPAINTING_PYRAMID,
+    &FI_INPAINTING,
+];
+
 /// Every shader HaqEngine ships.
 pub fn all() -> &'static [Shader] {
     &[
@@ -230,6 +336,101 @@ mod tests {
         }
         out.sort_unstable();
         out
+    }
+
+    fn binding_kinds(spirv: &[u8]) -> Vec<(u32, BindingKind)> {
+        use std::collections::HashMap;
+        let w = words(spirv);
+        let (mut binding, mut block, mut buffer_block) = (HashMap::new(), Vec::new(), Vec::new());
+        let (mut pointers, mut images, mut samplers, mut vars) = (HashMap::new(), HashMap::new(), Vec::new(), Vec::new());
+        let mut i = 5;
+        while i < w.len() {
+            let (count, op) = ((w[i] >> 16) as usize, w[i] & 0xffff);
+            let a = &w[i..i + count.max(1)];
+            match op {
+                71 if a.len() >= 3 && a[2] == 33 => {
+                    binding.insert(a[1], a[3]);
+                }
+                71 if a.len() >= 3 && a[2] == 2 => block.push(a[1]),
+                71 if a.len() >= 3 && a[2] == 3 => buffer_block.push(a[1]),
+                25 => {
+                    images.insert(a[1], a[7]);
+                }
+                26 => samplers.push(a[1]),
+                32 => {
+                    pointers.insert(a[1], (a[2], a[3]));
+                }
+                59 => vars.push((a[2], a[1])),
+                _ => {}
+            }
+            i += count.max(1);
+        }
+        let mut out = Vec::new();
+        for (var, ptr) in vars {
+            let Some(&b) = binding.get(&var) else { continue };
+            let Some(&(class, pointee)) = pointers.get(&ptr) else { continue };
+            let kind = match class {
+                0 if samplers.contains(&pointee) => BindingKind::Sampler,
+                0 if images.get(&pointee) == Some(&1) => BindingKind::SampledImage,
+                0 if images.get(&pointee) == Some(&2) => BindingKind::StorageImage,
+                2 if buffer_block.contains(&pointee) => BindingKind::StorageBuffer,
+                2 if block.contains(&pointee) => BindingKind::UniformBuffer,
+                12 => BindingKind::StorageBuffer,
+                _ => panic!("binding {b}: unknown storage class {class}"),
+            };
+            out.push((b, kind));
+        }
+        out.sort_by_key(|x| x.0);
+        out
+    }
+
+    fn table(p: &Fsr3Pass) -> Vec<(u32, BindingKind)> {
+        let mut t = p.bindings.to_vec();
+        t.sort_by_key(|x| x.0);
+        t
+    }
+
+    #[test]
+    fn fi_passes_are_spirv_1_3() {
+        assert_eq!(FI_PASSES.len(), 10);
+        for p in FI_PASSES {
+            assert_eq!(words(p.spirv)[1], 0x0001_0300, "{}", p.name);
+        }
+    }
+
+    #[test]
+    fn fi_bindings_match_spirv() {
+        for p in FI_PASSES {
+            let numbers: Vec<u32> = table(p).iter().map(|b| b.0).collect();
+            assert_eq!(decorated_bindings(p.spirv), numbers, "{}", p.name);
+        }
+    }
+
+    #[test]
+    fn binding_kinds_match_spirv() {
+        for p in OF_PASSES.iter().chain(FI_PASSES.iter()) {
+            assert_eq!(binding_kinds(p.spirv), table(p), "{}", p.name);
+        }
+    }
+
+    #[test]
+    fn fi_pass_order() {
+        let names: Vec<&str> = FI_PASSES.iter().map(|p| p.name).collect();
+        assert_eq!(
+            names,
+            [
+                "fi_setup",
+                "fi_reconstruct_and_dilate",
+                "fi_reconstruct_previous_depth",
+                "fi_game_motion_vector_field",
+                "fi_game_vector_field_inpainting_pyramid",
+                "fi_optical_flow_vector_field",
+                "fi_disocclusion_mask",
+                "fi_interpolation",
+                "fi_inpainting_pyramid",
+                "fi_inpainting"
+            ]
+        );
     }
 
     #[test]

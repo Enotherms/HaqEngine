@@ -2,7 +2,7 @@ HaqEngine includes third-party code under the licences below.
 
 AMD FidelityFX SDK v1.1.4
 Upstream: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK (tag v1.1.4)
-Files: third_party/fidelityfx/ (unchanged copies of the optical flow shaders and the shared GPU headers)
+Files: third_party/fidelityfx/ (unchanged copies of the optical flow and frame interpolation shaders and the shared GPU headers)
 Licence: MIT, full text in third_party/fidelityfx/LICENSE.txt
 
 Copyright (C) 2024 Advanced Micro Devices, Inc.

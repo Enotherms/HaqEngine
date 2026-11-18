@@ -671,7 +671,12 @@ impl Gpu {
             BindingKind::StorageImage => vk::DescriptorType::STORAGE_IMAGE,
             BindingKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
             BindingKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+            BindingKind::Sampler => vk::DescriptorType::SAMPLER,
+            BindingKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
         };
+        if let Some((b, k)) = pass.bindings.iter().find(|(_, k)| matches!(k, BindingKind::Sampler | BindingKind::StorageBuffer)) {
+            return Err(format!("{} binding {b} is a {k:?}, which this runner cannot bind yet", pass.name));
+        }
         let mut cb_bindings: Vec<u32> =
             pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).map(|b| b.0).collect();
         cb_bindings.sort_unstable();

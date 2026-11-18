@@ -4,14 +4,28 @@ use std::process::Command;
 
 const SHADERS: &[&str] = &["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed", "of_luma_half"];
 
-const FSR3_PASSES: &[(&str, &str)] = &[
-    ("of_prepare_luma", "ffx_opticalflow_prepare_luma_pass"),
-    ("of_luminance_pyramid", "ffx_opticalflow_compute_luminance_pyramid_pass"),
-    ("of_scd_histogram", "ffx_opticalflow_generate_scd_histogram_pass"),
-    ("of_scd_divergence", "ffx_opticalflow_compute_scd_divergence_pass"),
-    ("of_search", "ffx_opticalflow_compute_optical_flow_advanced_pass_v5"),
-    ("of_filter", "ffx_opticalflow_filter_optical_flow_pass_v5"),
-    ("of_scale", "ffx_opticalflow_scale_optical_flow_advanced_pass_v5"),
+const FSR3_PASSES: &[(&str, &str, &str)] = &[
+    ("of_prepare_luma", "opticalflow", "ffx_opticalflow_prepare_luma_pass"),
+    ("of_luminance_pyramid", "opticalflow", "ffx_opticalflow_compute_luminance_pyramid_pass"),
+    ("of_scd_histogram", "opticalflow", "ffx_opticalflow_generate_scd_histogram_pass"),
+    ("of_scd_divergence", "opticalflow", "ffx_opticalflow_compute_scd_divergence_pass"),
+    ("of_search", "opticalflow", "ffx_opticalflow_compute_optical_flow_advanced_pass_v5"),
+    ("of_filter", "opticalflow", "ffx_opticalflow_filter_optical_flow_pass_v5"),
+    ("of_scale", "opticalflow", "ffx_opticalflow_scale_optical_flow_advanced_pass_v5"),
+    ("fi_setup", "frameinterpolation", "ffx_frameinterpolation_setup_pass"),
+    ("fi_reconstruct_and_dilate", "frameinterpolation", "ffx_frameinterpolation_reconstruct_and_dilate_pass"),
+    ("fi_reconstruct_previous_depth", "frameinterpolation", "ffx_frameinterpolation_reconstruct_previous_depth_pass"),
+    ("fi_game_motion_vector_field", "frameinterpolation", "ffx_frameinterpolation_game_motion_vector_field_pass"),
+    (
+        "fi_game_vector_field_inpainting_pyramid",
+        "frameinterpolation",
+        "ffx_frameinterpolation_compute_game_vector_field_inpainting_pyramid_pass",
+    ),
+    ("fi_optical_flow_vector_field", "frameinterpolation", "ffx_frameinterpolation_optical_flow_vector_field_pass"),
+    ("fi_disocclusion_mask", "frameinterpolation", "ffx_frameinterpolation_disocclusion_mask_pass"),
+    ("fi_interpolation", "frameinterpolation", "ffx_frameinterpolation_pass"),
+    ("fi_inpainting_pyramid", "frameinterpolation", "ffx_frameinterpolation_compute_inpainting_pyramid_pass"),
+    ("fi_inpainting", "frameinterpolation", "ffx_frameinterpolation_inpainting_pass"),
 ];
 
 fn compiler() -> PathBuf {
@@ -43,15 +57,15 @@ fn main() {
     }
     let ffx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party/fidelityfx");
     println!("cargo:rerun-if-changed={}", ffx.display());
-    let (gpu, of) = (ffx.join("gpu"), ffx.join("gpu/opticalflow"));
-    for (name, file) in FSR3_PASSES {
-        let src = ffx.join("vk/opticalflow").join(format!("{file}.glsl"));
+    let gpu = ffx.join("gpu");
+    for (name, dir, file) in FSR3_PASSES {
+        let src = ffx.join("vk").join(dir).join(format!("{file}.glsl"));
         let dst = out.join(format!("{name}.spv"));
         let status = Command::new(&glslang)
             .args(["-V", "--target-env", "vulkan1.1", "-S", "comp", "-DFFX_GPU=1", "-DFFX_GLSL=1"])
             .arg("-DFFX_OPTICALFLOW_OPTION_HDR_COLOR_INPUT=0")
             .arg(format!("-I{}", gpu.display()))
-            .arg(format!("-I{}", of.display()))
+            .arg(format!("-I{}", gpu.join(dir).display()))
             .arg("-o")
             .arg(&dst)
             .arg(&src)
