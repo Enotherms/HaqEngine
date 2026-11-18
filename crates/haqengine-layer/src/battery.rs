@@ -196,8 +196,30 @@ fn groups(w: u32, h: u32) -> (u32, u32) {
     (w.div_ceil(8), h.div_ceil(8))
 }
 
-fn push_words(words: &[[u8; 4]]) -> Vec<u8> {
-    words.iter().flatten().copied().collect()
+/// Push-constant bytes for 2 words, without allocating.
+pub fn push2(a: [u8; 4], b: [u8; 4]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&a);
+    out[4..].copy_from_slice(&b);
+    out
+}
+
+/// Push-constant bytes for 3 words, without allocating.
+pub fn push3(a: [u8; 4], b: [u8; 4], c: [u8; 4]) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[..4].copy_from_slice(&a);
+    out[4..8].copy_from_slice(&b);
+    out[8..].copy_from_slice(&c);
+    out
+}
+
+/// Push-constant bytes for 6 words, without allocating.
+pub fn push6(w: [[u8; 4]; 6]) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    for (i, word) in w.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(word);
+    }
+    out
 }
 
 unsafe fn memory_barrier(d: &ash::Device, cmd: vk::CommandBuffer, src: vk::PipelineStageFlags, dst: vk::PipelineStageFlags) {
@@ -404,11 +426,11 @@ impl BatteryResources {
         let levels = level_sizes(w, h);
         let flows = flow_sizes(&levels);
         let fmt = self.format.code();
-        dispatch(d, cmd, &p.luma, self.luma_sets[cur], &push_words(&[w.to_le_bytes(), h.to_le_bytes(), fmt.to_le_bytes()]), groups(levels[0].0, levels[0].1));
+        dispatch(d, cmd, &p.luma, self.luma_sets[cur], &push3(w.to_le_bytes(), h.to_le_bytes(), fmt.to_le_bytes()), groups(levels[0].0, levels[0].1));
         for l in 1..LEVELS {
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
             let (iw, ih) = levels[l - 1];
-            dispatch(d, cmd, &p.reduce, self.reduce_sets[cur][l - 1], &push_words(&[iw.to_le_bytes(), ih.to_le_bytes()]), groups(levels[l].0, levels[l].1));
+            dispatch(d, cmd, &p.reduce, self.reduce_sets[cur][l - 1], &push2(iw.to_le_bytes(), ih.to_le_bytes()), groups(levels[l].0, levels[l].1));
         }
 
         image_barrier(d, cmd, spare, L::UNDEFINED, L::TRANSFER_DST_OPTIMAL, A::empty(), A::TRANSFER_WRITE, S::TRANSFER, S::TRANSFER);
@@ -420,7 +442,7 @@ impl BatteryResources {
                 let has_coarse = l + 1 < LEVELS;
                 let (cw, ch) = if has_coarse { flows[l + 1] } else { (1, 1) };
                 let radius = if has_coarse { RADIUS_FINE } else { RADIUS_COARSE };
-                let push = push_words(&[
+                let push = push6([
                     lw.to_le_bytes(),
                     lh.to_le_bytes(),
                     cw.to_le_bytes(),
@@ -431,11 +453,11 @@ impl BatteryResources {
                 dispatch(d, cmd, &p.block_match, self.match_sets[cur][l], &push, (bw, bh));
                 if l > 0 {
                     memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
-                    dispatch(d, cmd, &p.median, self.median_sets[l - 1], &push_words(&[bw.to_le_bytes(), bh.to_le_bytes()]), groups(bw, bh));
+                    dispatch(d, cmd, &p.median, self.median_sets[l - 1], &push2(bw.to_le_bytes(), bh.to_le_bytes()), groups(bw, bh));
                 }
             }
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
-            let push = push_words(&[
+            let push = push6([
                 w.to_le_bytes(),
                 h.to_le_bytes(),
                 flows[0].0.to_le_bytes(),
@@ -492,6 +514,15 @@ mod tests {
         assert_ne!(p.cur(), first);
         p.advance();
         assert_eq!(p.cur(), first);
+    }
+
+    #[test]
+    fn push_bytes_are_little_endian_in_order() {
+        assert_eq!(push2(1u32.to_le_bytes(), 2u32.to_le_bytes()), [1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(push3(1u32.to_le_bytes(), 2u32.to_le_bytes(), 0.5f32.to_le_bytes())[8..], 0.5f32.to_le_bytes());
+        let six = push6([1u32, 2, 3, 4, 5, 6].map(u32::to_le_bytes));
+        assert_eq!(six[20..], 6u32.to_le_bytes());
+        assert_eq!(six[..4], 1u32.to_le_bytes());
     }
 
     #[test]

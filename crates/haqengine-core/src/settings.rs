@@ -51,6 +51,13 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// Warnings about the environment, to log once when HaqEngine loads.
+    pub fn notes(&self) -> Vec<String> {
+        self.mode_note.iter().chain(self.multiplier_note.iter()).cloned().collect()
+    }
+}
+
 /// Turns the contents of `/proc/self/comm` into a process name.
 pub fn process_name(comm: &str) -> String {
     let name = comm.trim();
@@ -136,6 +143,16 @@ mod tests {
         let s = Settings::from_lookup(env(&[("HAQENGINE_MODE", "turbo")]));
         assert_eq!(s.mode, Mode::Battery);
         assert!(s.mode_note.unwrap().contains("turbo"));
+    }
+
+    #[test]
+    fn notes_report_mode_and_multiplier_problems() {
+        let s = Settings::from_lookup(env(&[("HAQENGINE_MODE", "cpy"), ("HAQENGINE_MULTIPLIER", "4")]));
+        let notes = s.notes();
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().any(|n| n.contains("cpy")));
+        assert!(notes.iter().any(|n| n.contains("M5")));
+        assert!(Settings::from_lookup(env(&[])).notes().is_empty());
     }
 
     #[test]

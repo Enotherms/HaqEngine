@@ -18,6 +18,9 @@ fn log_loaded() {
             std::process::id(),
             env!("CARGO_PKG_VERSION")
         ));
+        for note in crate::state::SETTINGS.notes() {
+            LOG.log(&format!("warning: {note}"));
+        }
     });
 }
 
