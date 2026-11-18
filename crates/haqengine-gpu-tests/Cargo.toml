@@ -1,0 +1,15 @@
+[package]
+name = "haqengine-gpu-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "haqengine-gpu-tests"
+path = "src/main.rs"
+
+[dependencies]
+ash = { version = "=0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
+haqengine-core = { path = "../haqengine-core" }
+haqengine-shaders = { path = "../haqengine-shaders" }
