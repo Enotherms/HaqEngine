@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/haqengine-core", "crates/haqengine-layer"]
+members = ["crates/haqengine-core", "crates/haqengine-layer", "crates/haqengine-shaders"]
 
 [workspace.package]
 version = "0.0.1"

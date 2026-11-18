@@ -19,3 +19,7 @@ dependencies = [
  "ash",
  "haqengine-core",
 ]
+
+[[package]]
+name = "haqengine-shaders"
+version = "0.0.1"
