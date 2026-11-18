@@ -1,5 +1,6 @@
 //! Platform-independent parts of HaqEngine: settings, logging and handle bookkeeping.
 
+pub mod blend;
 pub mod flow;
 pub mod fsr3_flow;
 pub mod fsr3_interp;

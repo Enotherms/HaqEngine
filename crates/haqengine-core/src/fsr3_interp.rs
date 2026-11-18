@@ -18,7 +18,7 @@ pub const PASS_FI_BLEND: usize = 10;
 
 /// Above this summed 8-bit luma difference over the 3×3 window the best candidate's two samples
 /// show different things, and the blend takes the current frame instead of a ghost of both.
-pub const DISAGREE8: u32 = 288;
+pub const DISAGREE8: u32 = crate::blend::DISAGREE8;
 
 pub const FI_CONSTANTS_SIZE: usize = 176;
 pub const FI_PYRAMID_BINDINGS: u32 = 13;
@@ -245,45 +245,21 @@ pub fn fi_blend_packed_reference(
     out
 }
 
-/// The blend's per-pixel choice: whether the winning candidate's samples still disagree, and its
-/// vector in full-resolution pixels.
+fn luma(img: &Image<u8>) -> impl Fn(i64, i64) -> i32 + '_ {
+    move |x, y| img.get(x.clamp(0, img.width as i64 - 1) as u32, y.clamp(0, img.height as i64 - 1) as u32) as i32
+}
+
+/// The blend's per-pixel choice on FSR 3's flow at the midpoint (`crate::blend::choose_vector`).
 fn choose(x: u32, y: u32, flow_raw: &Image<[i16; 2]>, prev_luma: &Image<u8>, cur_luma: &Image<u8>) -> (bool, [f32; 2]) {
-    let luma_at = |img: &Image<u8>, x: i64, y: i64| {
-        img.get(x.clamp(0, img.width as i64 - 1) as u32, y.clamp(0, img.height as i64 - 1) as u32) as i32
-    };
-    let window_cost = |ax: f32, ay: f32, bx: f32, by: f32| {
-        let (pa, pb) = (((ax / 2.0).floor() as i64, (ay / 2.0).floor() as i64), ((bx / 2.0).floor() as i64, (by / 2.0).floor() as i64));
-        let mut sum = 0u32;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let weight = if dx == 0 && dy == 0 { 4 } else { 1 };
-                sum += weight * luma_at(prev_luma, pa.0 + dx, pa.1 + dy).abs_diff(luma_at(cur_luma, pb.0 + dx, pb.1 + dy));
-            }
-        }
-        sum
-    };
-    let (bx, by) = ((x / 16).min(flow_raw.width - 1) as i64, (y / 16).min(flow_raw.height - 1) as i64);
-    let mut cands: [[f32; 2]; 6] = [[0.0; 2]; 6];
-    let mut n = 1;
-    for (ox, oy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
-        let (nx, ny) = (bx + ox, by + oy);
-        if nx >= 0 && ny >= 0 && nx < flow_raw.width as i64 && ny < flow_raw.height as i64 {
-            let v = crate::fsr3_flow::ffx_to_haq(flow_raw.get(nx as u32, ny as u32), 2.0);
-            if !cands[..n].contains(&v) {
-                cands[n] = v;
-                n += 1;
-            }
-        }
-    }
-    let (px, py) = (x as f32, y as f32);
-    let mut best = (u32::MAX, [0.0f32; 2]);
-    for v in &cands[..n] {
-        let cost = window_cost(px - v[0] * 0.5, py - v[1] * 0.5, px + v[0] * 0.5, py + v[1] * 0.5);
-        if cost < best.0 {
-            best = (cost, *v);
-        }
-    }
-    (best.0 > DISAGREE8, best.1)
+    crate::blend::choose_vector(
+        x,
+        y,
+        (flow_raw.width, flow_raw.height),
+        |bx, by| crate::fsr3_flow::ffx_to_haq(flow_raw.get(bx, by), 2.0),
+        luma(prev_luma),
+        luma(cur_luma),
+        0.5,
+    )
 }
 
 /// Texel bytes of the image interpolation owns, its output; the frames, the flow, its luma and its
