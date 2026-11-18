@@ -1,7 +1,7 @@
 //! Swapchain and present pass-through. M0 only counts presents and forwards everything unchanged.
 
 use crate::guard::guard;
-use crate::chain::{swapchain_ext_size, ChainCopy, PrefixCopy};
+use crate::chain::{present_ext_size, swapchain_ext_size, ChainCopy, PrefixCopy};
 use crate::framegen::FrameGen;
 use crate::plan::plan_swapchain_with;
 use crate::state::{device_can_transfer, dispatch_key, multiplier, DeviceData, DEVICES, LOG};
@@ -245,6 +245,12 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
     });
     match device {
         Some(data) => {
+            let mut chain = ChainCopy::new();
+            let rewritten = if any_fifo_only(&*present_info) { fifo_present_info(&*present_info, &mut chain) } else { None };
+            let present_info: *const vk::PresentInfoKHR = match rewritten.as_ref() {
+                Some(pi) => pi,
+                None => present_info,
+            };
             let pi = &*present_info;
             if crate::framegen::present_shape_ok(pi) {
                 if let Some(info) = SWAPCHAINS.get((*pi.p_swapchains).as_raw()) {
@@ -259,6 +265,37 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
             NO_DEVICE_REPORTED.call_once(|| LOG.log("error: present on an unknown device"));
             vk::Result::ERROR_DEVICE_LOST
         }
+    }
+}
+
+/// True when any swapchain in the present was created with a rewritten present-mode list.
+unsafe fn any_fifo_only(pi: &vk::PresentInfoKHR) -> bool {
+    if pi.p_swapchains.is_null() {
+        return false;
+    }
+    std::slice::from_raw_parts(pi.p_swapchains, pi.swapchain_count as usize)
+        .iter()
+        .any(|sc| SWAPCHAINS.get(sc.as_raw()).is_some_and(|info| info.fifo_only_modes))
+}
+
+/// `pi` with its `VkSwapchainPresentModeInfoEXT` copied and set to FIFO, or `None` when it has none
+/// or the chain cannot be copied.
+///
+/// # Safety
+/// `pi` must be a valid present; the result borrows `chain`.
+pub unsafe fn fifo_present_info<'a>(pi: &vk::PresentInfoKHR<'a>, chain: &'a mut ChainCopy) -> Option<vk::PresentInfoKHR<'a>> {
+    match chain.copy_prefix(pi.p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT, present_ext_size) {
+        PrefixCopy::Copied { head, target } => {
+            let info = &mut *(target as *mut vk::SwapchainPresentModeInfoEXT);
+            if info.swapchain_count as usize > FIFO_MODES.len() {
+                return None;
+            }
+            info.p_present_modes = FIFO_MODES.as_ptr();
+            let mut out = *pi;
+            out.p_next = head;
+            Some(out)
+        }
+        PrefixCopy::NotFound | PrefixCopy::Unsupported => None,
     }
 }
 
@@ -486,6 +523,69 @@ mod tests {
         let info = info.expect("registered");
         assert!(info.gen.is_some());
         assert!(info.fifo_only_modes);
+    }
+
+    static PRESENTED_MODES: std::sync::Mutex<Vec<(u64, Vec<vk::PresentModeKHR>)>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "system" fn capture_present_modes(_: vk::Queue, pi: *const vk::PresentInfoKHR) -> vk::Result {
+        unsafe {
+            let pi = &*pi;
+            let sc = (*pi.p_swapchains).as_raw();
+            let mut cur = pi.p_next as *const vk::BaseInStructure;
+            let mut modes = Vec::new();
+            while !cur.is_null() {
+                if (*cur).s_type == vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT {
+                    let m = &*(cur as *const vk::SwapchainPresentModeInfoEXT);
+                    modes = std::slice::from_raw_parts(m.p_present_modes, m.swapchain_count as usize).to_vec();
+                }
+                cur = (*cur).p_next;
+            }
+            PRESENTED_MODES.lock().unwrap().push((sc, modes));
+        }
+        vk::Result::SUCCESS
+    }
+
+    /// Presents `[IMMEDIATE]` per-present mode info on a swapchain registered with `fifo_only_modes`.
+    fn present_with_mode_info(handle: u64, fifo_only_modes: bool) -> Vec<vk::PresentModeKHR> {
+        use std::ffi::{c_void, CStr};
+        let load = |name: &CStr| -> *const c_void {
+            if name == c"vkQueuePresentKHR" { capture_present_modes as *const c_void } else { std::ptr::null() }
+        };
+        let (device, data) = crate::state::test_support::fake_device(load, vec![]);
+        SWAPCHAINS.created(handle, SwapchainInfo { device: Some(data), fifo_only_modes, ..info(handle) });
+        let queue = vk::Queue::from_raw(device.as_raw());
+        let game_modes = [vk::PresentModeKHR::IMMEDIATE];
+        let mode_info = vk::SwapchainPresentModeInfoEXT {
+            swapchain_count: 1,
+            p_present_modes: game_modes.as_ptr(),
+            ..Default::default()
+        };
+        let swapchain = vk::SwapchainKHR::from_raw(handle);
+        let index = 0u32;
+        let present = vk::PresentInfoKHR {
+            p_next: &mode_info as *const _ as *const c_void,
+            swapchain_count: 1,
+            p_swapchains: &swapchain,
+            p_image_indices: &index,
+            ..Default::default()
+        };
+        let r = unsafe { queue_present(queue, &present) };
+        SWAPCHAINS.destroyed(handle);
+        DEVICES.remove(dispatch_key(device));
+        assert_eq!(r, vk::Result::SUCCESS);
+        assert_eq!(game_modes, [vk::PresentModeKHR::IMMEDIATE], "the game's struct must not change");
+        let seen = PRESENTED_MODES.lock().unwrap();
+        seen.iter().rev().find(|(sc, _)| *sc == handle).map(|(_, m)| m.clone()).expect("presented")
+    }
+
+    #[test]
+    fn present_mode_info_rewritten_on_pass_through() {
+        assert_eq!(present_with_mode_info(0x5c_6001, true), [vk::PresentModeKHR::FIFO]);
+    }
+
+    #[test]
+    fn present_mode_info_untouched_without_rewrite() {
+        assert_eq!(present_with_mode_info(0x5c_6002, false), [vk::PresentModeKHR::IMMEDIATE]);
     }
 
     #[test]
