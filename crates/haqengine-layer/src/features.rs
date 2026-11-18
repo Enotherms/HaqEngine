@@ -33,6 +33,7 @@ fn feature_struct_size(s: vk::StructureType) -> Option<usize> {
         S::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES => size_of::<vk::PhysicalDeviceVulkan13Features>(),
         S::PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES => size_of::<vk::PhysicalDeviceImageRobustnessFeatures>(),
         S::PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT => size_of::<vk::PhysicalDeviceRobustness2FeaturesEXT>(),
+        S::LOADER_DEVICE_CREATE_INFO => size_of::<crate::loader_abi::LayerDeviceCreateInfo>(),
         _ => return None,
     })
 }
@@ -216,8 +217,9 @@ pub type CreateDevice = unsafe extern "system" fn(
     *mut vk::Device,
 ) -> vk::Result;
 
-/// Creates the device with the patch; if that fails, once more with the game's own create info.
-/// Returns the result and whether the patched info was the one that succeeded.
+/// Creates the device with the patch; if that fails, calls `before_retry` (which restores the
+/// loader's layer link the first call used up) and tries once more with the game's own create
+/// info. Returns the result and whether the patched info was the one that succeeded.
 ///
 /// # Safety
 /// The arguments must be valid for `next`.
@@ -226,6 +228,7 @@ pub unsafe fn create_with_fallback(
     physical: vk::PhysicalDevice,
     original: *const vk::DeviceCreateInfo,
     patch: Option<&FeaturePatch>,
+    before_retry: &mut dyn FnMut(),
     allocator: *const vk::AllocationCallbacks,
     out: *mut vk::Device,
 ) -> (vk::Result, bool) {
@@ -234,6 +237,7 @@ pub unsafe fn create_with_fallback(
         if r == vk::Result::SUCCESS {
             return (r, true);
         }
+        before_retry();
     }
     (next(physical, original, allocator, out), false)
 }
@@ -348,6 +352,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn patch_copies_loader_structs_at_the_head() {
+        use crate::loader_abi::{LayerDeviceCreateInfo, LayerDeviceCreateInfoU};
+        unsafe {
+            let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13);
+            let marker = 0x5151usize as *const c_void;
+            let callback = LayerDeviceCreateInfo {
+                s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+                p_next: &mut f2 as *mut _ as *const c_void,
+                function: 1,
+                u: LayerDeviceCreateInfoU { other: std::ptr::null() },
+            };
+            let link = LayerDeviceCreateInfo {
+                s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+                p_next: &callback as *const _ as *const c_void,
+                function: 0,
+                u: LayerDeviceCreateInfoU { other: marker },
+            };
+            let ci = vk::DeviceCreateInfo { p_next: &link as *const _ as *const c_void, ..Default::default() };
+            let patch = patch_create_info(&ci, &Supported { device_api_13: true, ..ALL }).unwrap().expect("patched");
+            let head = patch.info.p_next as *const LayerDeviceCreateInfo;
+            assert_ne!(head, &link as *const _, "the loader's link struct is copied, not shared");
+            assert_eq!(((*head).function, (*head).u.other), (0, marker));
+            let v13c: *const vk::PhysicalDeviceVulkan13Features =
+                find(patch.info.p_next, vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES).unwrap();
+            assert_eq!((*v13c).robust_image_access, vk::TRUE);
+            assert_eq!(v13.robust_image_access, vk::FALSE);
+        }
+    }
+
+    static LINK_USED: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "system" fn uses_link(
+        _: vk::PhysicalDevice,
+        ci: *const vk::DeviceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Device,
+    ) -> vk::Result {
+        if LINK_USED.swap(1, Ordering::SeqCst) == 1 {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        if (*ci).enabled_extension_count > 0 {
+            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        }
+        *out = vk::Handle::from_raw(0x99);
+        vk::Result::SUCCESS
+    }
+
+    #[test]
+    fn retry_restores_the_layer_link() {
+        unsafe {
+            let features = vk::PhysicalDeviceFeatures::default();
+            let ci = vk::DeviceCreateInfo::default().enabled_features(&features);
+            let patch = patch_create_info(&ci, &ALL).unwrap().unwrap();
+            let mut out = vk::Device::null();
+            LINK_USED.store(0, Ordering::SeqCst);
+            let mut restore = || LINK_USED.store(0, Ordering::SeqCst);
+            let (r, patched) =
+                create_with_fallback(uses_link, vk::PhysicalDevice::null(), &ci, Some(&patch), &mut restore, std::ptr::null(), &mut out);
+            assert_eq!((r, patched), (vk::Result::SUCCESS, false));
+        }
+    }
+
     static CALLS: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "system" fn fail_patched(
@@ -372,10 +440,10 @@ mod tests {
             let patch = patch_create_info(&ci, &ALL).unwrap().unwrap();
             let mut out = vk::Device::null();
             CALLS.store(0, Ordering::SeqCst);
-            let (r, patched) = create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, Some(&patch), std::ptr::null(), &mut out);
+            let (r, patched) = create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, Some(&patch), &mut || {}, std::ptr::null(), &mut out);
             assert_eq!((r, patched, CALLS.load(Ordering::SeqCst)), (vk::Result::SUCCESS, false, 2));
             assert_eq!(vk::Handle::as_raw(out), 0x1234);
-            let (r, patched) = create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, None, std::ptr::null(), &mut out);
+            let (r, patched) = create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, None, &mut || {}, std::ptr::null(), &mut out);
             assert_eq!((r, patched), (vk::Result::SUCCESS, false));
         }
     }

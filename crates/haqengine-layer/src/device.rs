@@ -39,6 +39,7 @@ unsafe fn create_device_inner(
     let next_gipa = (*link).pfn_next_get_instance_proc_addr;
     let next_gdpa = (*link).pfn_next_get_device_proc_addr;
     (*info).u.p_layer_info = (*link).p_next;
+    let layer_link = (*info).u.p_layer_info;
 
     let Some(next_create) = next_gipa(instance.instance.handle(), c"vkCreateDevice".as_ptr()) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
@@ -61,7 +62,15 @@ unsafe fn create_device_inner(
         None
     };
     let (result, patched) =
-        crate::features::create_with_fallback(next_create, physical_device, create_info, patch.as_ref(), allocator, out);
+        crate::features::create_with_fallback(
+            next_create,
+            physical_device,
+            create_info,
+            patch.as_ref(),
+            &mut || (*info).u.p_layer_info = layer_link,
+            allocator,
+            out,
+        );
     if result != vk::Result::SUCCESS {
         return result;
     }
@@ -138,7 +147,8 @@ unsafe fn quality_patch(
     }
     let i = &instance.instance;
     let props = i.get_physical_device_properties(physical);
-    let device_api_13 = (vk::api_version_major(props.api_version), vk::api_version_minor(props.api_version)) >= (1, 3);
+    let version = |v: u32| (vk::api_version_major(v), vk::api_version_minor(v));
+    let device_api_13 = version(props.api_version) >= (1, 3) && version(instance.api_version) >= (1, 3);
     let image_robustness_ext = i
         .enumerate_device_extension_properties(physical)
         .map(|exts| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::ext::image_robustness::NAME)))
