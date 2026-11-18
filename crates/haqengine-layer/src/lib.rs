@@ -2,6 +2,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod device;
+pub mod guard;
 pub mod instance;
 pub mod loader_abi;
 pub mod state;
@@ -18,6 +19,12 @@ const LAYER_INTERFACE_VERSION: u32 = 2;
 pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
     p_version: *mut NegotiateLayerInterface,
 ) -> vk::Result {
+    guard::guard("vkNegotiateLoaderLayerInterfaceVersion", vk::Result::ERROR_INITIALIZATION_FAILED, || unsafe {
+        negotiate(p_version)
+    })
+}
+
+unsafe fn negotiate(p_version: *mut NegotiateLayerInterface) -> vk::Result {
     let Some(n) = p_version.as_mut() else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
@@ -50,28 +57,32 @@ pub unsafe extern "system" fn vkGetInstanceProcAddr(
     instance: vk::Instance,
     p_name: *const c_char,
 ) -> vk::PFN_vkVoidFunction {
-    if p_name.is_null() {
-        return None;
-    }
-    let name = CStr::from_ptr(p_name);
-    if let Some(f) = instance_hook(name).or_else(|| device::device_hook(name)) {
-        return Some(f);
-    }
-    let data = INSTANCES.get(dispatch_key(instance))?;
-    (data.next_gipa)(instance, p_name)
+    guard::guard("vkGetInstanceProcAddr", None, || unsafe {
+        if p_name.is_null() {
+            return None;
+        }
+        let name = CStr::from_ptr(p_name);
+        if let Some(f) = instance_hook(name).or_else(|| device::device_hook(name)) {
+            return Some(f);
+        }
+        let data = INSTANCES.get(dispatch_key(instance))?;
+        (data.next_gipa)(instance, p_name)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn vkGetDeviceProcAddr(device: vk::Device, p_name: *const c_char) -> vk::PFN_vkVoidFunction {
-    if p_name.is_null() {
-        return None;
-    }
-    let name = CStr::from_ptr(p_name);
-    if let Some(f) = device::device_hook(name) {
-        return Some(f);
-    }
-    let data = DEVICES.get(dispatch_key(device))?;
-    (data.next_gdpa)(device, p_name)
+    guard::guard("vkGetDeviceProcAddr", None, || unsafe {
+        if p_name.is_null() {
+            return None;
+        }
+        let name = CStr::from_ptr(p_name);
+        if let Some(f) = device::device_hook(name) {
+            return Some(f);
+        }
+        let data = DEVICES.get(dispatch_key(device))?;
+        (data.next_gdpa)(device, p_name)
+    })
 }
 
 #[cfg(test)]
@@ -104,6 +115,12 @@ mod tests {
     #[test]
     fn negotiate_rejects_version_below_2() {
         assert_eq!(negotiate(1).0, vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+
+    #[test]
+    fn gipa_unknown_name_without_instance_is_null() {
+        let f = unsafe { vkGetInstanceProcAddr(vk::Instance::null(), c"vkSomethingMadeUp".as_ptr()) };
+        assert!(f.is_none());
     }
 
     #[test]

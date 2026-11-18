@@ -1,5 +1,6 @@
 //! Instance-level hooks: create and destroy.
 
+use crate::guard::guard;
 use crate::loader_abi::find_instance_link;
 use crate::state::{dispatch_key, InstanceData, INSTANCES, LOG};
 use ash::vk;
@@ -21,6 +22,16 @@ fn log_loaded() {
 }
 
 pub unsafe extern "system" fn create_instance(
+    create_info: *const vk::InstanceCreateInfo,
+    allocator: *const vk::AllocationCallbacks,
+    out: *mut vk::Instance,
+) -> vk::Result {
+    guard("vkCreateInstance", vk::Result::ERROR_INITIALIZATION_FAILED, || unsafe {
+        create_instance_inner(create_info, allocator, out)
+    })
+}
+
+unsafe fn create_instance_inner(
     create_info: *const vk::InstanceCreateInfo,
     allocator: *const vk::AllocationCallbacks,
     out: *mut vk::Instance,
@@ -51,7 +62,9 @@ pub unsafe extern "system" fn create_instance(
 }
 
 pub unsafe extern "system" fn destroy_instance(instance: vk::Instance, allocator: *const vk::AllocationCallbacks) {
-    if let Some(data) = INSTANCES.remove(dispatch_key(instance)) {
-        data.instance.destroy_instance(allocator.as_ref());
-    }
+    guard("vkDestroyInstance", (), || unsafe {
+        if let Some(data) = INSTANCES.remove(dispatch_key(instance)) {
+            data.instance.destroy_instance(allocator.as_ref());
+        }
+    })
 }

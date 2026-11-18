@@ -1,5 +1,6 @@
 //! Device-level hooks: create, destroy and the device-level function table.
 
+use crate::guard::guard;
 use crate::loader_abi::find_device_link;
 use crate::state::{dispatch_key, DeviceData, DEVICES, INSTANCES};
 use ash::vk;
@@ -7,6 +8,17 @@ use std::ffi::CStr;
 use std::sync::Arc;
 
 pub unsafe extern "system" fn create_device(
+    physical_device: vk::PhysicalDevice,
+    create_info: *const vk::DeviceCreateInfo,
+    allocator: *const vk::AllocationCallbacks,
+    out: *mut vk::Device,
+) -> vk::Result {
+    guard("vkCreateDevice", vk::Result::ERROR_INITIALIZATION_FAILED, || unsafe {
+        create_device_inner(physical_device, create_info, allocator, out)
+    })
+}
+
+unsafe fn create_device_inner(
     physical_device: vk::PhysicalDevice,
     create_info: *const vk::DeviceCreateInfo,
     allocator: *const vk::AllocationCallbacks,
@@ -44,9 +56,11 @@ pub unsafe extern "system" fn create_device(
 }
 
 pub unsafe extern "system" fn destroy_device(device: vk::Device, allocator: *const vk::AllocationCallbacks) {
-    if let Some(data) = DEVICES.remove(dispatch_key(device)) {
-        data.device.destroy_device(allocator.as_ref());
-    }
+    guard("vkDestroyDevice", (), || unsafe {
+        if let Some(data) = DEVICES.remove(dispatch_key(device)) {
+            data.device.destroy_device(allocator.as_ref());
+        }
+    })
 }
 
 /// Our replacement for a device-level function, if HaqEngine hooks it.
