@@ -14,5 +14,5 @@ pub use image::{checker, gradient, noise, shift, Image, Rgba8};
 pub use log::{Logger, LOG_CAP_BYTES};
 pub use packed::PackedFormat;
 pub use reference::{blend, compare_f32, compare_rg32f, compare_rgba8, luma_downsample, CompareReport, Mismatch};
-pub use settings::{process_name, Settings};
+pub use settings::{process_name, Mode, Settings};
 pub use stats::{should_log, FrameStats, Summary, STATS_CAPACITY};

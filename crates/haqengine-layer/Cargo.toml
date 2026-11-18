@@ -12,3 +12,4 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 ash = { version = "=0.38.0", default-features = false, features = ["debug"] }
 haqengine-core = { path = "../haqengine-core" }
+haqengine-shaders = { path = "../haqengine-shaders" }

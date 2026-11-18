@@ -2,6 +2,15 @@
 
 use std::path::PathBuf;
 
+/// How generated frames are made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Motion-compensated interpolation (block matching + warp).
+    Battery,
+    /// The real frame shown twice (M1).
+    Copy,
+}
+
 /// Settings HaqEngine reads once when it loads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -11,6 +20,9 @@ pub struct Settings {
     pub multiplier: u32,
     /// Set when the requested multiplier was clamped.
     pub multiplier_note: Option<String>,
+    pub mode: Mode,
+    /// Set when `HAQENGINE_MODE` held an unknown value.
+    pub mode_note: Option<String>,
 }
 
 impl Settings {
@@ -30,7 +42,12 @@ impl Settings {
             Some(v @ ("3" | "4")) => (2, Some(format!("multiplier {v} requested; 3x/4x arrive in M5, using 2"))),
             _ => (1, None),
         };
-        Settings { log_path, multiplier, multiplier_note }
+        let (mode, mode_note) = match get("HAQENGINE_MODE").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("battery") => (Mode::Battery, None),
+            Some("copy") => (Mode::Copy, None),
+            Some(other) => (Mode::Battery, Some(format!("unknown HAQENGINE_MODE {other:?}; using battery"))),
+        };
+        Settings { log_path, multiplier, multiplier_note, mode, mode_note }
     }
 }
 
@@ -98,6 +115,27 @@ mod tests {
         for v in ["0", "9", "x", "", "-2"] {
             assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", v)])).multiplier, 1, "{v}");
         }
+    }
+
+    #[test]
+    fn mode_defaults_to_battery() {
+        let s = Settings::from_lookup(env(&[]));
+        assert_eq!(s.mode, Mode::Battery);
+        assert!(s.mode_note.is_none());
+    }
+
+    #[test]
+    fn mode_parses_copy_and_battery() {
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "copy")])).mode, Mode::Copy);
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "COPY")])).mode, Mode::Copy);
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "Battery")])).mode, Mode::Battery);
+    }
+
+    #[test]
+    fn mode_rejects_garbage_with_note() {
+        let s = Settings::from_lookup(env(&[("HAQENGINE_MODE", "turbo")]));
+        assert_eq!(s.mode, Mode::Battery);
+        assert!(s.mode_note.unwrap().contains("turbo"));
     }
 
     #[test]

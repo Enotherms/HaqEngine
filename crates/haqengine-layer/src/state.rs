@@ -30,6 +30,8 @@ pub struct DeviceData {
     pub queue_families: Vec<vk::QueueFamilyProperties>,
     /// The loader's callback for dispatchable objects HaqEngine creates (command buffers).
     pub set_loader_data: Option<crate::loader_abi::PfnSetDeviceLoaderData>,
+    /// Battery-mode pipelines, created on the first battery swapchain.
+    pub pipelines: std::sync::OnceLock<Result<Arc<crate::pipelines::Pipelines>, vk::Result>>,
 }
 
 pub static INSTANCES: LazyLock<HandleMap<Arc<InstanceData>>> = LazyLock::new(HandleMap::new);
@@ -128,6 +130,7 @@ pub mod test_support {
             instance,
             queue_families,
             set_loader_data: None,
+            pipelines: std::sync::OnceLock::new(),
         });
         DEVICES.insert(dispatch_key(handle), Arc::clone(&data));
         (handle, data)

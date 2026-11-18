@@ -63,6 +63,7 @@ unsafe fn create_device_inner(
             instance,
             queue_families,
             set_loader_data,
+            pipelines: std::sync::OnceLock::new(),
         }),
     );
     vk::Result::SUCCESS
@@ -73,6 +74,9 @@ pub unsafe extern "system" fn destroy_device(device: vk::Device, allocator: *con
         let key = dispatch_key(device);
         if let Some(data) = DEVICES.remove(key) {
             crate::queue::forget_device(key);
+            if let Some(Ok(p)) = data.pipelines.get() {
+                p.destroy(&data.device);
+            }
             data.device.destroy_device(allocator.as_ref());
         }
     })

@@ -8,6 +8,7 @@ pub mod framegen;
 pub mod guard;
 pub mod instance;
 pub mod loader_abi;
+pub mod pipelines;
 pub mod plan;
 pub mod queue;
 pub mod state;
