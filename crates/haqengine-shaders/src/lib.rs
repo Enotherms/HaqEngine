@@ -22,9 +22,32 @@ pub const BLEND: Shader = Shader {
     local_size: [8, 8],
 };
 
+/// Halves an `r32f` luma level: bindings 0 = input, 1 = output; push `{ in_w, in_h }`.
+pub const LUMA_REDUCE: Shader = Shader {
+    name: "luma_reduce",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/luma_reduce.spv")),
+    local_size: [8, 8],
+};
+
+/// One motion vector per 8×8 block: bindings 0 = prev `r32f`, 1 = cur `r32f`, 2 = coarse `rg32f`,
+/// 3 = output `rg32f`; push `{ w, h, coarse_w, coarse_h, radius: i32, use_coarse }`. One invocation per block.
+pub const BLOCK_MATCH: Shader = Shader {
+    name: "block_match",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/block_match.spv")),
+    local_size: [8, 8],
+};
+
+/// The frame at time `t`: bindings 0 = prev `rgba8`, 1 = cur `rgba8`, 2 = level-0 flow `rg32f`,
+/// 3 = output `rgba8`; push `{ w, h, flow_w, flow_h, t: f32 }`.
+pub const WARP_BLEND: Shader = Shader {
+    name: "warp_blend",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/warp_blend.spv")),
+    local_size: [8, 8],
+};
+
 /// Every shader HaqEngine ships.
 pub fn all() -> &'static [Shader] {
-    &[LUMA_DOWNSAMPLE, BLEND]
+    &[LUMA_DOWNSAMPLE, BLEND, LUMA_REDUCE, BLOCK_MATCH, WARP_BLEND]
 }
 
 #[cfg(test)]
@@ -41,8 +64,8 @@ mod tests {
     }
 
     #[test]
-    fn all_lists_both_shaders() {
+    fn all_lists_every_shader() {
         let names: Vec<&str> = all().iter().map(|s| s.name).collect();
-        assert_eq!(names, ["luma_downsample", "blend"]);
+        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend"]);
     }
 }

@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D prev_frame;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D cur_frame;
+layout(set = 0, binding = 2, rg32f) uniform readonly image2D flow;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Push {
+    uint w;
+    uint h;
+    uint flow_w;
+    uint flow_h;
+    float t;
+} pc;
+
+const uint FULL_BLOCK = 16u;
+
+vec4 bilinear_prev(vec2 p) {
+    vec2 c = clamp(p, vec2(0.0), vec2(float(pc.w - 1u), float(pc.h - 1u)));
+    ivec2 p0 = ivec2(floor(c));
+    ivec2 p1 = min(p0 + ivec2(1), ivec2(int(pc.w) - 1, int(pc.h) - 1));
+    vec2 f = c - vec2(p0);
+    vec4 top = mix(imageLoad(prev_frame, p0), imageLoad(prev_frame, ivec2(p1.x, p0.y)), f.x);
+    vec4 bottom = mix(imageLoad(prev_frame, ivec2(p0.x, p1.y)), imageLoad(prev_frame, p1), f.x);
+    return mix(top, bottom, f.y);
+}
+
+vec4 bilinear_cur(vec2 p) {
+    vec2 c = clamp(p, vec2(0.0), vec2(float(pc.w - 1u), float(pc.h - 1u)));
+    ivec2 p0 = ivec2(floor(c));
+    ivec2 p1 = min(p0 + ivec2(1), ivec2(int(pc.w) - 1, int(pc.h) - 1));
+    vec2 f = c - vec2(p0);
+    vec4 top = mix(imageLoad(cur_frame, p0), imageLoad(cur_frame, ivec2(p1.x, p0.y)), f.x);
+    vec4 bottom = mix(imageLoad(cur_frame, ivec2(p0.x, p1.y)), imageLoad(cur_frame, p1), f.x);
+    return mix(top, bottom, f.y);
+}
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.w || p.y >= pc.h) {
+        return;
+    }
+    ivec2 ip = ivec2(p);
+    if (pc.t == 0.0) {
+        imageStore(dst, ip, imageLoad(prev_frame, ip));
+        return;
+    }
+    if (pc.t == 1.0) {
+        imageStore(dst, ip, imageLoad(cur_frame, ip));
+        return;
+    }
+    ivec2 block = ivec2(min(p.x / FULL_BLOCK, pc.flow_w - 1u), min(p.y / FULL_BLOCK, pc.flow_h - 1u));
+    vec2 f = imageLoad(flow, block).rg * 2.0;
+    vec2 pos = vec2(p);
+    vec4 a = bilinear_prev(pos - pc.t * f);
+    vec4 b = bilinear_cur(pos + (1.0 - pc.t) * f);
+    imageStore(dst, ip, mix(a, b, pc.t));
+}

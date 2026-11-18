@@ -50,7 +50,7 @@ pub fn pyramid(frame: &Image<Rgba8>) -> Vec<Image<f32>> {
 
 /// Luma as an integer for matching.
 pub fn quantize(l: f32) -> i32 {
-    (l.clamp(0.0, 1.0) * QUANT).round() as i32
+    (l.clamp(0.0, 1.0) * QUANT + 0.5).floor() as i32
 }
 
 /// Block matching at one level, optionally refining a coarser level's flow.

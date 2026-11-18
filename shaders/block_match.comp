@@ -1,0 +1,96 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32f) uniform readonly image2D prev_luma;
+layout(set = 0, binding = 1, r32f) uniform readonly image2D cur_luma;
+layout(set = 0, binding = 2, rg32f) uniform readonly image2D coarse_flow;
+layout(set = 0, binding = 3, rg32f) uniform writeonly image2D out_flow;
+
+layout(push_constant) uniform Push {
+    uint w;
+    uint h;
+    uint coarse_w;
+    uint coarse_h;
+    int radius;
+    uint use_coarse;
+} pc;
+
+const uint BLOCK = 8u;
+const float QUANT = 1023.0;
+
+int quantize(float l) {
+    precise float q = clamp(l, 0.0, 1.0) * QUANT;
+    precise float r = q + 0.5;
+    return int(floor(r));
+}
+
+int block_sad(uvec2 b, ivec2 offset) {
+    ivec2 limit = ivec2(int(pc.w) - 1, int(pc.h) - 1);
+    int sad = 0;
+    uint y_end = min((b.y + 1u) * BLOCK, pc.h);
+    uint x_end = min((b.x + 1u) * BLOCK, pc.w);
+    for (uint y = b.y * BLOCK; y < y_end; y++) {
+        for (uint x = b.x * BLOCK; x < x_end; x++) {
+            ivec2 q = ivec2(x, y);
+            ivec2 c = clamp(q + offset, ivec2(0), limit);
+            sad += abs(quantize(imageLoad(prev_luma, q).r) - quantize(imageLoad(cur_luma, c).r));
+        }
+    }
+    return sad;
+}
+
+ivec2 scaled(ivec2 c) {
+    vec2 v = imageLoad(coarse_flow, c).rg;
+    return ivec2(round(2.0 * v));
+}
+
+void main() {
+    uvec2 b = gl_GlobalInvocationID.xy;
+    uint blocks_w = (pc.w + BLOCK - 1u) / BLOCK;
+    uint blocks_h = (pc.h + BLOCK - 1u) / BLOCK;
+    if (b.x >= blocks_w || b.y >= blocks_h) {
+        return;
+    }
+    ivec2 candidates[10];
+    int n = 0;
+    if (pc.use_coarse != 0u) {
+        ivec2 c = ivec2(min(b.x / 2u, pc.coarse_w - 1u), min(b.y / 2u, pc.coarse_h - 1u));
+        candidates[n++] = scaled(c);
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                ivec2 nb = c + ivec2(dx, dy);
+                bool inside = nb.x >= 0 && nb.y >= 0 && nb.x < int(pc.coarse_w) && nb.y < int(pc.coarse_h);
+                if ((dx != 0 || dy != 0) && inside) {
+                    candidates[n++] = scaled(nb);
+                }
+            }
+        }
+    }
+    candidates[n++] = ivec2(0);
+    ivec2 pred = candidates[0];
+    int pred_sad = block_sad(b, pred);
+    for (int i = 1; i < n; i++) {
+        int s = block_sad(b, candidates[i]);
+        if (s < pred_sad) {
+            pred = candidates[i];
+            pred_sad = s;
+        }
+    }
+    int best_sad = 0x7fffffff;
+    int best_d2 = 0x7fffffff;
+    ivec2 best = pred;
+    for (int dy = -pc.radius; dy <= pc.radius; dy++) {
+        for (int dx = -pc.radius; dx <= pc.radius; dx++) {
+            ivec2 offset = pred + ivec2(dx, dy);
+            int s = block_sad(b, offset);
+            int d2 = dx * dx + dy * dy;
+            if (s < best_sad || (s == best_sad && d2 < best_d2)) {
+                best_sad = s;
+                best_d2 = d2;
+                best = offset;
+            }
+        }
+    }
+    imageStore(out_flow, ivec2(b), vec4(vec2(best), 0.0, 0.0));
+}
