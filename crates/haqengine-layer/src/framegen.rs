@@ -20,10 +20,11 @@ const LOG_EVERY_MS: u64 = 10_000;
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Generated-frame count at which the `HAQENGINE_DUMP` snapshot is taken.
-const DUMP_AT: u64 = 300;
+/// How often (in generated frames) the snapshot trigger file is checked.
+const DUMP_CHECK_EVERY: u64 = 30;
 
-/// `HAQENGINE_DUMP`: `1` for `~/haqengine-dump`, or a directory; unset for no snapshot.
+/// `HAQENGINE_DUMP`: `1` for `~/haqengine-dump`, or a directory; unset for no snapshot. A snapshot
+/// is taken when the file `now` appears in that directory.
 static DUMP_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
     let v = std::env::var("HAQENGINE_DUMP").ok().filter(|v| !v.is_empty() && v != "0")?;
     if v == "1" {
@@ -344,10 +345,14 @@ impl FrameGen {
             ready.stamped[slot_index] = ready.queries != vk::QueryPool::null();
         }
         if used_battery {
-            if st.stats.generated == DUMP_AT {
-                if let (Some(dir), Some(b), Some(ready)) = (DUMP_DIR.as_ref(), st.battery.as_ref(), st.ready.as_ref()) {
-                    let r = b.dump(device, ready.pool, queue, dir);
-                    LOG.log(&format!("debug snapshot to {}: {r:?}", dir.display()));
+            if let Some(dir) = DUMP_DIR.as_ref().filter(|_| st.stats.generated % DUMP_CHECK_EVERY == 0) {
+                let trigger = dir.join("now");
+                if trigger.exists() {
+                    let _ = std::fs::remove_file(&trigger);
+                    if let (Some(b), Some(ready)) = (st.battery.as_ref(), st.ready.as_ref()) {
+                        let r = b.dump(device, ready.pool, queue, dir);
+                        LOG.log(&format!("debug snapshot to {}: {r:?}", dir.display()));
+                    }
                 }
             }
             if let Some(b) = st.battery.as_mut() {
