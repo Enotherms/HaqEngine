@@ -77,7 +77,7 @@ pub fn compare_rgba8(expected: &Image<Rgba8>, actual: &Image<Rgba8>, tol_per_cha
     })
 }
 
-fn compare<T: Copy>(expected: &Image<T>, actual: &Image<T>, tol: f32, diff: impl Fn(T, T) -> f32) -> CompareReport {
+pub(crate) fn compare<T: Copy>(expected: &Image<T>, actual: &Image<T>, tol: f32, diff: impl Fn(T, T) -> f32) -> CompareReport {
     if (expected.width, expected.height) != (actual.width, actual.height) || expected.data.len() != actual.data.len() {
         return CompareReport { max_diff: f32::INFINITY, worst: None, over_tolerance: u32::MAX };
     }

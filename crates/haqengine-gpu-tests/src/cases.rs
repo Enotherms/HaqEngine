@@ -7,7 +7,10 @@ use haqengine_core::{
     blend, checker, compare_f32, compare_rg32f, compare_rgba8, gradient, luma_downsample, noise, shift, CompareReport,
     Image, Rgba8,
 };
-use haqengine_shaders::{BLEND, BLOCK_MATCH, FLOW_MEDIAN, LUMA_DOWNSAMPLE, LUMA_REDUCE, WARP_BLEND};
+use haqengine_core::packed::{self, PackedFormat};
+use haqengine_shaders::{
+    BLEND, BLOCK_MATCH, FLOW_MEDIAN, LUMA_DOWNSAMPLE, LUMA_DOWNSAMPLE_PACKED, LUMA_REDUCE, WARP_BLEND, WARP_BLEND_PACKED,
+};
 
 pub const LUMA_TOLERANCE: f32 = 1e-5;
 pub const BLEND_TOLERANCE: u8 = 1;
@@ -101,21 +104,157 @@ impl Frame {
     }
 }
 
+const CANARY_U32: u32 = 0xDEAD_BEEF;
+
 fn gpu_frame(gpu: &Gpu, frame: &Image<Rgba8>, time: &mut f64) -> Result<Frame, String> {
     let color = gpu.upload_rgba8(frame)?;
+    build_pyramid(gpu, color, None, time)
+}
+
+fn gpu_frame_packed(gpu: &Gpu, f: PackedFormat, frame: &Image<u32>, time: &mut f64) -> Result<Frame, String> {
+    let color = gpu.upload_u32(frame)?;
+    build_pyramid(gpu, color, Some(f), time)
+}
+
+fn build_pyramid(gpu: &Gpu, color: StorageImage, packed: Option<PackedFormat>, time: &mut f64) -> Result<Frame, String> {
+    let (frame_w, frame_h) = (color.width, color.height);
     let mut levels: Vec<StorageImage> = Vec::new();
-    let (mut w, mut h) = (frame.width, frame.height);
-    for level in 0..LEVELS {
-        let (ow, oh) = (w.div_ceil(2), h.div_ceil(2));
-        let dst = gpu.create_storage_image(vk::Format::R32_SFLOAT, ow, oh)?;
-        gpu.clear(&dst, CANARY_FLOAT)?;
-        let push = push_bytes(&[w.to_le_bytes(), h.to_le_bytes()]);
-        let (shader, src) = if level == 0 { (&LUMA_DOWNSAMPLE, &color) } else { (&LUMA_REDUCE, &levels[level - 1]) };
-        *time += gpu.run(shader, &[src, &dst], &push, groups(ow, oh))?;
-        levels.push(dst);
-        (w, h) = (ow, oh);
+    let (mut w, mut h) = (frame_w, frame_h);
+    let result = (|| {
+        for level in 0..LEVELS {
+            let (ow, oh) = (w.div_ceil(2), h.div_ceil(2));
+            let dst = gpu.create_storage_image(vk::Format::R32_SFLOAT, ow, oh)?;
+            gpu.clear(&dst, CANARY_FLOAT)?;
+            let mut words = vec![w.to_le_bytes(), h.to_le_bytes()];
+            let (shader, src) = match (level, packed) {
+                (0, Some(f)) => {
+                    words.push(f.code().to_le_bytes());
+                    (&LUMA_DOWNSAMPLE_PACKED, &color)
+                }
+                (0, None) => (&LUMA_DOWNSAMPLE, &color),
+                _ => (&LUMA_REDUCE, &levels[level - 1]),
+            };
+            let t = gpu.run(shader, &[src, &dst], &push_bytes(&words), groups(ow, oh));
+            levels.push(dst);
+            *time += t?;
+            (w, h) = (ow, oh);
+        }
+        Ok(())
+    })();
+    let frame = Frame { color, levels };
+    match result {
+        Ok(()) => Ok(frame),
+        Err(e) => {
+            frame.destroy(gpu);
+            Err(e)
+        }
     }
-    Ok(Frame { color, levels })
+}
+
+fn luma_packed_case(gpu: &Gpu, f: PackedFormat, input: &Image<u32>) -> Result<CaseResult, String> {
+    let src = gpu.upload_u32(input)?;
+    let (ow, oh) = (input.width.div_ceil(2), input.height.div_ceil(2));
+    let dst = gpu.create_storage_image(vk::Format::R32_SFLOAT, ow, oh)?;
+    let result = (|| {
+        gpu.clear(&dst, CANARY_FLOAT)?;
+        let push = push_bytes(&[input.width.to_le_bytes(), input.height.to_le_bytes(), f.code().to_le_bytes()]);
+        let gpu_us = gpu.run(&LUMA_DOWNSAMPLE_PACKED, &[&src, &dst], &push, groups(ow, oh))?;
+        let report = compare_f32(&packed::luma_downsample_packed(f, input), &gpu.read_r32f(&dst)?, LUMA_TOLERANCE);
+        Ok(CaseResult { report, gpu_us, tolerance: LUMA_TOLERANCE })
+    })();
+    gpu.destroy_image(src);
+    gpu.destroy_image(dst);
+    result
+}
+
+fn run_warp_packed(
+    gpu: &Gpu,
+    f: PackedFormat,
+    prev: &StorageImage,
+    cur: &StorageImage,
+    flow_img: &StorageImage,
+    t: f32,
+) -> Result<(Image<u32>, f64), String> {
+    let dst = gpu.create_storage_image(vk::Format::R32_UINT, prev.width, prev.height)?;
+    let result = (|| {
+        gpu.clear_u32(&dst, CANARY_U32)?;
+        let push = push_bytes(&[
+            prev.width.to_le_bytes(),
+            prev.height.to_le_bytes(),
+            flow_img.width.to_le_bytes(),
+            flow_img.height.to_le_bytes(),
+            t.to_le_bytes(),
+            f.code().to_le_bytes(),
+        ]);
+        let us = gpu.run(&WARP_BLEND_PACKED, &[prev, cur, flow_img, &dst], &push, groups(prev.width, prev.height))?;
+        Ok((gpu.read_u32(&dst)?, us))
+    })();
+    gpu.destroy_image(dst);
+    result
+}
+
+fn warp_packed_case(
+    gpu: &Gpu,
+    f: PackedFormat,
+    prev: &Image<u32>,
+    cur: &Image<u32>,
+    flow_cpu: &Flow,
+    ts: &[f32],
+    tol_steps: f32,
+) -> Result<CaseResult, String> {
+    let gp = gpu.upload_u32(prev)?;
+    let gc = gpu.upload_u32(cur)?;
+    let gf = gpu.upload_rg32f(flow_cpu)?;
+    let result = (|| {
+        let (mut reports, mut time) = (Vec::new(), 0.0);
+        for &t in ts {
+            let (actual, us) = run_warp_packed(gpu, f, &gp, &gc, &gf, t)?;
+            time += us;
+            reports.push(packed::compare_packed(f, &packed::warp_blend_packed(f, prev, cur, flow_cpu, t), &actual, tol_steps));
+        }
+        Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: tol_steps })
+    })();
+    for img in [gp, gc, gf] {
+        gpu.destroy_image(img);
+    }
+    result
+}
+
+fn battery_packed_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let f = PackedFormat::Bgra8;
+    let prev = noise(1280, 800, 31);
+    let cur = shift(&prev, 10, -6);
+    let (pp, cp) = (packed::to_packed(f, &prev), packed::to_packed(f, &cur));
+    let mut setup = 0.0;
+    let fp = gpu_frame_packed(gpu, f, &pp, &mut setup)?;
+    let mut time = 0.0;
+    let fc = match gpu_frame_packed(gpu, f, &cp, &mut time) {
+        Ok(frame) => frame,
+        Err(e) => {
+            fp.destroy(gpu);
+            return Err(e);
+        }
+    };
+    let result = (|| {
+        let flows = gpu_flows(gpu, &fp, &fc, &mut time)?;
+        let level0 = gpu.read_rg32f(&flows.images[0]);
+        let warp = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], 0.5);
+        let mut reports = flows.checks.clone();
+        for img in flows.images {
+            gpu.destroy_image(img);
+        }
+        let level0 = level0?;
+        let (actual, us) = warp?;
+        time += us;
+        end_to_end(&prev, &cur, &level0)?;
+        require_recovery(&level0, [5.0, -3.0])?;
+        reports.push(packed::compare_packed(f, &packed::warp_blend_packed(f, &pp, &cp, &level0, 0.5), &actual, 1.0));
+        println!("      battery packed pipeline total {time:.1} us (budget 2000 us)");
+        Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: 1.0 })
+    })();
+    fp.destroy(gpu);
+    fc.destroy(gpu);
+    result
 }
 
 /// GPU flow for every level (index = level), each checked exactly against the CPU fed with the
@@ -399,6 +538,37 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         }),
         case("battery pipeline 1280x800 total", battery_case),
     ]);
+    cases.extend([
+        case("luma packed bgra8 1280x800", |g| {
+            luma_packed_case(g, PackedFormat::Bgra8, &packed::to_packed(PackedFormat::Bgra8, &noise(1280, 800, 41)))
+        }),
+        case("luma packed rgba8 1281x801", |g| {
+            luma_packed_case(g, PackedFormat::Rgba8, &packed::to_packed(PackedFormat::Rgba8, &gradient(1281, 801)))
+        }),
+        case("luma packed a2b10g10r10 1280x800", |g| {
+            let f = PackedFormat::A2b10g10r10;
+            luma_packed_case(g, f, &packed::to_packed(f, &noise(1280, 800, 42)))
+        }),
+        case("warp packed bgra8 t=0.5", |g| {
+            let f = PackedFormat::Bgra8;
+            let prev = noise(1280, 800, 43);
+            let flow = Image::new(80, 50, [4.0f32, 0.0]);
+            warp_packed_case(g, f, &packed::to_packed(f, &prev), &packed::to_packed(f, &shift(&prev, 8, 0)), &flow, &[0.5], 1.0)
+        }),
+        case("warp packed a2b10g10r10 t=0.5", |g| {
+            let f = PackedFormat::A2b10g10r10;
+            let prev = noise(1280, 800, 44);
+            let flow = Image::new(80, 50, [3.0f32, -2.0]);
+            warp_packed_case(g, f, &packed::to_packed(f, &prev), &packed::to_packed(f, &noise(1280, 800, 45)), &flow, &[0.5], 1.0)
+        }),
+        case("warp packed endpoints", |g| {
+            let f = PackedFormat::A2b10g10r10;
+            let flow = Image::new(80, 50, [5.0f32, 3.0]);
+            let (a, b) = (packed::to_packed(f, &noise(1280, 800, 46)), packed::to_packed(f, &noise(1280, 800, 47)));
+            warp_packed_case(g, f, &a, &b, &flow, &[0.0, 1.0], 0.0)
+        }),
+        case("battery packed pipeline bgra8 total", battery_packed_case),
+    ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
             blend_case(g, &noise(64, 64, 4), &gradient(64, 64), 0.5, 0.6)
@@ -435,6 +605,13 @@ mod tests {
             "warp_blend 1280x800 t=0.5 shift(8,0)",
             "warp_blend endpoints t=0 and t=1",
             "battery pipeline 1280x800 total",
+            "luma packed bgra8 1280x800",
+            "luma packed rgba8 1281x801",
+            "luma packed a2b10g10r10 1280x800",
+            "warp packed bgra8 t=0.5",
+            "warp packed a2b10g10r10 t=0.5",
+            "warp packed endpoints",
+            "battery packed pipeline bgra8 total",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

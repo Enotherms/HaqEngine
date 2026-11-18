@@ -54,9 +54,34 @@ pub const FLOW_MEDIAN: Shader = Shader {
     local_size: [8, 8],
 };
 
+/// Half-resolution luma from packed pixels: bindings 0 = `r32ui` input, 1 = `r32f` output;
+/// push `{ in_w, in_h, format }` with the `PackedFormat` code.
+pub const LUMA_DOWNSAMPLE_PACKED: Shader = Shader {
+    name: "luma_downsample_packed",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/luma_downsample_packed.spv")),
+    local_size: [8, 8],
+};
+
+/// The frame at time `t` on packed pixels: bindings 0 = prev `r32ui`, 1 = cur `r32ui`, 2 = level-0
+/// flow `rg32f`, 3 = output `r32ui`; push `{ w, h, flow_w, flow_h, t: f32, format }`.
+pub const WARP_BLEND_PACKED: Shader = Shader {
+    name: "warp_blend_packed",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/warp_blend_packed.spv")),
+    local_size: [8, 8],
+};
+
 /// Every shader HaqEngine ships.
 pub fn all() -> &'static [Shader] {
-    &[LUMA_DOWNSAMPLE, BLEND, LUMA_REDUCE, BLOCK_MATCH, WARP_BLEND, FLOW_MEDIAN]
+    &[
+        LUMA_DOWNSAMPLE,
+        BLEND,
+        LUMA_REDUCE,
+        BLOCK_MATCH,
+        WARP_BLEND,
+        FLOW_MEDIAN,
+        LUMA_DOWNSAMPLE_PACKED,
+        WARP_BLEND_PACKED,
+    ]
 }
 
 #[cfg(test)]
@@ -75,6 +100,6 @@ mod tests {
     #[test]
     fn all_lists_every_shader() {
         let names: Vec<&str> = all().iter().map(|s| s.name).collect();
-        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median"]);
+        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed"]);
     }
 }

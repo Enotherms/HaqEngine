@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: &[&str] = &["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median"];
+const SHADERS: &[&str] = &["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed"];
 
 fn compiler() -> PathBuf {
     if let Ok(p) = env::var("GLSLANG_VALIDATOR") {

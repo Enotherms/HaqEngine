@@ -2,7 +2,7 @@
 
 use crate::flow::{Flow, BLOCK};
 use crate::image::{Image, Rgba8};
-use crate::reference::LUMA;
+use crate::reference::{CompareReport, LUMA};
 
 /// The 32-bit layouts HaqEngine reads and writes; the code is passed to the shaders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,14 @@ pub fn pack(f: PackedFormat, rgba: [f32; 4]) -> u32 {
         PackedFormat::Bgra8 => q(b, 255.0) | (q(g, 255.0) << 8) | (q(r, 255.0) << 16) | (q(a, 255.0) << 24),
         PackedFormat::A2b10g10r10 => q(r, 1023.0) | (q(g, 1023.0) << 10) | (q(b, 1023.0) << 20) | (q(a, 3.0) << 30),
     }
+}
+
+/// Compares packed images channel by channel, in steps of the format (1/255 or 1/1023).
+pub fn compare_packed(f: PackedFormat, expected: &Image<u32>, actual: &Image<u32>, tol_steps: f32) -> CompareReport {
+    crate::reference::compare(expected, actual, tol_steps, |e, a| {
+        let (e, a) = (unpack(f, e), unpack(f, a));
+        (0..4).map(|c| (e[c] - a[c]).abs() * f.max_rgb()).fold(0.0, f32::max)
+    })
 }
 
 /// `img` stored in format `f`.
@@ -178,6 +186,16 @@ mod tests {
                 assert!((a - b).abs() < 1e-6, "{f:?}");
             }
         }
+    }
+
+    #[test]
+    fn compare_packed_counts_steps() {
+        let f = PackedFormat::A2b10g10r10;
+        let a = Image::new(2, 1, pack(f, [0.5, 0.5, 0.5, 1.0]));
+        let mut b = a.clone();
+        b.set(1, 0, a.get(1, 0) + 2);
+        assert_eq!(compare_packed(f, &a, &b, 1.0).over_tolerance, 1);
+        assert_eq!(compare_packed(f, &a, &b, 2.0).over_tolerance, 0);
     }
 
     #[test]
