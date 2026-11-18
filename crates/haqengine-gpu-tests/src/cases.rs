@@ -858,6 +858,60 @@ fn blend_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: BLEND_TOLERANCE as f32 })
 }
 
+/// The packed blend, run on the frames and flow the layer would have, equals its CPU reference
+/// within one step of the format.
+fn blend_packed_case(gpu: &Gpu, f: PackedFormat) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let square = checker(96, 96, 6);
+    let mut frames = pan_frames(1280, 800, 16, 0, QUALITY_STEPS, 171);
+    for fr in &mut frames {
+        paste(fr, &square, (592, 352));
+    }
+    let packed_frames: Vec<Image<u32>> = frames.iter().map(|fr| packed::to_packed(f, fr)).collect();
+    let mut flow = crate::fsr3::Fsr3Flow::new(gpu, 1280, 800, f)?;
+    let mut images: Vec<StorageImage> = Vec::new();
+    let result = (|| -> Result<CaseResult, String> {
+        for fr in &packed_frames {
+            flow.run_frame(gpu, fr)?;
+        }
+        let n = packed_frames.len();
+        let (prev, cur) = (&packed_frames[n - 2], &packed_frames[n - 1]);
+        images.push(gpu.upload_u32(prev)?);
+        images.push(gpu.upload_u32(cur)?);
+        images.push(gpu.create_storage_image(vk::Format::R32_UINT, 1280, 800)?);
+        let (ps, cs) = flow.luma_slots();
+        let raw = flow.read_raw(gpu)?;
+        let lp = gpu.read_r8(flow.image(haqengine_core::fsr3_flow::OfRes::Input(ps, 0))?)?;
+        let lc = gpu.read_r8(flow.image(haqengine_core::fsr3_flow::OfRes::Input(cs, 0))?)?;
+        let binds = [
+            (0, Bind::Image(&images[0])),
+            (1, Bind::Image(&images[1])),
+            (2, Bind::Image(flow.image(haqengine_core::fsr3_flow::OfRes::Output)?)),
+            (3, Bind::Image(flow.image(haqengine_core::fsr3_flow::OfRes::Input(ps, 0))?)),
+            (4, Bind::Image(flow.image(haqengine_core::fsr3_flow::OfRes::Input(cs, 0))?)),
+            (5, Bind::Image(&images[2])),
+            (6, Bind::Image(flow.image(haqengine_core::fsr3_flow::OfRes::ScdOutput)?)),
+        ];
+        let push = push_bytes(&[
+            1280u32.to_le_bytes(),
+            800u32.to_le_bytes(),
+            raw.width.to_le_bytes(),
+            raw.height.to_le_bytes(),
+            0u32.to_le_bytes(),
+            f.code().to_le_bytes(),
+        ]);
+        let us = gpu.run_fsr3(&haqengine_shaders::FI_BLEND_PACKED, &binds, &[], &push, [160, 100, 1])?;
+        let expected = haqengine_core::fsr3_interp::fi_blend_packed_reference(f, prev, cur, &raw, &lp, &lc, false);
+        let got = gpu.read_u32(&images[2])?;
+        Ok(CaseResult { report: packed::compare_packed(f, &expected, &got, 1.0), gpu_us: us, tolerance: 1.0 })
+    })();
+    for img in images {
+        gpu.destroy_image(img);
+    }
+    flow.destroy(gpu);
+    result
+}
+
 fn interp_reset_case(gpu: &Gpu) -> Result<CaseResult, String> {
     fsr3_ready(gpu)?;
     let frames = pan_frames(1280, 800, 12, -8, 9, 101);
@@ -1272,6 +1326,8 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("fsr3 flow odd shift(7,-3)", fsr3_odd_case),
         case("fsr3 flow memory within budget", fsr3_memory_case),
         case("fi_blend matches CPU", blend_parity_case),
+        case("fi_blend_packed matches CPU bgra8", |g| blend_packed_case(g, PackedFormat::Bgra8)),
+        case("fi_blend_packed matches CPU a2b10g10r10", |g| blend_packed_case(g, PackedFormat::A2b10g10r10)),
         case("fsr3 interp first frames after reset", interp_reset_case),
         case("fsr3 interp memory within budget", interp_memory_case),
         case("fsr3 interp pan", |g| interp_pan_case(g, 1280, 800, 12, -8)),
@@ -1363,6 +1419,8 @@ mod tests {
             "fsr3 interp pipeline total",
             "fsr3 interp scene cut takes current frame",
             "fsr3 interp no ghosts behind a moving object",
+            "fi_blend_packed matches CPU bgra8",
+            "fi_blend_packed matches CPU a2b10g10r10",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

@@ -281,6 +281,16 @@ pub const FI_BLEND: Fsr3Pass = Fsr3Pass {
     push_size: 20,
 };
 
+/// `FI_BLEND` on packed pixels (`r32ui` frames and output, `PackedFormat` code in the push),
+/// for the layer; push `{ w, h, flow_w, flow_h, reset, format }`.
+pub const FI_BLEND_PACKED: Fsr3Pass = Fsr3Pass {
+    name: "fi_blend_packed",
+    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_blend_packed.spv")),
+    local_size: [8, 8, 1],
+    bindings: &[(0, Uav), (1, Uav), (2, Uav), (3, Uav), (4, Uav), (5, Uav), (6, Uav)],
+    push_size: 24,
+};
+
 /// The interpolation passes; indices are `haqengine_core::fsr3_interp`'s `PASS_FI_*` constants.
 pub const FI_PASSES: [&Fsr3Pass; 11] = [
     &FI_SETUP,
@@ -469,6 +479,12 @@ mod tests {
     fn fsr3_pass_order() {
         let names: Vec<&str> = OF_PASSES.iter().map(|p| p.name).collect();
         assert_eq!(names, ["of_prepare_luma", "of_luminance_pyramid", "of_scd_histogram", "of_scd_divergence", "of_search", "of_filter", "of_scale", "of_luma_half"]);
+    }
+
+    #[test]
+    fn packed_blend_is_spirv_1_0_with_kinds() {
+        assert_eq!(words(FI_BLEND_PACKED.spirv)[1], 0x0001_0000);
+        assert_eq!(binding_kinds(FI_BLEND_PACKED.spirv), table(&FI_BLEND_PACKED));
     }
 
     #[test]

@@ -197,6 +197,57 @@ pub fn fi_blend_reference(
     if copy_current {
         return out;
     }
+    for y in 0..cur.height {
+        for x in 0..cur.width {
+            let (disagree, v) = choose(x, y, flow_raw, prev_luma, cur_luma);
+            let (px, py) = (x as f32, y as f32);
+            let a = crate::flow::bilinear(prev, px - v[0] * 0.5, py - v[1] * 0.5);
+            let b = crate::flow::bilinear(cur, px + v[0] * 0.5, py + v[1] * 0.5);
+            let mut c = [0u8, 0, 0, 255];
+            for i in 0..3 {
+                let value = if disagree { b[i] } else { (a[i] + b[i]) * 0.5 };
+                c[i] = (value + 0.5).floor().clamp(0.0, 255.0) as u8;
+            }
+            out.set(x, y, c);
+        }
+    }
+    out
+}
+
+/// `fi_blend_reference` on packed pixels, rounding through `pack` as `fi_blend_packed.comp` does.
+pub fn fi_blend_packed_reference(
+    f: crate::packed::PackedFormat,
+    prev: &Image<u32>,
+    cur: &Image<u32>,
+    flow_raw: &Image<[i16; 2]>,
+    prev_luma: &Image<u8>,
+    cur_luma: &Image<u8>,
+    copy_current: bool,
+) -> Image<u32> {
+    use crate::packed::{bilinear_packed, pack};
+    let mut out = cur.clone();
+    if copy_current {
+        return out;
+    }
+    for y in 0..cur.height {
+        for x in 0..cur.width {
+            let (disagree, v) = choose(x, y, flow_raw, prev_luma, cur_luma);
+            let (px, py) = (x as f32, y as f32);
+            let a = bilinear_packed(f, prev, px - v[0] * 0.5, py - v[1] * 0.5);
+            let b = bilinear_packed(f, cur, px + v[0] * 0.5, py + v[1] * 0.5);
+            let mut c = [0.0f32, 0.0, 0.0, 1.0];
+            for i in 0..3 {
+                c[i] = if disagree { b[i] } else { (a[i] + b[i]) * 0.5 };
+            }
+            out.set(x, y, pack(f, c));
+        }
+    }
+    out
+}
+
+/// The blend's per-pixel choice: whether the winning candidate's samples still disagree, and its
+/// vector in full-resolution pixels.
+fn choose(x: u32, y: u32, flow_raw: &Image<[i16; 2]>, prev_luma: &Image<u8>, cur_luma: &Image<u8>) -> (bool, [f32; 2]) {
     let luma_at = |img: &Image<u8>, x: i64, y: i64| {
         img.get(x.clamp(0, img.width as i64 - 1) as u32, y.clamp(0, img.height as i64 - 1) as u32) as i32
     };
@@ -211,41 +262,28 @@ pub fn fi_blend_reference(
         }
         sum
     };
-    for y in 0..cur.height {
-        for x in 0..cur.width {
-            let (bx, by) = ((x / 16).min(flow_raw.width - 1) as i64, (y / 16).min(flow_raw.height - 1) as i64);
-            let mut cands: Vec<[f32; 2]> = Vec::with_capacity(6);
-            cands.push([0.0, 0.0]);
-            for (ox, oy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let (nx, ny) = (bx + ox, by + oy);
-                if nx >= 0 && ny >= 0 && nx < flow_raw.width as i64 && ny < flow_raw.height as i64 {
-                    let v = crate::fsr3_flow::ffx_to_haq(flow_raw.get(nx as u32, ny as u32), 2.0);
-                    if !cands.contains(&v) {
-                        cands.push(v);
-                    }
-                }
+    let (bx, by) = ((x / 16).min(flow_raw.width - 1) as i64, (y / 16).min(flow_raw.height - 1) as i64);
+    let mut cands: [[f32; 2]; 6] = [[0.0; 2]; 6];
+    let mut n = 1;
+    for (ox, oy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+        let (nx, ny) = (bx + ox, by + oy);
+        if nx >= 0 && ny >= 0 && nx < flow_raw.width as i64 && ny < flow_raw.height as i64 {
+            let v = crate::fsr3_flow::ffx_to_haq(flow_raw.get(nx as u32, ny as u32), 2.0);
+            if !cands[..n].contains(&v) {
+                cands[n] = v;
+                n += 1;
             }
-            let (px, py) = (x as f32, y as f32);
-            let mut best = (u32::MAX, [0.0f32; 2]);
-            for v in cands {
-                let (ax, ay, bx2, by2) = (px - v[0] * 0.5, py - v[1] * 0.5, px + v[0] * 0.5, py + v[1] * 0.5);
-                let cost = window_cost(ax, ay, bx2, by2);
-                if cost < best.0 {
-                    best = (cost, v);
-                }
-            }
-            let v = best.1;
-            let a = crate::flow::bilinear(prev, px - v[0] * 0.5, py - v[1] * 0.5);
-            let b = crate::flow::bilinear(cur, px + v[0] * 0.5, py + v[1] * 0.5);
-            let mut c = [0u8, 0, 0, 255];
-            for i in 0..3 {
-                let value = if best.0 > DISAGREE8 { b[i] } else { (a[i] + b[i]) * 0.5 };
-                c[i] = (value + 0.5).floor().clamp(0.0, 255.0) as u8;
-            }
-            out.set(x, y, c);
         }
     }
-    out
+    let (px, py) = (x as f32, y as f32);
+    let mut best = (u32::MAX, [0.0f32; 2]);
+    for v in &cands[..n] {
+        let cost = window_cost(px - v[0] * 0.5, py - v[1] * 0.5, px + v[0] * 0.5, py + v[1] * 0.5);
+        if cost < best.0 {
+            best = (cost, *v);
+        }
+    }
+    (best.0 > DISAGREE8, best.1)
 }
 
 /// Texel bytes of the image interpolation owns, its output; the frames, the flow, its luma and its
@@ -372,6 +410,35 @@ mod tests {
         let cur = crate::noise(40, 24, 8);
         let out = fi_blend_reference(&prev, &cur, &raw_flow(40, 24, [-4, 2]), &luma8(&prev), &luma8(&cur), true);
         assert_eq!(out.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>(), cur.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fi_blend_packed_matches_rgba_path() {
+        use crate::packed::{to_packed, unpack, PackedFormat};
+        let bar = crate::checker(16, 16, 2);
+        let mut prev = crate::noise(64, 48, 11);
+        let mut cur = crate::shift(&prev, 8, -4);
+        for img in [&mut prev, &mut cur] {
+            for y in 0..16 {
+                for x in 0..16 {
+                    img.set(24 + x, 16 + y, bar.get(x, y));
+                }
+            }
+        }
+        let flow = raw_flow(64, 48, [-4, 2]);
+        let (lp, lc) = (luma8(&prev), luma8(&cur));
+        let rgba = fi_blend_reference(&prev, &cur, &flow, &lp, &lc, false);
+        let f = PackedFormat::Rgba8;
+        let packed = fi_blend_packed_reference(f, &to_packed(f, &prev), &to_packed(f, &cur), &flow, &lp, &lc, false);
+        for (e, g) in rgba.data.iter().zip(&packed.data) {
+            let g = unpack(f, *g);
+            for c in 0..3 {
+                assert!((e[c] as f32 - g[c] * 255.0).abs() <= 1.01, "{e:?} vs {g:?}");
+            }
+            assert_eq!(g[3], 1.0);
+        }
+        let copied = fi_blend_packed_reference(f, &to_packed(f, &prev), &to_packed(f, &cur), &flow, &lp, &lc, true);
+        assert_eq!(copied, to_packed(f, &cur));
     }
 
     #[test]
