@@ -50,11 +50,20 @@ pub fn image_specs(extent: vk::Extent2D) -> Vec<(QRes, vk::Format, u32, u32)> {
     out
 }
 
-/// The flow's schedule for even and odd frames, built once per swapchain.
+/// The flow's schedule for even and odd frames, built once per swapchain, without FSR 3's scene
+/// detection: in games it fires on effects and fast turns, and each detection zeroes the flow for
+/// four frames. Real cuts still come out as one real frame, because the blend takes the current
+/// frame wherever the two frames disagree.
 pub fn schedules(extent: vk::Extent2D, format: PackedFormat) -> [Vec<OfDispatch>; 2] {
+    use haqengine_core::fsr3_flow::{PASS_SCD_DIVERGENCE, PASS_SCD_HISTOGRAM};
     let (hw, hh) = half_size(extent.width, extent.height);
     let input = OfInput::PackedHalf { format: format.code(), full_width: extent.width, full_height: extent.height };
-    [of_schedule(hw, hh, 0, input), of_schedule(hw, hh, 1, input)]
+    let without_scd = |frame| {
+        let mut d = of_schedule(hw, hh, frame, input);
+        d.retain(|x| x.pass != PASS_SCD_HISTOGRAM && x.pass != PASS_SCD_DIVERGENCE);
+        d
+    };
+    [without_scd(0), without_scd(1)]
 }
 
 fn of_res(r: OfRes, parity: usize) -> QRes {
@@ -646,11 +655,21 @@ mod tests {
     }
 
     #[test]
+    fn quality_schedule_skips_scene_detection() {
+        use haqengine_core::fsr3_flow::{PASS_SCD_DIVERGENCE, PASS_SCD_HISTOGRAM};
+        for parity in schedules(EXTENT, PackedFormat::Bgra8) {
+            assert_eq!(parity.len(), 22);
+            assert!(parity.iter().all(|d| d.pass != PASS_SCD_HISTOGRAM && d.pass != PASS_SCD_DIVERGENCE));
+            assert_eq!(parity.iter().filter(|d| d.spd_constants.is_some()).count(), 1);
+        }
+    }
+
+    #[test]
     fn quality_sets_per_parity() {
         let s = schedules(EXTENT, PackedFormat::Bgra8);
-        assert_eq!(s[0].len(), 24);
+        assert_eq!(s[0].len(), 22);
         let plan = set_plan(&s);
-        assert_eq!(plan[0].len() + plan[1].len(), 50);
+        assert_eq!(plan[0].len() + plan[1].len(), 46);
         let specs = image_specs(EXTENT);
         let owned: Vec<QRes> = specs.iter().map(|x| x.0).collect();
         for parity in &plan {
@@ -662,7 +681,7 @@ mod tests {
         }
         assert_eq!(plan[0][0][0], (0, QRes::Raw(0)));
         assert_eq!(plan[1][0][0], (0, QRes::Raw(1)));
-        let blend = &plan[0][24];
+        let blend = plan[0].last().unwrap();
         assert_eq!(blend[0], (0, QRes::Raw(1)));
         assert_eq!(blend[1], (1, QRes::Raw(0)));
         assert_eq!(blend[3], (3, QRes::Of(OfRes::Input(1, 0))));
@@ -684,7 +703,7 @@ mod tests {
         fill_constants(&s[0], 8, &ring, 1, &mut b);
         let slot = ring.offset(1, 0) as usize;
         assert!(a[..slot].iter().all(|x| *x == 0), "other slots untouched");
-        for i in 0..RING_BLOCKS {
+        for i in (0..s[0].len()).chain([SPD_BLOCK]) {
             let o = ring.offset(1, i) as usize;
             for k in 0..BLOCK_SIZE as usize {
                 if i != SPD_BLOCK && (16..20).contains(&k) {
