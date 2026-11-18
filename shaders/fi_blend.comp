@@ -8,6 +8,7 @@ layout(set = 0, binding = 2, rg16i) uniform readonly iimage2D flow;
 layout(set = 0, binding = 3, r8ui) uniform readonly uimage2D prev_luma;
 layout(set = 0, binding = 4, r8ui) uniform readonly uimage2D cur_luma;
 layout(set = 0, binding = 5, rgba8) uniform writeonly image2D dst;
+layout(set = 0, binding = 6, r32ui) uniform readonly uimage2D scd;
 
 layout(push_constant) uniform Push {
     uint w;
@@ -62,8 +63,9 @@ void main() {
     if (p.x >= int(pc.w) || p.y >= int(pc.h)) {
         return;
     }
-    if (pc.reset != 0u) {
-        imageStore(dst, p, vec4(imageLoad(cur_frame, p).rgb, 0.0));
+    bool cut = (imageLoad(scd, ivec2(1, 0)).r & 1u) != 0u;
+    if (pc.reset != 0u || cut) {
+        imageStore(dst, p, vec4(imageLoad(cur_frame, p).rgb, 1.0));
         return;
     }
     ivec2 own = min(p / BLOCK, ivec2(int(pc.flow_w) - 1, int(pc.flow_h) - 1));
@@ -101,5 +103,5 @@ void main() {
     vec4 a = bilinear(true, pf - h);
     vec4 b = bilinear(false, pf + h);
     vec3 c = best_cost > DISAGREE8 ? b.rgb : (a.rgb + b.rgb) * 0.5;
-    imageStore(dst, p, vec4(c, 0.0));
+    imageStore(dst, p, vec4(c, 1.0));
 }

@@ -1,14 +1,12 @@
-//! Quality-mode interpolation on the GPU: our blend on FSR 3's half-resolution flow, then AMD's
-//! inpainting. Every image, the counters buffer and the schedule are created once; per frame only
-//! the reset words are patched, and the two real frames swap roles by parity instead of copying.
+//! Quality-mode interpolation on the GPU: our blend on FSR 3's half-resolution flow. The output
+//! and the schedule are created once; per frame only the reset word is patched, and the two real
+//! frames swap roles by parity instead of copying.
 
 use crate::fsr3::Fsr3Flow;
-use crate::gpu::{Bind, Gpu, GpuBuffer, StorageImage};
+use crate::gpu::{Bind, Gpu, StorageImage};
 use ash::vk;
 use haqengine_core::fsr3_flow::OfRes;
-use haqengine_core::fsr3_interp::{
-    fi_constants, fi_schedule, fi_sizes, set_fi_frame, FiDispatch, FiParams, FiRes, FiSizes, FI_CONSTANTS_SIZE,
-};
+use haqengine_core::fsr3_interp::{fi_schedule, fi_sizes, set_fi_frame, FiDispatch, FiParams, FiRes, FiSizes};
 use haqengine_core::packed::{self, PackedFormat};
 use haqengine_core::{Image, Rgba8};
 use haqengine_shaders::{BindingKind, FI_PASSES};
@@ -32,9 +30,7 @@ pub struct Fsr3Interp {
     flow: Fsr3Flow,
     images: Vec<(FiRes, StorageImage)>,
     colors: Vec<StorageImage>,
-    counters: Option<GpuBuffer>,
     schedule: Vec<FiDispatch>,
-    constants: [u8; FI_CONSTANTS_SIZE],
     frames: u32,
     pub times: InterpTimes,
 }
@@ -45,7 +41,6 @@ type ImageSpec = (FiRes, vk::Format, (u32, u32), u32, u32);
 fn owned_images(s: &FiSizes) -> Vec<ImageSpec> {
     vec![
         (FiRes::Output, vk::Format::R8G8B8A8_UNORM, s.display, 1, 0),
-        (FiRes::Pyramid, vk::Format::R16G16B16A16_SFLOAT, s.pyramid, s.pyramid_mips, 0),
     ]
 }
 
@@ -61,9 +56,7 @@ impl Fsr3Interp {
             flow,
             images: Vec::new(),
             colors: Vec::new(),
-            counters: None,
             schedule: fi_schedule(&sizes, &params(0)),
-            constants: fi_constants(&sizes, &params(0)),
             frames: 0,
             times: InterpTimes::default(),
         };
@@ -87,7 +80,6 @@ impl Fsr3Interp {
             self.colors.push(img);
             cleared?;
         }
-        self.counters = Some(gpu.create_storage_buffer(8)?);
         Ok(())
     }
 
@@ -102,8 +94,6 @@ impl Fsr3Interp {
             FiRes::PrevColor => Bind::Image(&self.colors[1 - cur]),
             FiRes::Flow => Bind::Image(self.flow.image(OfRes::Output)?),
             FiRes::Scd => Bind::Image(self.flow.image(OfRes::ScdOutput)?),
-            FiRes::Counters => Bind::Buffer(self.counters.as_ref().ok_or("no counters")?),
-            FiRes::PyramidMip(m) => Bind::Mip(self.owned(FiRes::Pyramid)?, m),
             FiRes::PrevLuma => Bind::Image(self.flow.image(OfRes::Input(self.flow.luma_slots().0, 0))?),
             FiRes::CurLuma => Bind::Image(self.flow.image(OfRes::Input(self.flow.luma_slots().1, 0))?),
             other => Bind::Image(self.owned(other)?),
@@ -118,27 +108,19 @@ impl Fsr3Interp {
         }
         self.times = InterpTimes { flow: self.flow.run_frame(gpu, &packed::to_packed(self.format, frame))?, ..InterpTimes::default() };
         gpu.write_rgba8(&self.colors[(self.frames & 1) as usize], frame)?;
-        set_fi_frame(&mut self.constants, &mut self.schedule, self.frames);
+        set_fi_frame(&mut self.schedule, self.frames);
         let mut total = self.times.flow;
         for d in &self.schedule {
             for (res, value) in &d.clears {
-                match res {
-                    FiRes::Counters => {
-                        let c = self.counters.as_ref().ok_or("no counters")?;
-                        gpu.write_buffer(c, &value.to_le_bytes().repeat((c.size / 4) as usize))?;
-                    }
-                    other => gpu.clear_u32(self.owned(*other)?, *value)?,
-                }
+                gpu.clear_u32(self.owned(*res)?, *value)?;
             }
             let binds: Vec<(u32, Bind)> = d.bind.iter().map(|(b, r)| self.bind(*r).map(|x| (*b, x))).collect::<Result<_, _>>()?;
             let pass = FI_PASSES[d.pass];
             let wanted = pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).count();
-            let blocks: Vec<&[u8]> = match (wanted, &d.pyramid_constants) {
-                (0, None) => Vec::new(),
-                (1, None) => vec![&self.constants],
-                (2, Some(p)) => vec![&self.constants, p],
-                _ => return Err(format!("{} takes {wanted} constant blocks; the schedule disagrees", pass.name)),
-            };
+            if wanted != 0 || d.pyramid_constants.is_some() {
+                return Err(format!("{} takes {wanted} constant blocks; the schedule has none", pass.name));
+            }
+            let blocks: Vec<&[u8]> = Vec::new();
             let us = gpu.run_fsr3(pass, &binds, &blocks, &d.push[..pass.push_size as usize], d.groups)?;
             self.times.passes[d.pass] += us;
             total += us;
@@ -169,7 +151,7 @@ impl Fsr3Interp {
     /// Device memory interpolation owns, as the driver sized it: everything but the two real
     /// frames (the layer keeps those already) and the flow, which reports its own.
     pub fn owned_bytes(&self) -> u64 {
-        self.images.iter().map(|(_, i)| i.bytes).sum::<u64>() + self.counters.as_ref().map_or(0, |c| c.size)
+        self.images.iter().map(|(_, i)| i.bytes).sum::<u64>()
     }
 
     pub fn owned_images(&self) -> usize {
@@ -182,9 +164,6 @@ impl Fsr3Interp {
         }
         for img in self.colors {
             gpu.destroy_image(img);
-        }
-        if let Some(c) = self.counters {
-            gpu.destroy_buffer(c);
         }
         self.flow.destroy(gpu);
     }

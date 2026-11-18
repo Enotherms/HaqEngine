@@ -826,8 +826,8 @@ fn unwritten(a: &Image<Rgba8>, b: &Image<Rgba8>) -> usize {
     a.data.iter().zip(&b.data).filter(|(x, y)| x[..3] == ca && y[..3] == cb).count()
 }
 
-/// The blend after AMD's inpainting equals the CPU reference within one 8-bit step, on the
-/// still-square scene and at an odd size.
+/// The blend equals the CPU reference within one 8-bit step, on the still-square scene and at
+/// an odd size.
 fn blend_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
     fsr3_ready(gpu)?;
     let square = checker(96, 96, 6);
@@ -884,7 +884,7 @@ fn interp_memory_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let (owned, count) = (fi.owned_bytes(), fi.owned_images());
     fi.destroy(gpu);
     let texels = haqengine_core::fsr3_interp::fi_memory_bytes(1280, 800);
-    println!("      fsr3 interp owns {owned} bytes in {count} images and 1 buffer ({texels} bytes of texels)");
+    println!("      fsr3 interp owns {owned} bytes in {count} images ({texels} bytes of texels)");
     if owned > 12 << 20 {
         return Err(format!("interpolation owns {owned} bytes, budget 12 MiB"));
     }
@@ -1042,6 +1042,59 @@ fn interp_revealed_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let battery = battery_mid(prev, cur);
     let band = |x: u32, y: u32| (300..500).contains(&y) && prev.get(x, y) != cur.get(x, y);
     compare_to_battery("revealed band", mean_err(&out, &truth, band), mean_err(&battery, &truth, band), 255.0, 0.0)?;
+    Ok(fsr3_result(us))
+}
+
+/// A hard cut between two dark scenes: the generated frame must be the new frame itself, never a
+/// double exposure of both scenes.
+fn interp_cut_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let dim = |img: Image<Rgba8>| Image { width: img.width, height: img.height, data: img.data.iter().map(|p| [p[0] / 8, p[1] / 8, p[2] / 8, 255]).collect() };
+    let mut frames: Vec<Image<Rgba8>> = pan_frames(1280, 800, 12, -8, QUALITY_STEPS, 161).into_iter().map(dim).collect();
+    frames.push(dim(gradient(1280, 800)));
+    let (out, us, _) = fsr3_mid(gpu, &frames)?;
+    let cur = frames.last().ok_or("no frames")?;
+    let differs = out.data.iter().zip(&cur.data).filter(|(o, c)| o[..3] != c[..3]).count();
+    println!("      scene cut: {differs} pixels differ from the new frame");
+    if differs > 0 {
+        return Err(format!("scene cut: {differs} pixels are not the new frame"));
+    }
+    Ok(fsr3_result(us))
+}
+
+/// A black-and-white checker square moving 16 px per frame over flat grey 200. Every true colour
+/// is 0, 200 or 255 on all channels, so a pixel far from all three is a blend of two things: a
+/// ghost. At most 0.1% of the pixels the square covers or reveals may be one.
+fn interp_ghost_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let bg = Image::new(1280, 800, [200u8, 200, 200, 255]);
+    let square = checker(200, 200, 10);
+    let frames: Vec<Image<Rgba8>> = (0..=QUALITY_STEPS)
+        .map(|k| {
+            let mut f = bg.clone();
+            paste(&mut f, &square, (200 + 16 * k, 300));
+            f
+        })
+        .collect();
+    let (out, us, _) = fsr3_mid(gpu, &frames)?;
+    let n = frames.len();
+    let (prev, cur) = (&frames[n - 2], &frames[n - 1]);
+    let (mut ghosts, mut total) = (0usize, 0usize);
+    for y in 300..500 {
+        for x in 0..1280 {
+            if prev.get(x, y) == cur.get(x, y) {
+                continue;
+            }
+            total += 1;
+            let o = out.get(x, y);
+            let near = |v: u8| (0..3).all(|i| o[i].abs_diff(v) <= 8);
+            ghosts += (!near(0) && !near(200) && !near(255)) as usize;
+        }
+    }
+    println!("      ghosts: {ghosts}/{total} changed pixels are a blend");
+    if total == 0 || ghosts * 1000 > total {
+        return Err(format!("ghosts: {ghosts}/{total}, at most 0.1%"));
+    }
     Ok(fsr3_result(us))
 }
 
@@ -1228,6 +1281,8 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("fsr3 interp revealed area", interp_revealed_case),
         case("fsr3 interp flat black", interp_black_case),
         case("fsr3 interp pipeline total", interp_pipeline_case),
+        case("fsr3 interp scene cut takes current frame", interp_cut_case),
+        case("fsr3 interp no ghosts behind a moving object", interp_ghost_case),
     ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
@@ -1306,6 +1361,8 @@ mod tests {
             "fsr3 interp revealed area",
             "fsr3 interp flat black",
             "fsr3 interp pipeline total",
+            "fsr3 interp scene cut takes current frame",
+            "fsr3 interp no ghosts behind a moving object",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

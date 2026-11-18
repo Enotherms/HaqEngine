@@ -272,12 +272,12 @@ pub const FI_INPAINTING: Fsr3Pass = Fsr3Pass {
 
 /// HaqEngine's blend on FSR 3's flow (SPIR-V 1.0), replacing AMD's interpolation pass:
 /// 0/1 = previous/current frame (`rgba8`), 2 = flow (`rg16i`), 3/4 = previous/current 8-bit luma,
-/// 5 = output (`rgba8`); push `{ w, h, flow_w, flow_h, reset }`.
+/// 5 = output (`rgba8`), 6 = FSR 3 scene-change words (`r32ui`); push `{ w, h, flow_w, flow_h, reset }`.
 pub const FI_BLEND: Fsr3Pass = Fsr3Pass {
     name: "fi_blend",
     spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_blend.spv")),
     local_size: [8, 8, 1],
-    bindings: &[(0, Uav), (1, Uav), (2, Uav), (3, Uav), (4, Uav), (5, Uav)],
+    bindings: &[(0, Uav), (1, Uav), (2, Uav), (3, Uav), (4, Uav), (5, Uav), (6, Uav)],
     push_size: 20,
 };
 

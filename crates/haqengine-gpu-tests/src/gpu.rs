@@ -40,20 +40,11 @@ pub struct StorageImage {
     pub mip_views: Vec<vk::ImageView>,
 }
 
-/// A host-visible storage buffer.
-pub struct GpuBuffer {
-    pub buffer: vk::Buffer,
-    pub memory: vk::DeviceMemory,
-    pub size: u64,
-}
-
-/// What an FSR 3 binding points at: a whole image, one mip level of it, or a storage buffer.
-/// Sampler bindings are filled with the device's linear-clamp sampler.
+/// What an FSR 3 binding points at: an image. Sampler bindings are filled with the device's
+/// linear-clamp sampler.
 #[derive(Clone, Copy)]
 pub enum Bind<'a> {
     Image(&'a StorageImage),
-    Mip(&'a StorageImage, u32),
-    Buffer(&'a GpuBuffer),
 }
 
 pub struct Gpu {
@@ -538,39 +529,6 @@ impl Gpu {
         unsafe { self.copy_in(img, &bytes) }
     }
 
-    pub fn create_storage_buffer(&self, size: u64) -> Result<GpuBuffer, String> {
-        let (buffer, memory) = unsafe { self.host_buffer(size, vk::BufferUsageFlags::STORAGE_BUFFER)? };
-        let buf = GpuBuffer { buffer, memory, size };
-        if let Err(e) = self.write_buffer(&buf, &vec![0u8; size as usize]) {
-            self.destroy_buffer(buf);
-            return Err(e);
-        }
-        Ok(buf)
-    }
-
-    pub fn write_buffer(&self, buf: &GpuBuffer, bytes: &[u8]) -> Result<(), String> {
-        unsafe {
-            let len = bytes.len().min(buf.size as usize);
-            let ptr = self
-                .device
-                .map_memory(buf.memory, 0, buf.size, vk::MemoryMapFlags::empty())
-                .map_err(|e| err("mapping memory", e))?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
-            self.device.unmap_memory(buf.memory);
-        }
-        Ok(())
-    }
-
-    pub fn destroy_buffer(&self, buf: GpuBuffer) {
-        if self.is_lost() {
-            return;
-        }
-        unsafe {
-            self.device.destroy_buffer(buf.buffer, None);
-            self.device.free_memory(buf.memory, None);
-        }
-    }
-
     pub fn write_u32(&self, img: &StorageImage, src: &Image<u32>) -> Result<(), String> {
         let bytes: Vec<u8> = src.data.iter().flat_map(|v| v.to_le_bytes()).collect();
         unsafe { self.copy_in(img, &bytes) }
@@ -782,13 +740,11 @@ impl Gpu {
         }
         for (b, kind) in pass.bindings {
             let bound = binds.iter().find(|(n, _)| n == b).map(|(_, x)| *x);
-            let fits = match (kind, bound) {
-                (BindingKind::UniformBuffer | BindingKind::Sampler, None) => true,
-                (BindingKind::StorageBuffer, Some(Bind::Buffer(_))) => true,
-                (BindingKind::StorageImage | BindingKind::SampledImage, Some(Bind::Image(_))) => true,
-                (BindingKind::StorageImage, Some(Bind::Mip(img, m))) => (m as usize) < img.mip_views.len(),
-                _ => false,
-            };
+            let fits = matches!(
+                (kind, bound),
+                (BindingKind::UniformBuffer | BindingKind::Sampler, None)
+                    | (BindingKind::StorageImage | BindingKind::SampledImage, Some(Bind::Image(_)))
+            );
             if !fits {
                 return Err(format!("{} binding {b} ({kind:?}) is not bound to a matching resource", pass.name));
             }
@@ -886,17 +842,9 @@ impl Gpu {
                 let view = match (k, bound) {
                     (BindingKind::Sampler, _) => return Some((*b, kind_of(*k), [vk::DescriptorImageInfo::default().sampler(self.sampler)])),
                     (_, Some(Bind::Image(img))) => img.view,
-                    (_, Some(Bind::Mip(img, m))) => img.mip_views[m as usize],
                     _ => return None,
                 };
                 Some((*b, kind_of(*k), [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL)]))
-            })
-            .collect();
-        let storage_infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = binds
-            .iter()
-            .filter_map(|(b, x)| match x {
-                Bind::Buffer(buf) => Some((*b, [vk::DescriptorBufferInfo::default().buffer(buf.buffer).range(buf.size)])),
-                _ => None,
             })
             .collect();
         let buffer_infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = cb_bindings
@@ -914,13 +862,6 @@ impl Gpu {
                 .dst_set(set)
                 .dst_binding(*b)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(info)
-        }));
-        writes.extend(storage_infos.iter().map(|(b, info)| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(*b)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(info)
         }));
         d.update_descriptor_sets(&writes, &[]);

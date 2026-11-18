@@ -149,72 +149,52 @@ pub fn fi_constants(sizes: &FiSizes, p: &FiParams) -> [u8; FI_CONSTANTS_SIZE] {
     c
 }
 
-/// Patches the per-frame words: `reset` in the constants and in the blend's push constants.
-pub fn set_fi_frame(constants: &mut [u8; FI_CONSTANTS_SIZE], schedule: &mut [FiDispatch], frame_since_reset: u32) {
+/// Patches the blend's per-frame `reset` push word, so the schedule is built once.
+pub fn set_fi_frame(schedule: &mut [FiDispatch], frame_since_reset: u32) {
     let reset = (frame_since_reset == 0) as u32;
-    put(constants, 44, reset);
     for d in schedule.iter_mut().filter(|d| d.pass == PASS_FI_BLEND) {
         put(&mut d.push, 16, reset);
     }
-}
-
-fn spd(width: u32, height: u32) -> ([u8; 16], [u32; 3]) {
-    let groups = [(width - 1) / 64 + 1, (height - 1) / 64 + 1, 1];
-    let mips = width.max(height).ilog2().min(12);
-    let mut out = [0u8; 16];
-    put(&mut out, 0, mips);
-    put(&mut out, 4, groups[0] * groups[1]);
-    (out, groups)
 }
 
 fn groups8((w, h): (u32, u32)) -> [u32; 3] {
     [w.div_ceil(8), h.div_ceil(8), 1]
 }
 
-/// One interpolated frame: our blend on FSR 3's flow, then AMD's inpainting pyramid and
-/// inpainting, which fill holes and fall back to the current frame on a scene cut.
+/// One interpolated frame: our blend on FSR 3's flow. On a reset or a scene cut (FSR 3's
+/// scene-change history bit for this frame) it outputs the current frame. AMD's inpainting passes
+/// are not used: they only act on pixels AMD's own interpolation marks, which ours never does.
 pub fn fi_schedule(sizes: &FiSizes, p: &FiParams) -> Vec<FiDispatch> {
     use FiRes::*;
-    let d = |pass, groups, bind: Vec<(u32, FiRes)>| FiDispatch {
-        pass,
-        groups,
-        bind,
+    let mut blend = FiDispatch {
+        pass: PASS_FI_BLEND,
+        groups: groups8(sizes.display),
+        bind: vec![(0, PrevColor), (1, CurColor), (2, Flow), (3, PrevLuma), (4, CurLuma), (5, Output), (6, Scd)],
         pyramid_constants: None,
         clears: Vec::new(),
         push: [0; 20],
     };
-    let display = groups8(sizes.display);
-    let mut blend = d(
-        PASS_FI_BLEND,
-        display,
-        vec![(0, PrevColor), (1, CurColor), (2, Flow), (3, PrevLuma), (4, CurLuma), (5, Output)],
-    );
-    blend.clears.push((Counters, 0));
     let words = [sizes.display.0, sizes.display.1, sizes.flow.0, sizes.flow.1, (p.frame_since_reset == 0) as u32];
     for (i, w) in words.iter().enumerate() {
         put(&mut blend.push, i * 4, *w);
     }
-    let (oc, og) = spd(sizes.display.0, sizes.display.1);
-    let mut pyramid = d(PASS_FI_INPAINTING_PYRAMID, og, vec![(0, Output), (1, Counters)]);
-    pyramid.bind.extend((0..FI_PYRAMID_BINDINGS).map(|i| (2 + i, PyramidMip(i.min(sizes.pyramid_mips - 1)))));
-    pyramid.pyramid_constants = Some(oc);
-    vec![blend, pyramid, d(PASS_FI_INPAINTING, display, vec![(0, Scd), (1, Pyramid), (2, CurColor), (3, CurColor), (7, Output)])]
+    vec![blend]
 }
 
 /// CPU reference of `fi_blend.comp`: per pixel, the candidates are zero, then the FSR 3 vectors of
 /// the pixel's own 16×16 block and its edge neighbours; the one whose two 3×3 windows of FSR 3's
 /// 8-bit luma agree best wins (zero on ties, which keeps a still HUD still), and a winner that
-/// still disagrees takes the current frame.
+/// still disagrees takes the current frame. `copy_current` is a reset or a scene cut.
 pub fn fi_blend_reference(
     prev: &Image<Rgba8>,
     cur: &Image<Rgba8>,
     flow_raw: &Image<[i16; 2]>,
     prev_luma: &Image<u8>,
     cur_luma: &Image<u8>,
-    reset: bool,
+    copy_current: bool,
 ) -> Image<Rgba8> {
     let mut out = cur.clone();
-    if reset {
+    if copy_current {
         return out;
     }
     let luma_at = |img: &Image<u8>, x: i64, y: i64| {
@@ -257,7 +237,7 @@ pub fn fi_blend_reference(
             let v = best.1;
             let a = crate::flow::bilinear(prev, px - v[0] * 0.5, py - v[1] * 0.5);
             let b = crate::flow::bilinear(cur, px + v[0] * 0.5, py + v[1] * 0.5);
-            let mut c = [0u8; 4];
+            let mut c = [0u8, 0, 0, 255];
             for i in 0..3 {
                 let value = if best.0 > DISAGREE8 { b[i] } else { (a[i] + b[i]) * 0.5 };
                 c[i] = (value + 0.5).floor().clamp(0.0, 255.0) as u8;
@@ -268,16 +248,10 @@ pub fn fi_blend_reference(
     out
 }
 
-/// Texel bytes of the images interpolation owns (the output, the inpainting pyramid and the
-/// counters); the frames, the flow, its luma and its scene-change words belong to others.
+/// Texel bytes of the image interpolation owns, its output; the frames, the flow, its luma and its
+/// scene-change words belong to others.
 pub fn fi_memory_bytes(display_w: u32, display_h: u32) -> u64 {
-    let s = fi_sizes(display_w, display_h);
-    let area = |(w, h): (u32, u32)| w as u64 * h as u64;
-    let mut pyramid = 0u64;
-    for m in 0..s.pyramid_mips {
-        pyramid += area(((s.pyramid.0 >> m).max(1), (s.pyramid.1 >> m).max(1))) * 8;
-    }
-    pyramid + area(s.display) * 4 + 8
+    display_w as u64 * display_h as u64 * 4
 }
 
 #[cfg(test)]
@@ -401,66 +375,43 @@ mod tests {
     }
 
     #[test]
-    fn fi_schedule_order() {
+    fn fi_schedule_is_one_blend() {
         let s = fi_sizes(1280, 800);
-        let passes = |f| fi_schedule(&s, &FiParams { frame_since_reset: f, delta_time_ms: 33.3 }).iter().map(|d| d.pass).collect::<Vec<_>>();
-        let order = [PASS_FI_BLEND, PASS_FI_INPAINTING_PYRAMID, PASS_FI_INPAINTING];
-        assert_eq!(passes(0), order);
-        assert_eq!(passes(1), order);
+        for f in [0, 1, 9] {
+            let d = fi_schedule(&s, &FiParams { frame_since_reset: f, delta_time_ms: 33.3 });
+            assert_eq!(d.iter().map(|x| x.pass).collect::<Vec<_>>(), [PASS_FI_BLEND]);
+        }
     }
 
     #[test]
-    fn fi_dispatch_sizes_1280x800() {
+    fn fi_blend_dispatch_1280x800() {
         let s = fi_sizes(1280, 800);
-        let d = fi_schedule(&s, &P1);
-        let by = |pass| d.iter().find(|x| x.pass == pass).unwrap();
-        let blend = by(PASS_FI_BLEND);
-        assert_eq!(blend.groups, [160, 100, 1]);
-        assert_eq!(blend.clears, vec![(FiRes::Counters, 0)]);
-        let push: Vec<u32> = blend.push.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let d = &fi_schedule(&s, &P1)[0];
+        assert_eq!(d.groups, [160, 100, 1]);
+        assert!(d.clears.is_empty());
+        let push: Vec<u32> = d.push.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         assert_eq!(push, [1280, 800, 80, 50, 0]);
-        assert_eq!(by(PASS_FI_INPAINTING).groups, [160, 100, 1]);
-        let out = by(PASS_FI_INPAINTING_PYRAMID);
-        assert_eq!(out.groups, [20, 13, 1]);
-        let op = out.pyramid_constants.unwrap();
-        assert_eq!([word(&op, 0), word(&op, 4)], [10, 260]);
-    }
-
-    #[test]
-    fn fi_bindings_follow_amd() {
-        let s = fi_sizes(1280, 800);
-        let d = fi_schedule(&s, &P1);
-        let by = |pass| d.iter().find(|x| x.pass == pass).unwrap();
         assert_eq!(
-            by(PASS_FI_BLEND).bind,
+            d.bind,
             vec![
                 (0, FiRes::PrevColor),
                 (1, FiRes::CurColor),
                 (2, FiRes::Flow),
                 (3, FiRes::PrevLuma),
                 (4, FiRes::CurLuma),
-                (5, FiRes::Output)
+                (5, FiRes::Output),
+                (6, FiRes::Scd)
             ]
         );
-        let pyramid = &by(PASS_FI_INPAINTING_PYRAMID).bind;
-        assert_eq!(pyramid[0], (0, FiRes::Output));
-        assert_eq!(pyramid[2], (2, FiRes::PyramidMip(0)));
-        assert_eq!(pyramid.last(), Some(&(14, FiRes::PyramidMip(9))));
-        assert_eq!(pyramid.len(), 2 + FI_PYRAMID_BINDINGS as usize);
-        assert_eq!(by(PASS_FI_INPAINTING).bind, vec![(0, FiRes::Scd), (1, FiRes::Pyramid), (2, FiRes::CurColor), (3, FiRes::CurColor), (7, FiRes::Output)]);
     }
 
     #[test]
     fn fi_schedule_reuse() {
         let s = fi_sizes(1280, 800);
-        let reset = fi_schedule(&s, &FiParams { frame_since_reset: 0, delta_time_ms: 33.3 });
-        let five = fi_schedule(&s, &FiParams { frame_since_reset: 5, delta_time_ms: 33.3 });
+        let mut five = fi_schedule(&s, &FiParams { frame_since_reset: 5, delta_time_ms: 33.3 });
         assert_eq!(five, fi_schedule(&s, &FiParams { frame_since_reset: 7, delta_time_ms: 33.3 }));
-        let mut c = fi_constants(&s, &FiParams { frame_since_reset: 5, delta_time_ms: 33.3 });
-        let mut patched = five.clone();
-        set_fi_frame(&mut c, &mut patched, 0);
-        assert_eq!(patched, reset);
-        assert_eq!(c, fi_constants(&s, &FiParams { frame_since_reset: 0, delta_time_ms: 33.3 }));
+        set_fi_frame(&mut five, 0);
+        assert_eq!(five, fi_schedule(&s, &FiParams { frame_since_reset: 0, delta_time_ms: 33.3 }));
     }
 
     #[test]
