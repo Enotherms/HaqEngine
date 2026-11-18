@@ -43,6 +43,10 @@ impl SwapchainRegistry {
     pub fn destroyed(&self, handle: u64) -> Option<Arc<SwapchainInfo>> {
         self.map.remove(handle as usize)
     }
+    /// A live swapchain's record.
+    pub fn get(&self, handle: u64) -> Option<Arc<SwapchainInfo>> {
+        self.map.get(handle as usize)
+    }
     /// The device that created a live swapchain.
     pub fn device_of(&self, handle: u64) -> Option<Arc<DeviceData>> {
         self.map.get(handle as usize).and_then(|info| info.device.clone())
@@ -145,11 +149,20 @@ unsafe fn destroy_swapchain_inner(
             if let (Some(gen), Some(dev)) = (info.gen.as_ref(), info.device.as_ref()) {
                 gen.destroy(dev);
             }
-            LOG.log(&format!(
-                "swapchain {} destroyed after {} presents",
-                info.id,
-                info.presents.load(Ordering::Relaxed)
-            ));
+            match info.gen.as_ref() {
+                Some(gen) => {
+                    let (real, generated, skipped) = gen.counts();
+                    LOG.log(&format!(
+                        "swapchain {} destroyed after {real} real + {generated} generated presents, {skipped} skipped",
+                        info.id
+                    ));
+                }
+                None => LOG.log(&format!(
+                    "swapchain {} destroyed after {} presents",
+                    info.id,
+                    info.presents.load(Ordering::Relaxed)
+                )),
+            }
         }
     });
     if let Some(data) = DEVICES.get(dispatch_key(device)) {
@@ -158,6 +171,7 @@ unsafe fn destroy_swapchain_inner(
 }
 
 unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::PresentInfoKHR) -> vk::Result {
+    let start = std::time::Instant::now();
     guard("present counting", (), || unsafe {
         let pi = &*present_info;
         if !pi.p_swapchains.is_null() {
@@ -174,7 +188,17 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
         SWAPCHAINS.device_of((*pi.p_swapchains).as_raw())
     });
     match device {
-        Some(data) => (data.swapchain.queue_present_khr)(queue, present_info),
+        Some(data) => {
+            let pi = &*present_info;
+            if crate::framegen::present_shape_ok(pi) {
+                if let Some(info) = SWAPCHAINS.get((*pi.p_swapchains).as_raw()) {
+                    if let Some(gen) = info.gen.as_ref().filter(|g| !g.disabled.load(Ordering::Relaxed)) {
+                        return gen.present(info.id, &data, queue, pi, start);
+                    }
+                }
+            }
+            (data.swapchain.queue_present_khr)(queue, present_info)
+        }
         None => {
             NO_DEVICE_REPORTED.call_once(|| LOG.log("error: present on an unknown device"));
             vk::Result::ERROR_DEVICE_LOST
