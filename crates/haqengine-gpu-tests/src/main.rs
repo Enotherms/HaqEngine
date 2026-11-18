@@ -45,7 +45,10 @@ fn main() {
         }
     };
     println!("device: {}", gpu.device_name);
-    println!("subgroup size {} (arithmetic in compute: {})", gpu.subgroup_size, gpu.subgroup_ok);
+    println!(
+        "subgroup size {} (basic, arithmetic, quad in compute: {}), extended storage formats {}, robust image access {}",
+        gpu.subgroup_size, gpu.subgroup_ok, gpu.extended_formats, gpu.robust_images
+    );
     let mut outcomes = Vec::new();
     for case in cases::all_cases(args.self_test_fail) {
         if args.filter.as_deref().is_some_and(|f| !case.name.contains(f)) {

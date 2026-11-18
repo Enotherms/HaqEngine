@@ -53,6 +53,8 @@ pub struct Gpu {
     pub device_name: String,
     pub subgroup_size: u32,
     pub subgroup_ok: bool,
+    pub extended_formats: bool,
+    pub robust_images: bool,
 }
 
 /// Index of the device to test on: a discrete or integrated GPU first, never a CPU renderer
@@ -140,22 +142,33 @@ impl Gpu {
             let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
             instance.get_physical_device_properties2(physical, &mut props2);
-            let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC;
+            let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::QUAD;
             let subgroup_ok = subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
                 && subgroup.supported_operations.contains(needed);
             let subgroup_size = subgroup.subgroup_size;
             let supported = instance.get_physical_device_features(physical);
+            let extended_formats = supported.shader_storage_image_extended_formats == vk::TRUE;
+            let has_robustness = instance
+                .enumerate_device_extension_properties(physical)
+                .map(|exts| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::ext::image_robustness::NAME)))
+                .unwrap_or(false);
+            let mut robust_query = vk::PhysicalDeviceImageRobustnessFeatures::default();
+            if has_robustness {
+                let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut robust_query);
+                instance.get_physical_device_features2(physical, &mut features2);
+            }
+            let robust_images = has_robustness && robust_query.robust_image_access == vk::TRUE;
+            let mut robust_enable = vk::PhysicalDeviceImageRobustnessFeatures::default().robust_image_access(true);
+            let device_extensions = [ash::ext::image_robustness::NAME.as_ptr()];
             let features = vk::PhysicalDeviceFeatures::default()
                 .shader_storage_image_extended_formats(supported.shader_storage_image_extended_formats == vk::TRUE);
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
-            let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_features(&features),
-                    None,
-                )
-                .map_err(|e| err("creating the device", e))?;
+            let mut device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_features(&features);
+            if robust_images {
+                device_info = device_info.enabled_extension_names(&device_extensions).push_next(&mut robust_enable);
+            }
+            let device = instance.create_device(physical, &device_info, None).map_err(|e| err("creating the device", e))?;
             let queue = device.get_device_queue(family, 0);
             let pool = device
                 .create_command_pool(
@@ -187,6 +200,8 @@ impl Gpu {
                 device_name: props.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                 subgroup_size,
                 subgroup_ok,
+                extended_formats,
+                robust_images,
             })
         }
     }

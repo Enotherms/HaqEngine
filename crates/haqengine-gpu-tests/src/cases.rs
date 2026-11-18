@@ -621,12 +621,46 @@ fn seen_before(bx: u32, by: u32, width: u32, height: u32, dx: i32, dy: i32) -> b
     x0 >= 0 && y0 >= 0 && x0 + b <= width as i32 && y0 + b <= height as i32
 }
 
-fn fsr3_ready(gpu: &Gpu) -> Result<(), String> {
-    if gpu.subgroup_ok {
-        Ok(())
-    } else {
-        Err("the device lacks subgroup arithmetic in compute".into())
+/// Blocks in the outer two rows and columns, which the interior checks skip, must reach 90%.
+fn require_border(flow: &Flow, want: [f32; 2], keep: impl Fn(u32, u32) -> bool) -> Result<(), String> {
+    let (mut hits, mut total) = (0, 0);
+    for by in 0..flow.height {
+        for bx in 0..flow.width {
+            let border = bx < 2 || by < 2 || bx + 2 >= flow.width || by + 2 >= flow.height;
+            if border && keep(bx, by) {
+                total += 1;
+                hits += near(flow.get(bx, by), want) as u32;
+            }
+        }
     }
+    if total == 0 || hits * 100 < total * 90 {
+        return Err(format!("border: {hits}/{total} blocks within 1 px of {want:?}, need 90%"));
+    }
+    println!("      border blocks {hits}/{total} within 1 px");
+    Ok(())
+}
+
+fn fsr3_ready(gpu: &Gpu) -> Result<(), String> {
+    fsr3_requirements(gpu.subgroup_ok, gpu.subgroup_size, gpu.extended_formats, gpu.robust_images)
+}
+
+/// What FSR 3's passes need from the device: subgroup basic, arithmetic and quad operations in
+/// compute at size 32 or 64 (the search's reduction assumes one of those), `r8ui`/`rg16i` storage
+/// images, and robust image access because AMD's passes read and write past image edges.
+fn fsr3_requirements(subgroup_ok: bool, subgroup_size: u32, extended_formats: bool, robust_images: bool) -> Result<(), String> {
+    if !subgroup_ok {
+        return Err("the device lacks subgroup basic, arithmetic or quad operations in compute".into());
+    }
+    if subgroup_size != 32 && subgroup_size != 64 {
+        return Err(format!("subgroup size {subgroup_size} is not 32 or 64"));
+    }
+    if !extended_formats {
+        return Err("the device lacks shaderStorageImageExtendedFormats".into());
+    }
+    if !robust_images {
+        return Err("robust image access is not enabled".into());
+    }
+    Ok(())
 }
 
 fn fsr3_result(gpu_us: f64) -> CaseResult {
@@ -637,6 +671,7 @@ fn fsr3_shift_case(gpu: &Gpu, width: u32, height: u32, dx: i32, dy: i32, frames:
     fsr3_ready(gpu)?;
     let (flow, _, us, _) = fsr3_run(gpu, &pan_frames(width, height, dx, dy, frames, 61))?;
     require_fsr3(&flow, [dx as f32, dy as f32], "pan", |bx, by| seen_before(bx, by, width, height, dx, dy))?;
+    require_border(&flow, [dx as f32, dy as f32], |bx, by| seen_before(bx, by, width, height, dx, dy))?;
     Ok(fsr3_result(us))
 }
 
@@ -872,6 +907,16 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fsr3_requirements_reject_unsafe_devices() {
+        assert!(fsr3_requirements(true, 64, true, true).is_ok());
+        assert!(fsr3_requirements(true, 32, true, true).is_ok());
+        assert!(fsr3_requirements(false, 64, true, true).is_err());
+        assert!(fsr3_requirements(true, 16, true, true).is_err());
+        assert!(fsr3_requirements(true, 64, false, true).is_err());
+        assert!(fsr3_requirements(true, 64, true, false).is_err());
+    }
 
     #[test]
     fn cases_are_named_and_unique() {
