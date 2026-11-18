@@ -7,6 +7,7 @@ pub mod handle_map;
 pub mod image;
 pub mod log;
 pub mod packed;
+pub mod quality;
 pub mod reference;
 pub mod settings;
 pub mod stats;

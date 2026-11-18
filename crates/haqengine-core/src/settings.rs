@@ -9,6 +9,8 @@ pub enum Mode {
     Battery,
     /// The real frame shown twice (M1).
     Copy,
+    /// FSR 3 optical flow at half resolution with HaqEngine's per-pixel blend (M4).
+    Quality,
 }
 
 /// Settings HaqEngine reads once when it loads.
@@ -45,6 +47,7 @@ impl Settings {
         let (mode, mode_note) = match get("HAQENGINE_MODE").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") | Some("battery") => (Mode::Battery, None),
             Some("copy") => (Mode::Copy, None),
+            Some("quality") => (Mode::Quality, None),
             Some(other) => (Mode::Battery, Some(format!("unknown HAQENGINE_MODE {other:?}; using battery"))),
         };
         Settings { log_path, multiplier, multiplier_note, mode, mode_note }
@@ -136,6 +139,13 @@ mod tests {
         assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "copy")])).mode, Mode::Copy);
         assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "COPY")])).mode, Mode::Copy);
         assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "Battery")])).mode, Mode::Battery);
+    }
+
+    #[test]
+    fn mode_parses_quality() {
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "quality")])).mode, Mode::Quality);
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MODE", " Quality ")])).mode, Mode::Quality);
+        assert!(Settings::from_lookup(env(&[("HAQENGINE_MODE", "quality")])).mode_note.is_none());
     }
 
     #[test]

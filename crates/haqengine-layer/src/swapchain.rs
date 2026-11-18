@@ -203,8 +203,8 @@ unsafe fn create_swapchain_inner(
             let generate = plan.is_some_and(|p| p.generate) && r == vk::Result::SUCCESS && !images.is_empty();
             let (battery_format, engine) = match (crate::state::SETTINGS.mode, packed_format(ci.image_format)) {
                 (Mode::Copy, _) => (None, " copy (mode copy)".to_string()),
-                (Mode::Battery, Some(f)) => (Some(f), " battery".to_string()),
-                (Mode::Battery, None) => (None, format!(" copy (format {:?} not supported)", ci.image_format)),
+                (Mode::Battery | Mode::Quality, Some(f)) => (Some(f), " battery".to_string()),
+                (Mode::Battery | Mode::Quality, None) => (None, format!(" copy (format {:?} not supported)", ci.image_format)),
             };
             let engine = if generate { engine } else { String::new() };
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
