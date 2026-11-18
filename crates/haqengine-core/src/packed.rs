@@ -1,6 +1,6 @@
 //! Pixels stored as one 32-bit word, as in swapchain images, and the battery passes on them.
 
-use crate::flow::{Flow, BLOCK};
+use crate::flow::Flow;
 use crate::image::{Image, Rgba8};
 use crate::reference::{CompareReport, LUMA};
 
@@ -98,19 +98,19 @@ pub fn warp_blend_packed(f: PackedFormat, prev: &Image<u32>, cur: &Image<u32>, f
     if t == 1.0 {
         return cur.clone();
     }
-    let full_block = BLOCK * 2;
     let mut out = prev.clone();
     for y in 0..prev.height {
         for x in 0..prev.width {
-            let v = flow.get((x / full_block).min(flow.width - 1), (y / full_block).min(flow.height - 1));
-            let (fx, fy) = (v[0] * 2.0, v[1] * 2.0);
-            let a = bilinear_packed(f, prev, x as f32 - t * fx, y as f32 - t * fy);
-            let b = bilinear_packed(f, cur, x as f32 + (1.0 - t) * fx, y as f32 + (1.0 - t) * fy);
-            let mut px = [0.0f32; 4];
-            for c in 0..4 {
-                px[c] = a[c] * (1.0 - t) + b[c] * t;
-            }
-            out.set(x, y, pack(f, px));
+            let (cands, n) = crate::flow::candidate_vectors(flow, x, y);
+            let c = crate::flow::interpolate_pixel(
+                |sx, sy| bilinear_packed(f, prev, sx, sy),
+                |sx, sy| bilinear_packed(f, cur, sx, sy),
+                1.0,
+                (x as f32, y as f32),
+                t,
+                &cands[..n],
+            );
+            out.set(x, y, pack(f, c));
         }
     }
     out

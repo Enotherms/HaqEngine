@@ -2,7 +2,7 @@
 //! warp-and-blend interpolation. These are the references the GPU shaders must match.
 
 use crate::image::{Image, Rgba8};
-use crate::reference::luma_downsample;
+use crate::reference::{luma_downsample, LUMA};
 
 /// Block size in pixels of the level being matched.
 pub const BLOCK: u32 = 8;
@@ -175,6 +175,75 @@ pub fn estimate_flow(prev: &[Image<f32>], cur: &[Image<f32>]) -> Flow {
     flow
 }
 
+/// Motion candidates per output pixel: own block, left, right, up, down.
+pub const CANDIDATES: usize = 5;
+/// Quantised luma difference above which the two samples are treated as different content.
+pub const DISAGREE: i32 = 96;
+
+/// Full-resolution motion candidates for pixel `(x, y)` (own block, then left, right, up, down;
+/// those that exist) and how many there are.
+pub fn candidate_vectors(flow: &Flow, x: u32, y: u32) -> ([[f32; 2]; CANDIDATES], usize) {
+    let full_block = BLOCK * 2;
+    let bx = (x / full_block).min(flow.width - 1) as i32;
+    let by = (y / full_block).min(flow.height - 1) as i32;
+    let mut out = [[0.0f32; 2]; CANDIDATES];
+    let mut n = 0;
+    for (dx, dy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+        let (cx, cy) = (bx + dx, by + dy);
+        if cx >= 0 && cy >= 0 && cx < flow.width as i32 && cy < flow.height as i32 {
+            let v = flow.get(cx as u32, cy as u32);
+            out[n] = [v[0] * 2.0, v[1] * 2.0];
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+/// Index and cost of the candidate whose previous and current samples agree best.
+pub fn pick(
+    prev_luma_at: impl Fn(f32, f32) -> f32,
+    cur_luma_at: impl Fn(f32, f32) -> f32,
+    p: (f32, f32),
+    t: f32,
+    cands: &[[f32; 2]],
+) -> (usize, i32) {
+    let mut best = (0, i32::MAX);
+    for (i, v) in cands.iter().enumerate() {
+        let a = prev_luma_at(p.0 - t * v[0], p.1 - t * v[1]);
+        let b = cur_luma_at(p.0 + (1.0 - t) * v[0], p.1 + (1.0 - t) * v[1]);
+        let cost = (quantize(a) - quantize(b)).abs();
+        if cost < best.1 {
+            best = (i, cost);
+        }
+    }
+    best
+}
+
+/// One output pixel at time `t`: picks the best candidate vector, then blends the two samples, or
+/// takes the nearer frame's sample when they disagree. Samplers return channels in `0..=scale`.
+pub fn interpolate_pixel(
+    sample_prev: impl Fn(f32, f32) -> [f32; 4],
+    sample_cur: impl Fn(f32, f32) -> [f32; 4],
+    scale: f32,
+    p: (f32, f32),
+    t: f32,
+    cands: &[[f32; 2]],
+) -> [f32; 4] {
+    let luma = |c: [f32; 4]| (LUMA[0] * c[0] + LUMA[1] * c[1] + LUMA[2] * c[2]) / scale;
+    let (i, cost) = pick(|x, y| luma(sample_prev(x, y)), |x, y| luma(sample_cur(x, y)), p, t, cands);
+    let v = cands[i];
+    let a = sample_prev(p.0 - t * v[0], p.1 - t * v[1]);
+    let b = sample_cur(p.0 + (1.0 - t) * v[0], p.1 + (1.0 - t) * v[1]);
+    if cost > DISAGREE {
+        return if t >= 0.5 { b } else { a };
+    }
+    let mut out = [0.0f32; 4];
+    for c in 0..4 {
+        out[c] = a[c] * (1.0 - t) + b[c] * t;
+    }
+    out
+}
+
 /// The frame at time `t` between `prev` (t = 0) and `cur` (t = 1), following `flow`.
 pub fn warp_blend(prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow: &Flow, t: f32) -> Image<Rgba8> {
     if t == 0.0 {
@@ -183,19 +252,19 @@ pub fn warp_blend(prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow: &Flow, t: f32) 
     if t == 1.0 {
         return cur.clone();
     }
-    let full_block = BLOCK * 2;
     let mut out = prev.clone();
     for y in 0..prev.height {
         for x in 0..prev.width {
-            let v = flow.get((x / full_block).min(flow.width - 1), (y / full_block).min(flow.height - 1));
-            let (fx, fy) = (v[0] * 2.0, v[1] * 2.0);
-            let a = bilinear(prev, x as f32 - t * fx, y as f32 - t * fy);
-            let b = bilinear(cur, x as f32 + (1.0 - t) * fx, y as f32 + (1.0 - t) * fy);
-            let mut px = [0u8; 4];
-            for c in 0..4 {
-                px[c] = (a[c] * (1.0 - t) + b[c] * t).round().clamp(0.0, 255.0) as u8;
-            }
-            out.set(x, y, px);
+            let (cands, n) = candidate_vectors(flow, x, y);
+            let c = interpolate_pixel(
+                |sx, sy| bilinear(prev, sx, sy),
+                |sx, sy| bilinear(cur, sx, sy),
+                255.0,
+                (x as f32, y as f32),
+                t,
+                &cands[..n],
+            );
+            out.set(x, y, c.map(|v| v.round().clamp(0.0, 255.0) as u8));
         }
     }
     out
@@ -342,6 +411,113 @@ mod tests {
             assert!(v[0].abs() <= 22.0 && v[1].abs() <= 22.0, "{v:?}");
         }
         assert!(flow.data.iter().all(|v| *v == [0.0, 0.0]), "identical frames: zero is the best candidate");
+    }
+
+    fn old_warp(prev: &Image<Rgba8>, cur: &Image<Rgba8>, flow: &Flow, t: f32) -> Image<Rgba8> {
+        let mut out = prev.clone();
+        for y in 0..prev.height {
+            for x in 0..prev.width {
+                let v = flow.get((x / 16).min(flow.width - 1), (y / 16).min(flow.height - 1));
+                let (fx, fy) = (v[0] * 2.0, v[1] * 2.0);
+                let a = bilinear(prev, x as f32 - t * fx, y as f32 - t * fy);
+                let b = bilinear(cur, x as f32 + (1.0 - t) * fx, y as f32 + (1.0 - t) * fy);
+                let mut px = [0u8; 4];
+                for c in 0..4 {
+                    px[c] = (a[c] * (1.0 - t) + b[c] * t).round().clamp(0.0, 255.0) as u8;
+                }
+                out.set(x, y, px);
+            }
+        }
+        out
+    }
+
+    fn paste(dst: &mut Image<Rgba8>, src: &Image<Rgba8>, ox: u32, oy: u32) {
+        for y in 0..src.height {
+            for x in 0..src.width {
+                dst.set(ox + x, oy + y, src.get(x, y));
+            }
+        }
+    }
+
+    fn err(a: Rgba8, b: Rgba8) -> i32 {
+        (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn still_square_over_moving_background() {
+        let bg = noise(256, 160, 1);
+        let square = crate::image::checker(48, 48, 4);
+        let (sx, sy) = (104u32, 56u32);
+        let mut prev = bg.clone();
+        paste(&mut prev, &square, sx, sy);
+        let mut cur = shift(&bg, 16, 0);
+        paste(&mut cur, &square, sx, sy);
+        let mut flow = Image::new(16, 10, [8.0f32, 0.0]);
+        for by in 3..=6 {
+            for bx in 6..=9 {
+                flow.set(bx, by, [0.0, 0.0]);
+            }
+        }
+        let mut expected = shift(&bg, 8, 0);
+        paste(&mut expected, &square, sx, sy);
+        let new = warp_blend(&prev, &cur, &flow, 0.5);
+        let old = old_warp(&prev, &cur, &flow, 0.5);
+        for y in sy + 8..sy + 40 {
+            for x in sx + 8..sx + 40 {
+                assert_eq!(new.get(x, y), square.get(x - sx, y - sy), "square interior ({x},{y})");
+            }
+        }
+        for y in 20..140 {
+            for x in [40u32, 220] {
+                assert!(err(new.get(x, y), expected.get(x, y)) <= 1, "background ({x},{y})");
+            }
+        }
+        let band = |img: &Image<Rgba8>| {
+            let mut bad = 0;
+            for y in sy - 8..sy + 56 {
+                for x in sx - 8..sx + 56 {
+                    let inside = x >= sx && x < sx + 48 && y >= sy && y < sy + 48;
+                    if !inside && err(img.get(x, y), expected.get(x, y)) > 40 {
+                        bad += 1;
+                    }
+                }
+            }
+            bad
+        };
+        let (new_bad, old_bad) = (band(&new), band(&old));
+        assert!(old_bad > 0, "the scene must break the single-vector warp");
+        assert!(new_bad * 2 < old_bad, "edge band: new {new_bad} vs old {old_bad}");
+    }
+
+    #[test]
+    fn uniform_shift_matches_m3a() {
+        let prev = noise(128, 96, 2);
+        let cur = shift(&prev, 8, 0);
+        let flow = Image::new(8, 6, [4.0f32, 0.0]);
+        let (new, old) = (warp_blend(&prev, &cur, &flow, 0.5), old_warp(&prev, &cur, &flow, 0.5));
+        for y in 0..96 {
+            for x in 16..112 {
+                assert_eq!(new.get(x, y), old.get(x, y), "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn revealed_area_uses_one_frame() {
+        let prev = Image::new(64, 48, [0u8, 0, 0, 255]);
+        let cur = Image::new(64, 48, [255u8, 255, 255, 255]);
+        let flow = Image::new(4, 3, [0.0f32, 0.0]);
+        assert_eq!(warp_blend(&prev, &cur, &flow, 0.5), cur);
+        assert_eq!(warp_blend(&prev, &cur, &flow, 0.4), prev);
+    }
+
+    #[test]
+    fn border_pixels_use_existing_candidates() {
+        let flow = Image::new(16, 10, [1.0f32, 0.0]);
+        assert_eq!(candidate_vectors(&flow, 0, 0).1, 3);
+        assert_eq!(candidate_vectors(&flow, 255, 159).1, 3);
+        assert_eq!(candidate_vectors(&flow, 100, 80).1, 5);
+        assert_eq!(candidate_vectors(&flow, 0, 0).0[0], [2.0, 0.0]);
     }
 
     #[test]
