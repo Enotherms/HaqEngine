@@ -754,6 +754,40 @@ fn fsr3_pipeline_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(fsr3_result(us))
 }
 
+/// Odd full-resolution motion is between two half-resolution vectors, so neither engine can hit
+/// it exactly; FSR 3 must do at least as well as Battery on the same frames.
+fn fsr3_odd_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let frames = pan_frames(1280, 800, 7, -3, FSR3_FRAMES, 63);
+    let (flow, _, us, _) = fsr3_run(gpu, &frames)?;
+    let (prev, cur) = (&frames[frames.len() - 2], &frames[frames.len() - 1]);
+    let battery = flow::estimate_flow(&flow::pyramid(prev), &flow::pyramid(cur));
+    let battery_px = Image { width: battery.width, height: battery.height, data: battery.data.iter().map(|v| [v[0] * 2.0, v[1] * 2.0]).collect() };
+    let keep = |bx: u32, by: u32| seen_before(bx, by, 1280, 800, 7, -3);
+    let (fh, ft) = fsr3_hits(&flow, [7.0, -3.0], keep);
+    let (bh, bt) = fsr3_hits(&battery_px, [7.0, -3.0], keep);
+    println!("      odd shift within 1 px: fsr3 {fh}/{ft}, battery {bh}/{bt}; fsr3 most common {}", common(&flow));
+    if fh * bt < bh * ft {
+        return Err(format!("fsr3 {fh}/{ft} is below battery {bh}/{bt}"));
+    }
+    Ok(fsr3_result(us))
+}
+
+/// The flow's own images, measured as the driver allocates them, stay within 1.5 MiB at 1280×800;
+/// the packed frame is borrowed from the layer and not counted.
+fn fsr3_memory_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    fsr3_ready(gpu)?;
+    let flow = crate::fsr3::Fsr3Flow::new(gpu, 1280, 800, FSR3_FORMAT)?;
+    let (owned, count) = (flow.owned_bytes(), flow.owned_images());
+    let texels = haqengine_core::fsr3_flow::of_memory_bytes(640, 400);
+    flow.destroy(gpu);
+    println!("      fsr3 flow owns {owned} bytes in {count} images ({texels} bytes of texels)");
+    if owned > 3 << 19 {
+        return Err(format!("flow owns {owned} bytes, budget 1.5 MiB"));
+    }
+    Ok(fsr3_result(0.0))
+}
+
 fn luma_half_case(gpu: &Gpu, f: PackedFormat, img: &Image<Rgba8>) -> Result<CaseResult, String> {
     let input = packed::to_packed(f, img);
     let expected = haqengine_core::fsr3_flow::luma_half_reference(f, &input);
@@ -895,6 +929,8 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("fsr3 flow second frame parity", |g| fsr3_shift_case(g, 1280, 800, 12, -8, FSR3_FRAMES + 1)),
         case("fsr3 scene cut detection", fsr3_scene_cut_case),
         case("fsr3 flow pipeline 1280x800 total", fsr3_pipeline_case),
+        case("fsr3 flow odd shift(7,-3)", fsr3_odd_case),
+        case("fsr3 flow memory within budget", fsr3_memory_case),
     ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
@@ -961,6 +997,8 @@ mod tests {
             "fsr3 scene cut detection",
             "fsr3 flow pipeline 1280x800 total",
             "of_luma_half matches CPU",
+            "fsr3 flow odd shift(7,-3)",
+            "fsr3 flow memory within budget",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

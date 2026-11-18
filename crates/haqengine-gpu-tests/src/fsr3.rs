@@ -28,6 +28,7 @@ pub struct Fsr3Flow {
     images: Vec<(OfRes, StorageImage)>,
     schedules: [Vec<OfDispatch>; 2],
     frame_index: u32,
+    odd: bool,
     pub times: PassTimes,
 }
 
@@ -56,6 +57,7 @@ impl Fsr3Flow {
             images: Vec::with_capacity(wanted.len()),
             schedules: [of_schedule(hw, hh, 0, input), of_schedule(hw, hh, 1, input)],
             frame_index: 0,
+            odd: false,
             times: PassTimes::default(),
         };
         for (res, format, (w, h)) in wanted {
@@ -88,18 +90,19 @@ impl Fsr3Flow {
         }
         gpu.write_u32(self.image(OfRes::Raw)?, frame)?;
         let mut total = 0.0;
-        for d in &self.schedules[(self.frame_index & 1) as usize] {
+        for d in &self.schedules[self.odd as usize] {
             let images: Vec<(u32, &StorageImage)> =
                 d.bind.iter().map(|(b, r)| self.image(*r).map(|i| (*b, i))).collect::<Result<_, _>>()?;
             let mut constants = d.constants;
             set_frame_index(&mut constants, self.frame_index);
             let pass = OF_PASSES[d.pass];
-            let mut blocks: Vec<&[u8]> = vec![&constants];
-            if let Some(spd) = &d.spd_constants {
-                blocks.push(spd);
-            }
             let wanted = pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).count();
-            blocks.truncate(wanted);
+            let blocks: Vec<&[u8]> = match (wanted, &d.spd_constants) {
+                (0, None) => Vec::new(),
+                (1, None) => vec![&constants],
+                (2, Some(spd)) => vec![&constants, spd],
+                _ => return Err(format!("{} takes {wanted} constant blocks; the schedule disagrees", pass.name)),
+            };
             let us = gpu.run_fsr3(pass, &images, &blocks, &d.push[..pass.push_size as usize], d.groups)?;
             self.times.passes[d.pass] += us;
             if d.pass == PASS_SEARCH {
@@ -109,6 +112,7 @@ impl Fsr3Flow {
             total += us;
         }
         self.frame_index = self.frame_index.saturating_add(1);
+        self.odd = !self.odd;
         Ok(total)
     }
 
@@ -122,6 +126,16 @@ impl Fsr3Flow {
     pub fn read_scd(&self, gpu: &Gpu) -> Result<ScdOutput, String> {
         let img = gpu.read_u32(self.image(OfRes::ScdOutput)?)?;
         Ok([img.data[0], img.data[1], img.data[2]])
+    }
+
+    /// Device memory of the images the flow owns, as the driver sized them. The packed frame is
+    /// excluded: in the layer it is the raw copy the frame generator already keeps.
+    pub fn owned_bytes(&self) -> u64 {
+        self.images.iter().filter(|(r, _)| *r != OfRes::Raw).map(|(_, i)| i.bytes).sum()
+    }
+
+    pub fn owned_images(&self) -> usize {
+        self.images.iter().filter(|(r, _)| *r != OfRes::Raw).count()
     }
 
     pub fn destroy(self, gpu: &Gpu) {

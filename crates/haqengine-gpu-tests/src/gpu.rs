@@ -36,6 +36,7 @@ pub struct StorageImage {
     pub view: vk::ImageView,
     pub width: u32,
     pub height: u32,
+    pub bytes: u64,
 }
 
 pub struct Gpu {
@@ -395,7 +396,7 @@ impl Gpu {
                 }
                 return Err(e);
             }
-            Ok(StorageImage { image, memory, view, width, height })
+            Ok(StorageImage { image, memory, view, width, height, bytes: req.size })
         }
     }
 

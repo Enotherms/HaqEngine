@@ -96,7 +96,9 @@ pub fn half_size(width: u32, height: u32) -> (u32, u32) {
     (width.div_ceil(2), height.div_ceil(2))
 }
 
-/// Bytes of every image the flow owns for an input of `width × height`.
+/// Texel bytes of every image the flow owns for an input of `width × height`. The packed input
+/// frame is borrowed and not counted; drivers round each allocation up, so the real cost is
+/// measured by the harness (`fsr3 flow memory within budget`).
 pub fn of_memory_bytes(width: u32, height: u32) -> u64 {
     let s = of_sizes(width, height);
     let area = |(w, h): (u32, u32)| w as u64 * h as u64;
