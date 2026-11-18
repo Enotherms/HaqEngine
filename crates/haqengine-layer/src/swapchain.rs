@@ -1,6 +1,7 @@
 //! Swapchain and present pass-through. M0 only counts presents and forwards everything unchanged.
 
 use crate::guard::guard;
+use crate::chain::{swapchain_ext_size, ChainCopy, PrefixCopy};
 use crate::framegen::FrameGen;
 use crate::plan::plan_swapchain_with;
 use crate::state::{device_can_transfer, dispatch_key, multiplier, DeviceData, DEVICES, LOG};
@@ -20,6 +21,8 @@ pub struct SwapchainInfo {
     pub device: Option<Arc<DeviceData>>,
     /// Generation resources, when this swapchain generates frames.
     pub gen: Option<crate::framegen::FrameGen>,
+    /// Created with the game's present-mode list rewritten to `[FIFO]`; presents must stay FIFO.
+    pub fifo_only_modes: bool,
 }
 
 /// Live swapchains, keyed by raw handle.
@@ -79,6 +82,9 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, present_info: *con
 }
 static NO_DEVICE_REPORTED: Once = Once::new();
 
+/// FIFO repeated, for rewritten present-mode lists (create: 1 entry; present: one per swapchain).
+pub static FIFO_MODES: [vk::PresentModeKHR; 16] = [vk::PresentModeKHR::FIFO; 16];
+
 /// The present modes listed in a chained `VkSwapchainPresentModesCreateInfoEXT`, if any.
 unsafe fn game_present_modes<'a>(p_next: *const std::ffi::c_void) -> Option<&'a [vk::PresentModeKHR]> {
     let mut cur = p_next as *const vk::BaseInStructure;
@@ -105,6 +111,21 @@ unsafe fn create_swapchain_inner(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let ci = &*create_info;
+    let mut chain = ChainCopy::new();
+    let mut rewritten_head: Option<*const std::ffi::c_void> = None;
+    let mut rewrite_unsupported = false;
+    if multiplier() >= 2 && game_present_modes(ci.p_next).is_some() {
+        match chain.copy_prefix(ci.p_next, vk::StructureType::SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT, swapchain_ext_size) {
+            PrefixCopy::Copied { head, target } => {
+                let list = &mut *(target as *mut vk::SwapchainPresentModesCreateInfoEXT);
+                list.present_mode_count = 1;
+                list.p_present_modes = FIFO_MODES.as_ptr();
+                rewritten_head = Some(head);
+            }
+            PrefixCopy::Unsupported => rewrite_unsupported = true,
+            PrefixCopy::NotFound => {}
+        }
+    }
     let plan = guard("swapchain plan", None, || unsafe {
         let mut caps = vk::SurfaceCapabilitiesKHR::default();
         let r = (data.instance.surface.get_physical_device_surface_capabilities_khr)(
@@ -112,16 +133,21 @@ unsafe fn create_swapchain_inner(
             ci.surface,
             &mut caps,
         );
-        let game_modes = game_present_modes(ci.p_next);
+        let game_modes = if rewritten_head.is_some() { Some(&FIFO_MODES[..1]) } else { game_present_modes(ci.p_next) };
         (r == vk::Result::SUCCESS)
             .then(|| plan_swapchain_with(ci, &caps, multiplier(), device_can_transfer(&data), game_modes))
     });
     let mut planned = *ci;
+    let generating = plan.is_some_and(|p| p.generate);
     if let Some(p) = plan.filter(|p| p.generate) {
         planned.min_image_count = p.min_image_count;
         planned.image_usage = p.image_usage;
         planned.present_mode = p.present_mode;
+        if let Some(head) = rewritten_head {
+            planned.p_next = head;
+        }
     }
+    let fifo_only_modes = generating && rewritten_head.is_some();
     let result = (data.swapchain.create_swapchain_khr)(device, &planned, allocator, out);
     if result == vk::Result::SUCCESS {
         guard("swapchain bookkeeping", (), || unsafe {
@@ -143,7 +169,13 @@ unsafe fn create_swapchain_inner(
                 ci.image_format,
                 ci.image_color_space,
                 planned.present_mode,
-                game_present_modes(ci.p_next).map(|m| format!(" (game modes {m:?})")).unwrap_or_default()
+                game_present_modes(ci.p_next)
+                    .map(|m| match (fifo_only_modes, rewrite_unsupported) {
+                        (true, _) => format!(" (game modes {m:?} -> [FIFO])"),
+                        (false, true) => format!(" (game modes {m:?}; cannot rewrite present modes: unknown struct)"),
+                        (false, false) => format!(" (game modes {m:?})"),
+                    })
+                    .unwrap_or_default()
             ));
             SWAPCHAINS.created(
                 (*out).as_raw(),
@@ -155,6 +187,7 @@ unsafe fn create_swapchain_inner(
                     presents: AtomicU64::new(0),
                     device: Some(Arc::clone(&data)),
                     gen: generate.then(|| FrameGen::new(images, ci.image_extent)),
+                    fifo_only_modes,
                 },
             );
         });
@@ -250,11 +283,29 @@ mod tests {
             presents: AtomicU64::new(0),
             device: None,
             gen: None,
+            fifo_only_modes: false,
         }
     }
 
     static CAPTURED: std::sync::Mutex<Option<(u32, vk::ImageUsageFlags, vk::PresentModeKHR)>> =
         std::sync::Mutex::new(None);
+    /// Serialises tests that set the global multiplier override.
+    static MULTIPLIER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CAPTURED_MODES: std::sync::Mutex<Option<(vk::PresentModeKHR, Vec<vk::PresentModeKHR>)>> =
+        std::sync::Mutex::new(None);
+
+    unsafe extern "system" fn capture_create_modes(
+        _: vk::Device,
+        ci: *const vk::SwapchainCreateInfoKHR,
+        _: *const vk::AllocationCallbacks,
+        out: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        let ci = unsafe { &*ci };
+        let modes = unsafe { game_present_modes(ci.p_next) }.map(|m| m.to_vec()).unwrap_or_default();
+        *CAPTURED_MODES.lock().unwrap() = Some((ci.present_mode, modes));
+        unsafe { *out = vk::SwapchainKHR::from_raw(0x5c_5555) };
+        vk::Result::SUCCESS
+    }
 
     unsafe extern "system" fn capture_create(
         _: vk::Device,
@@ -322,6 +373,7 @@ mod tests {
             crate::state::test_support::gdpa_nothing,
             instance_load,
         );
+        let _lock = MULTIPLIER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::state::set_test_multiplier(2);
         let ci = vk::SwapchainCreateInfoKHR {
             min_image_count: 3,
@@ -381,6 +433,59 @@ mod tests {
         SWAPCHAINS.destroyed(handle);
         assert_eq!(result, vk::Result::SUCCESS);
         assert_eq!(FAKE_PRESENTS.load(Ordering::SeqCst), before + 1);
+    }
+
+    #[test]
+    fn create_swapchain_rewrites_present_modes() {
+        use std::ffi::{c_void, CStr};
+        let load = |name: &CStr| -> *const c_void {
+            match name.to_bytes() {
+                b"vkCreateSwapchainKHR" => capture_create_modes as *const c_void,
+                b"vkGetSwapchainImagesKHR" => two_images as *const c_void,
+                _ => std::ptr::null(),
+            }
+        };
+        let instance_load = |name: &CStr| -> *const c_void {
+            if name == c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" { all_caps as *const c_void } else { std::ptr::null() }
+        };
+        let families = vec![vk::QueueFamilyProperties { queue_flags: vk::QueueFlags::GRAPHICS, ..Default::default() }];
+        let (device, _) = crate::state::test_support::fake_device_full(
+            load,
+            families,
+            crate::state::test_support::gdpa_nothing,
+            instance_load,
+        );
+        let game_modes = [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::IMMEDIATE];
+        let list = vk::SwapchainPresentModesCreateInfoEXT {
+            present_mode_count: 2,
+            p_present_modes: game_modes.as_ptr(),
+            ..Default::default()
+        };
+        let ci = vk::SwapchainCreateInfoKHR {
+            p_next: &list as *const _ as *const c_void,
+            min_image_count: 3,
+            image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            present_mode: vk::PresentModeKHR::FIFO,
+            image_extent: vk::Extent2D { width: 1280, height: 800 },
+            ..Default::default()
+        };
+        let _lock = MULTIPLIER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::state::set_test_multiplier(2);
+        let mut out = vk::SwapchainKHR::null();
+        let result = unsafe { create_swapchain(device, &ci, std::ptr::null(), &mut out) };
+        crate::state::set_test_multiplier(0);
+        let info = SWAPCHAINS.destroyed(out.as_raw());
+        DEVICES.remove(dispatch_key(device));
+        assert_eq!(result, vk::Result::SUCCESS);
+        let (mode, modes) = CAPTURED_MODES.lock().unwrap().take().unwrap();
+        assert_eq!(mode, vk::PresentModeKHR::FIFO);
+        assert_eq!(modes, [vk::PresentModeKHR::FIFO]);
+        assert_eq!(list.present_mode_count, 2, "the game's struct must not change");
+        assert_eq!(game_modes, [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::IMMEDIATE]);
+        let info = info.expect("registered");
+        assert!(info.gen.is_some());
+        assert!(info.fifo_only_modes);
     }
 
     #[test]
