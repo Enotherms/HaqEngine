@@ -60,12 +60,12 @@ pub fn block_match(prev: &Image<f32>, cur: &Image<f32>, coarse: Option<&Flow>, r
         for bx in 0..flow.width {
             let candidates = predictions(coarse, bx, by);
             let mut pred = candidates[0];
-            let mut pred_sad = block_sad(prev, cur, bx, by, pred);
-            for &c in &candidates[1..] {
-                let s = block_sad(prev, cur, bx, by, c);
-                if s < pred_sad {
+            let mut pred_score = i64::MAX;
+            for &c in &candidates {
+                let score = candidate_score(prev, cur, bx, by, c);
+                if score < pred_score {
                     pred = c;
-                    pred_sad = s;
+                    pred_score = score;
                 }
             }
             let mut best = (i64::MAX, i32::MAX, pred);
@@ -85,8 +85,21 @@ pub fn block_match(prev: &Image<f32>, cur: &Image<f32>, coarse: Option<&Flow>, r
     flow
 }
 
-/// Candidate predictions for a block, in order: its own coarse block, the eight neighbouring
-/// coarse blocks (row-major, those that exist), then zero. Without `coarse`, only zero.
+/// Lowest SAD within ±1 pixel of a candidate, so a candidate half a pixel off the true motion
+/// at the coarser level still scores well.
+pub fn candidate_score(prev: &Image<f32>, cur: &Image<f32>, bx: u32, by: u32, c: [i32; 2]) -> i64 {
+    let mut best = i64::MAX;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            best = best.min(block_sad(prev, cur, bx, by, [c[0] + dx, c[1] + dy]));
+        }
+    }
+    best
+}
+
+/// Candidate predictions for a block, in order and without duplicates: its own coarse block, the
+/// eight neighbouring coarse blocks (row-major, those that exist), then zero. Without `coarse`,
+/// only zero.
 pub fn predictions(coarse: Option<&Flow>, bx: u32, by: u32) -> Vec<[i32; 2]> {
     let Some(c) = coarse else { return vec![[0, 0]] };
     let scaled = |x: u32, y: u32| {
@@ -104,7 +117,13 @@ pub fn predictions(coarse: Option<&Flow>, bx: u32, by: u32) -> Vec<[i32; 2]> {
         }
     }
     out.push([0, 0]);
-    out
+    let mut unique: Vec<[i32; 2]> = Vec::with_capacity(out.len());
+    for c in out {
+        if !unique.contains(&c) {
+            unique.push(c);
+        }
+    }
+    unique
 }
 
 /// Integer SAD of block `(bx, by)` of `prev` against `cur` displaced by `offset` (clamped reads).
@@ -254,6 +273,31 @@ mod tests {
         let m = median_flow(&f);
         assert_eq!(m.get(0, 0), [1.0, 5.0]);
         assert_eq!(m.get(1, 0), [1.0, 5.0]);
+    }
+
+    fn recovery(w: u32, h: u32, seed: u64, dx: i32, dy: i32) -> (u32, u32) {
+        let prev = noise(w, h, seed);
+        let cur = shift(&prev, dx, dy);
+        let flow = estimate_flow(&pyramid(&prev), &pyramid(&cur));
+        let want = [dx as f32 / 2.0, dy as f32 / 2.0];
+        let (mut hits, mut total) = (0, 0);
+        for by in 2..flow.height - 2 {
+            for bx in 2..flow.width - 2 {
+                total += 1;
+                if flow.get(bx, by) == want {
+                    hits += 1;
+                }
+            }
+        }
+        (hits, total)
+    }
+
+    #[test]
+    fn recovers_half_pixel_coarse_shifts() {
+        for (w, h, seed, dx, dy) in [(1281, 801, 8, -6, 4), (1280, 800, 21, 10, -6), (1280, 800, 6, 12, -8)] {
+            let (hits, total) = recovery(w, h, seed, dx, dy);
+            assert!(hits * 100 >= total * 95, "{w}x{h} seed {seed} shift ({dx},{dy}): {hits}/{total}");
+        }
     }
 
     #[test]

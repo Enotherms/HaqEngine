@@ -23,7 +23,6 @@ const int MAX_OFFSETS = (2 * MAX_RADIUS + 1) * (2 * MAX_RADIUS + 1);
 const float QUANT = 1023.0;
 
 shared int prev_q[64];
-shared int reduce[64];
 shared int window_q[MAX_WINDOW * MAX_WINDOW];
 shared int sads[MAX_OFFSETS];
 
@@ -31,6 +30,36 @@ int quantize(float l) {
     precise float q = clamp(l, 0.0, 1.0) * QUANT;
     precise float r = q + 0.5;
     return int(floor(r));
+}
+
+void load_window(ivec2 b, ivec2 center, int r, ivec2 limit, int tid) {
+    int size = BLOCK + 2 * r;
+    ivec2 origin = b * BLOCK + center - ivec2(r);
+    for (int i = tid; i < size * size; i += 64) {
+        ivec2 c = clamp(origin + ivec2(i % size, i / size), ivec2(0), limit);
+        window_q[i] = quantize(imageLoad(cur_luma, c).r);
+    }
+    barrier();
+}
+
+void compute_sads(ivec2 b, int r, int tid) {
+    int size = BLOCK + 2 * r;
+    int span = 2 * r + 1;
+    ivec2 block_origin = b * BLOCK;
+    for (int k = tid; k < span * span; k += 64) {
+        int dx = k % span - r;
+        int dy = k / span - r;
+        int sad = 0;
+        for (int py = 0; py < BLOCK; py++) {
+            for (int px = 0; px < BLOCK; px++) {
+                if (block_origin.x + px < int(pc.w) && block_origin.y + py < int(pc.h)) {
+                    sad += abs(prev_q[py * BLOCK + px] - window_q[(py + dy + r) * size + (px + dx + r)]);
+                }
+            }
+        }
+        sads[k] = sad;
+    }
+    barrier();
 }
 
 ivec2 scaled(ivec2 c) {
@@ -66,53 +95,37 @@ void main() {
     }
     candidates[n++] = ivec2(0);
 
-    ivec2 pred = candidates[0];
-    int pred_sad = 0x7fffffff;
+    int m = 0;
     for (int i = 0; i < n; i++) {
-        ivec2 c = clamp(q + candidates[i], ivec2(0), limit);
-        reduce[tid] = valid ? abs(prev_q[tid] - quantize(imageLoad(cur_luma, c).r)) : 0;
-        barrier();
-        for (int s = 32; s > 0; s >>= 1) {
-            if (tid < s) {
-                reduce[tid] += reduce[tid + s];
-            }
-            barrier();
+        bool seen = false;
+        for (int j = 0; j < m; j++) {
+            seen = seen || candidates[j] == candidates[i];
         }
-        int sad = reduce[0];
-        barrier();
-        if (i == 0 || sad < pred_sad) {
+        if (!seen) {
+            candidates[m++] = candidates[i];
+        }
+    }
+
+    ivec2 pred = candidates[0];
+    int pred_score = 0x7fffffff;
+    for (int i = 0; i < m; i++) {
+        load_window(b, candidates[i], 1, limit, tid);
+        compute_sads(b, 1, tid);
+        int score = 0x7fffffff;
+        for (int k = 0; k < 9; k++) {
+            score = min(score, sads[k]);
+        }
+        if (score < pred_score) {
             pred = candidates[i];
-            pred_sad = sad;
+            pred_score = score;
         }
     }
 
-    int r = min(pc.radius, MAX_RADIUS);
-    int size = BLOCK + 2 * r;
-    ivec2 origin = b * BLOCK + pred - ivec2(r);
-    for (int i = tid; i < size * size; i += 64) {
-        ivec2 c = clamp(origin + ivec2(i % size, i / size), ivec2(0), limit);
-        window_q[i] = quantize(imageLoad(cur_luma, c).r);
-    }
-    barrier();
-
+    int r = clamp(pc.radius, 0, MAX_RADIUS);
     int span = 2 * r + 1;
     int count = span * span;
-    ivec2 block_origin = b * BLOCK;
-    for (int k = tid; k < count; k += 64) {
-        int dx = k % span - r;
-        int dy = k / span - r;
-        int sad = 0;
-        for (int py = 0; py < BLOCK; py++) {
-            for (int px = 0; px < BLOCK; px++) {
-                if (block_origin.x + px < int(pc.w) && block_origin.y + py < int(pc.h)) {
-                    int cur_value = window_q[(py + dy + r) * size + (px + dx + r)];
-                    sad += abs(prev_q[py * BLOCK + px] - cur_value);
-                }
-            }
-        }
-        sads[k] = sad;
-    }
-    barrier();
+    load_window(b, pred, r, limit, tid);
+    compute_sads(b, r, tid);
 
     if (tid == 0) {
         int best_sad = 0x7fffffff;

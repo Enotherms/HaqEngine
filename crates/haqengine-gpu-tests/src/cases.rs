@@ -196,6 +196,26 @@ fn merge(reports: &[CompareReport]) -> CompareReport {
     out
 }
 
+/// Blocks where the GPU's level-0 flow differs from a pure-CPU run; at most 0.5% may differ,
+/// because CPU and GPU luma differ by ~1e-7 and can round to different integers.
+fn end_to_end(prev: &Image<Rgba8>, cur: &Image<Rgba8>, gpu_level0: &Flow) -> Result<(), String> {
+    let cpu = flow::estimate_flow(&flow::pyramid(prev), &flow::pyramid(cur));
+    let differ = compare_rg32f(&cpu, gpu_level0, 0.0).over_tolerance;
+    let total = gpu_level0.data.len() as u32;
+    if differ == u32::MAX || differ * 200 > total {
+        return Err(format!("GPU flow differs from the pure-CPU run in {differ}/{total} blocks, max 0.5%"));
+    }
+    Ok(())
+}
+
+fn require_recovery(flow: &Flow, want: [f32; 2]) -> Result<(), String> {
+    let (hits, total) = interior_hits(flow, want);
+    if hits * 100 < total * 95 {
+        return Err(format!("motion recovered in {hits}/{total} interior blocks, need 95%"));
+    }
+    Ok(())
+}
+
 fn interior_hits(flow: &Flow, want: [f32; 2]) -> (u32, u32) {
     let (mut hits, mut total) = (0, 0);
     for by in 2..flow.height.saturating_sub(2) {
@@ -241,11 +261,9 @@ fn flow_case(
         }
         let picked: Vec<CompareReport> = levels.iter().map(|&l| flows.checks[l]).collect();
         let report = merge(&picked);
+        end_to_end(prev, cur, &level0)?;
         if let Some(want) = expect {
-            let (hits, total) = interior_hits(&level0, want);
-            if hits * 100 < total * 95 {
-                return Err(format!("motion recovered in {hits}/{total} interior blocks, need 95%"));
-            }
+            require_recovery(&level0, want)?;
         }
         Ok(CaseResult { report, gpu_us: time, tolerance: 0.0 })
     })();
@@ -317,6 +335,8 @@ fn battery_case(gpu: &Gpu) -> Result<CaseResult, String> {
             gpu.destroy_image(img);
         }
         let level0 = level0?;
+        end_to_end(&prev, &cur, &level0)?;
+        require_recovery(&level0, [5.0, -3.0])?;
         reports.push(compare_rgba8(&flow::warp_blend(&prev, &cur, &level0, 0.5), &warp?, BLEND_TOLERANCE));
         println!("      battery pipeline total {time:.1} us (budget 2000 us)");
         Ok(CaseResult { report: merge(&reports), gpu_us: time, tolerance: BLEND_TOLERANCE as f32 })
@@ -358,7 +378,7 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         }),
         case("flow pipeline 1281x801 shift(-6,4)", |g| {
             let prev = noise(1281, 801, 8);
-            flow_case(g, &prev, &shift(&prev, -6, 4), &[0, 1, 2, 3], None, false)
+            flow_case(g, &prev, &shift(&prev, -6, 4), &[0, 1, 2, 3], Some([-3.0, 2.0]), false)
         }),
         case("flow flat black", |g| {
             let black = Image::new(640, 400, [0u8, 0, 0, 255]);
