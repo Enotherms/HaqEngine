@@ -605,7 +605,7 @@ unsafe fn read_gpu_time(st: &mut GenState, d: &ash::Device, slot_index: usize) {
 /// Updates counters and timing windows after one real present, logging every 10 seconds.
 fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: bool) {
     let now = Instant::now();
-    let s = &mut st.stats;
+    let GenState { stats: s, quality: q, .. } = st;
     s.real += 1;
     if generated {
         s.generated += 1;
@@ -626,13 +626,18 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: 
         if let (Some(iv), Some(cost)) = (s.intervals.summary(), s.present_cost.summary()) {
             let real_fps = iv.count as f32 / secs;
             let out_per_real = if s.real > 0 { (s.real + s.generated) as f32 / s.real as f32 } else { 1.0 };
+            let quality = q
+                .as_mut()
+                .map(|q| q.take_counts())
+                .map(|c| format!(", quality cuts {} copies {} restarts {}", c.cuts, c.copies, c.restarts))
+                .unwrap_or_default();
             let gpu = s
                 .gpu_cost
                 .summary()
                 .map(|g| format!(", gpu {:.2} ms p99 {:.2}", g.mean_ms, g.p99_ms))
                 .unwrap_or_default();
             LOG.log(&format!(
-                "swapchain {id}: real {real_fps:.1} fps, out {:.1} fps, interval mean {:.2} ms sd {:.2} p99 {:.2}, added {:.2} ms p99 {:.2}, skipped {}{gpu}",
+                "swapchain {id}: real {real_fps:.1} fps, out {:.1} fps, interval mean {:.2} ms sd {:.2} p99 {:.2}, added {:.2} ms p99 {:.2}, skipped {}{gpu}{quality}",
                 real_fps * out_per_real,
                 iv.mean_ms,
                 iv.stddev_ms,

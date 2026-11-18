@@ -13,6 +13,8 @@ use haqengine_shaders::BindingKind;
 pub const RING_BLOCKS: usize = 25;
 pub const SPD_BLOCK: usize = 24;
 pub const BLOCK_SIZE: u64 = 32;
+/// Bytes per frame slot of the scene-change readback (FSR 3's three SCD words, padded).
+const READBACK_STRIDE: usize = 16;
 
 /// The images Quality owns: the raw frames by parity, the blend output, and the flow's images.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,6 +104,81 @@ pub fn fill_constants(schedule: &[OfDispatch], frame_index: u32, ring: &Constant
     }
 }
 
+/// What happened in Quality since the last log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QualityCounts {
+    pub cuts: u32,
+    pub copies: u32,
+    pub restarts: u32,
+}
+
+/// Quality's frame history: which raw image is current, whether a previous frame exists, FSR 3's
+/// frame index, and whether the flow's images must be cleared before the next frame.
+#[derive(Debug)]
+pub struct History {
+    pub parity: usize,
+    pub has_prev: bool,
+    pub frame_index: u32,
+    needs_clear: bool,
+    cleared_once: bool,
+    counts: QualityCounts,
+}
+
+impl History {
+    pub fn new() -> History {
+        History { parity: 0, has_prev: false, frame_index: 0, needs_clear: true, cleared_once: false, counts: QualityCounts::default() }
+    }
+
+    /// True once when the flow's images must be cleared (at creation); restarts FSR 3's warm-up.
+    pub fn take_clear(&mut self) -> bool {
+        if !self.needs_clear {
+            return false;
+        }
+        self.needs_clear = false;
+        self.frame_index = 0;
+        if self.cleared_once {
+            self.counts.restarts += 1;
+        }
+        self.cleared_once = true;
+        true
+    }
+
+    /// This frame's step, counting copies.
+    pub fn step(&mut self) -> QualityStep {
+        let s = quality_step(self.has_prev, self.frame_index);
+        if s == QualityStep::CopyAndPrime {
+            self.counts.copies += 1;
+        }
+        s
+    }
+
+    pub fn submitted(&mut self) {
+        self.parity ^= 1;
+        self.has_prev = true;
+        self.frame_index = self.frame_index.saturating_add(1);
+    }
+
+    /// A present skipped Quality work: the next frame is a copy, but FSR 3 keeps its history, so it
+    /// does not spend its warm-up frames again.
+    pub fn forget_previous(&mut self) {
+        self.has_prev = false;
+    }
+
+    pub fn note_cut(&mut self) {
+        self.counts.cuts += 1;
+    }
+
+    pub fn take_counts(&mut self) -> QualityCounts {
+        std::mem::take(&mut self.counts)
+    }
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct QImage {
     res: QRes,
     image: vk::Image,
@@ -125,11 +202,12 @@ pub struct QualityResources {
     mapped: Mapped,
     extent: vk::Extent2D,
     format: PackedFormat,
-    parity: usize,
-    has_prev: bool,
-    frame_index: u32,
+    history: History,
     initialized: bool,
-    needs_clear: bool,
+    readback: vk::Buffer,
+    readback_memory: vk::DeviceMemory,
+    readback_mapped: Mapped,
+    readback_valid: Vec<bool>,
     pub bytes: u64,
 }
 
@@ -211,11 +289,12 @@ impl QualityResources {
             schedules,
             extent,
             format,
-            parity: 0,
-            has_prev: false,
-            frame_index: 0,
+            history: History::new(),
             initialized: false,
-            needs_clear: true,
+            readback: vk::Buffer::null(),
+            readback_memory: vk::DeviceMemory::null(),
+            readback_mapped: Mapped(std::ptr::null_mut()),
+            readback_valid: vec![false; slots],
             bytes: 0,
         };
         match me.build(d, &props, pipelines) {
@@ -298,6 +377,14 @@ impl QualityResources {
         d.bind_buffer_memory(self.ring_buffer, self.ring_memory, 0)?;
         self.mapped = Mapped(d.map_memory(self.ring_memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u8);
         std::ptr::write_bytes(self.mapped.0, 0, size as usize);
+        let rb_size = (self.readback_valid.len().max(1) * READBACK_STRIDE) as u64;
+        self.readback = d.create_buffer(&vk::BufferCreateInfo::default().size(rb_size).usage(vk::BufferUsageFlags::TRANSFER_DST), None)?;
+        let req = d.get_buffer_memory_requirements(self.readback);
+        let kind = memory_type(props, req.memory_type_bits, flags).ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        self.readback_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)?;
+        self.bytes += req.size;
+        d.bind_buffer_memory(self.readback, self.readback_memory, 0)?;
+        self.readback_mapped = Mapped(d.map_memory(self.readback_memory, 0, rb_size, vk::MemoryMapFlags::empty())? as *mut u8);
         Ok(())
     }
 
@@ -400,16 +487,21 @@ impl QualityResources {
             d.cmd_pipeline_barrier(cmd, S::TOP_OF_PIPE, S::TRANSFER | S::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &barriers);
             self.initialized = true;
         }
-        if self.needs_clear {
+        if self.history.take_clear() {
             barrier(d, cmd, S::COMPUTE_SHADER | S::TRANSFER, S::TRANSFER);
             for img in self.images.iter().filter(|i| matches!(i.res, QRes::Of(_))) {
                 d.cmd_clear_color_image(cmd, img.image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
             }
-            self.frame_index = 0;
-            self.needs_clear = false;
         }
-        let step = quality_step(self.has_prev, self.frame_index);
-        let cur = self.parity;
+        if slot < self.readback_valid.len() && self.readback_valid[slot] && !self.readback_mapped.0.is_null() {
+            let words = std::slice::from_raw_parts(self.readback_mapped.0.add(slot * READBACK_STRIDE) as *const u32, 3);
+            if words[1] & 1 != 0 {
+                self.history.note_cut();
+            }
+        }
+        let step = self.history.step();
+        let cur = self.history.parity;
+        let frame_index = self.history.frame_index;
         let (w, h) = (self.extent.width, self.extent.height);
         let full = vk::ImageCopy::default()
             .src_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
@@ -421,7 +513,7 @@ impl QualityResources {
         barrier(d, cmd, S::TRANSFER, S::COMPUTE_SHADER);
 
         let ring_bytes = std::slice::from_raw_parts_mut(self.mapped.0, self.ring.size() as usize);
-        fill_constants(&self.schedules[cur], self.frame_index, &self.ring, slot, ring_bytes);
+        fill_constants(&self.schedules[cur], frame_index, &self.ring, slot, ring_bytes);
         for (i, dd) in self.schedules[cur].iter().enumerate() {
             let Some(pass) = p.flow.get(dd.pass).and_then(|x| x.as_ref()) else { continue };
             let mut offsets = [0u32; 2];
@@ -442,11 +534,22 @@ impl QualityResources {
             barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
         }
 
+        if slot < self.readback_valid.len() {
+            barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset((slot * READBACK_STRIDE) as u64)
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                .image_extent(vk::Extent3D { width: 3, height: 1, depth: 1 });
+            d.cmd_copy_image_to_buffer(cmd, self.image(QRes::Of(OfRes::ScdOutput)).image, L::GENERAL, self.readback, &[region]);
+            let to_host = vk::MemoryBarrier::default().src_access_mask(A::TRANSFER_WRITE).dst_access_mask(A::HOST_READ);
+            d.cmd_pipeline_barrier(cmd, S::TRANSFER, S::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
+            self.readback_valid[slot] = true;
+        }
         layout_barrier(d, cmd, spare, L::UNDEFINED, L::TRANSFER_DST_OPTIMAL, A::empty(), A::TRANSFER_WRITE, S::TRANSFER, S::TRANSFER);
         if step == QualityStep::Interpolate {
             let (hw, hh) = half_size(w, h);
             let flow = of_sizes(hw, hh).flow[0];
-            let push = push_words([w, h, flow.0, flow.1, (self.frame_index == 0) as u32, self.format.code()]);
+            let push = push_words([w, h, flow.0, flow.1, (frame_index == 0) as u32, self.format.code()]);
             let blend = &p.blend;
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, blend.pipeline);
             let blend_set = *self.sets[cur].last().expect("the blend's set is planned last");
@@ -465,20 +568,31 @@ impl QualityResources {
 
     /// Call after the recorded commands were submitted: this frame becomes the previous one.
     pub fn submitted(&mut self) {
-        self.parity ^= 1;
-        self.has_prev = true;
-        self.frame_index = self.frame_index.saturating_add(1);
+        self.history.submitted();
     }
 
-    /// Call when a present skipped Quality work: the next frame copies and the flow starts over.
+    /// Call when a present skipped Quality work: the next frame is a copy; FSR 3 keeps its history.
     pub fn forget_previous(&mut self) {
-        self.has_prev = false;
-        self.needs_clear = true;
+        self.history.forget_previous();
+    }
+
+    /// Scene cuts, copies and flow restarts since the last call.
+    pub fn take_counts(&mut self) -> QualityCounts {
+        self.history.take_counts()
     }
 
     /// # Safety
     /// The GPU must be done with these resources.
     pub unsafe fn destroy(&self, d: &ash::Device) {
+        if !self.readback_mapped.0.is_null() {
+            d.unmap_memory(self.readback_memory);
+        }
+        if self.readback != vk::Buffer::null() {
+            d.destroy_buffer(self.readback, None);
+        }
+        if self.readback_memory != vk::DeviceMemory::null() {
+            d.free_memory(self.readback_memory, None);
+        }
         if !self.mapped.0.is_null() {
             d.unmap_memory(self.ring_memory);
         }
@@ -506,6 +620,30 @@ mod tests {
     use super::*;
 
     const EXTENT: vk::Extent2D = vk::Extent2D { width: 1280, height: 800 };
+
+    #[test]
+    fn skipped_frame_keeps_flow_history() {
+        let mut h = History::new();
+        assert!(h.take_clear());
+        assert!(!h.take_clear());
+        assert_eq!(h.step(), QualityStep::CopyAndPrime);
+        h.submitted();
+        for _ in 0..7 {
+            assert_eq!(h.step(), QualityStep::Interpolate);
+            h.submitted();
+        }
+        let (parity, frame) = (h.parity, h.frame_index);
+        h.forget_previous();
+        assert!(!h.take_clear(), "a skipped present must not restart FSR 3");
+        assert_eq!(h.step(), QualityStep::CopyAndPrime);
+        assert_eq!((h.parity, h.frame_index), (parity, frame));
+        h.submitted();
+        assert_eq!(h.step(), QualityStep::Interpolate);
+        let mut counts = h.take_counts();
+        assert_eq!((counts.copies, counts.restarts), (2, 0));
+        counts = h.take_counts();
+        assert_eq!((counts.copies, counts.restarts), (0, 0));
+    }
 
     #[test]
     fn quality_sets_per_parity() {
