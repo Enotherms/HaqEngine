@@ -1222,6 +1222,10 @@ fn unpack_image(f: PackedFormat, img: &Image<u32>) -> Image<Rgba8> {
 }
 
 fn battery_pair(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgba8>) -> Result<BatteryPair, String> {
+    battery_pair_at(gpu, f, prev, cur, 0.5)
+}
+
+fn battery_pair_at(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgba8>, t: f32) -> Result<BatteryPair, String> {
     let (pp, cp) = (packed::to_packed(f, prev), packed::to_packed(f, cur));
     let mut setup = 0.0;
     let fp = gpu_frame_packed(gpu, f, &pp, &mut setup)?;
@@ -1236,7 +1240,7 @@ fn battery_pair(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgb
     let result = (|| {
         let flows = gpu_flows(gpu, &fp, &fc, &mut flow_us)?;
         let run = || -> Result<_, String> {
-            let (old, _) = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], 0.5)?;
+            let (old, _) = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
             let (new, blend_us) = run_warp_packed_with(
                 gpu,
                 &haqengine_shaders::BATTERY_BLEND_PACKED,
@@ -1246,7 +1250,7 @@ fn battery_pair(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgb
                 &flows.images[0],
                 &fp.levels[0],
                 &fc.levels[0],
-                0.5,
+                t,
             )?;
             Ok((old, new, blend_us, gpu.read_rg32f(&flows.images[0])?, gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?))
         };
@@ -1262,15 +1266,15 @@ fn battery_pair(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgb
     result
 }
 
-fn battery_parity_case(gpu: &Gpu, f: PackedFormat) -> Result<CaseResult, String> {
+fn battery_parity_case(gpu: &Gpu, f: PackedFormat, width: u32, height: u32, t: f32) -> Result<CaseResult, String> {
     let square = checker(96, 96, 6);
-    let mut frames = pan_frames(1280, 800, 12, -8, 1, 201);
+    let mut frames = pan_frames(width, height, 12, -8, 1, 201);
     for fr in &mut frames {
         paste(fr, &square, (592, 352));
     }
-    let pair = battery_pair(gpu, f, &frames[0], &frames[1])?;
+    let pair = battery_pair_at(gpu, f, &frames[0], &frames[1], t)?;
     let (pp, cp) = (packed::to_packed(f, &frames[0]), packed::to_packed(f, &frames[1]));
-    let expected = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, 0.5);
+    let expected = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, t);
     Ok(CaseResult { report: packed::compare_packed(f, &expected, &pair.new, 1.0), gpu_us: pair.blend_us, tolerance: 1.0 })
 }
 
@@ -1385,9 +1389,8 @@ fn battery_ghost_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(battery_result(pair.blend_us))
 }
 
-/// A menu-like still screen (light text bars on a dark panel) whose brightness drops 10%: pixels
-/// outside the two frames' values (by more than 2 steps) are false matches on the fine pattern;
-/// the new blend may not have more than 10% more of them than M3c's warp.
+/// A menu-like still screen (light text bars on a dark panel) whose brightness drops 10%: every
+/// output pixel stays between the two frames' values, within 2 steps.
 fn battery_menu_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let mut menu = Image::new(1280, 800, [30u8, 34, 48, 255]);
     for row in 0..12u32 {
@@ -1398,29 +1401,35 @@ fn battery_menu_case(gpu: &Gpu) -> Result<CaseResult, String> {
             }
         }
     }
-    let dim = Image { width: 1280, height: 800, data: menu.data.iter().map(|p| [p[0] * 9 / 10, p[1] * 9 / 10, p[2] * 9 / 10, 255]).collect() };
+    let dim = Image {
+        width: 1280,
+        height: 800,
+        data: menu.data.iter().map(|p| [0, 1, 2].map(|i| (p[i] as u16 * 9 / 10) as u8)).map(|c| [c[0], c[1], c[2], 255]).collect(),
+    };
     let pair = battery_pair(gpu, BF, &menu, &dim)?;
     let mut outside = 0usize;
     for y in 0..800 {
         for x in 0..1280 {
             let (a, b, o) = (menu.get(x, y), dim.get(x, y), pair.new_rgba.get(x, y));
-            outside += (0..3).any(|i| o[i] + 2 < a[i].min(b[i]) || o[i] > a[i].max(b[i]) + 2) as usize;
+            outside += (0..3).any(|i| o[i].saturating_add(2) < a[i].min(b[i]) || o[i] > a[i].max(b[i]).saturating_add(2)) as usize;
         }
     }
     let old_outside = (0..800u32)
         .flat_map(|y| (0..1280u32).map(move |x| (x, y)))
         .filter(|&(x, y)| {
             let (a, b, o) = (menu.get(x, y), dim.get(x, y), pair.old.get(x, y));
-            (0..3).any(|i| o[i] + 2 < a[i].min(b[i]) || o[i] > a[i].max(b[i]) + 2)
+            (0..3).any(|i| o[i].saturating_add(2) < a[i].min(b[i]) || o[i] > a[i].max(b[i]).saturating_add(2))
         })
         .count();
     println!("      menu fade: {outside} pixels outside the two frames (M3c warp {old_outside})");
-    if outside * 10 > old_outside * 11 {
+    if outside > 0 {
         return Err(format!("menu fade: {outside} pixels outside the two frames, M3c warp {old_outside}"));
     }
     Ok(battery_result(pair.blend_us))
 }
 
+/// Reports Battery's GPU time with the new blend against the budget; a report, not a gate (the
+/// in-game `gpu` stat decides).
 fn battery_total_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let frames = pan_frames(1280, 800, 12, -8, 1, 251);
     let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
@@ -1586,8 +1595,13 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("fsr3 interp pipeline total", interp_pipeline_case),
         case("fsr3 interp scene cut takes current frame", interp_cut_case),
         case("fsr3 interp no ghosts behind a moving object", interp_ghost_case),
-        case("battery blend matches CPU bgra8", |g| battery_parity_case(g, PackedFormat::Bgra8)),
-        case("battery blend matches CPU a2b10g10r10", |g| battery_parity_case(g, PackedFormat::A2b10g10r10)),
+        case("battery blend matches CPU bgra8", |g| battery_parity_case(g, PackedFormat::Bgra8, 1280, 800, 0.5)),
+        case("battery blend matches CPU a2b10g10r10", |g| battery_parity_case(g, PackedFormat::A2b10g10r10, 1280, 800, 0.5)),
+        case("battery blend matches CPU 1283x797", |g| battery_parity_case(g, PackedFormat::Bgra8, 1283, 797, 0.5)),
+        case("battery blend matches CPU t=0.25 and 0.75", |g| {
+            battery_parity_case(g, PackedFormat::Bgra8, 1283, 797, 0.25)?;
+            battery_parity_case(g, PackedFormat::Rgba8, 1280, 800, 0.75)
+        }),
         case("battery blend pan", battery_pan_case),
         case("battery blend static overlay", battery_overlay_case),
         case("battery blend still square", battery_square_case),
@@ -1679,6 +1693,8 @@ mod tests {
             "fi_blend_packed matches CPU a2b10g10r10",
             "battery blend matches CPU bgra8",
             "battery blend matches CPU a2b10g10r10",
+            "battery blend matches CPU 1283x797",
+            "battery blend matches CPU t=0.25 and 0.75",
             "battery blend pan",
             "battery blend static overlay",
             "battery blend still square",

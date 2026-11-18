@@ -130,8 +130,8 @@ void main() {
     uint best_cost = 0xFFFFFFFFu;
     vec2 best = vec2(0.0);
     for (int i = 0; i < n; i++) {
-        ivec2 ca = ivec2(floor((pf - pc.t * cands[i]) / 2.0)) - base_prev[i];
-        ivec2 cb = ivec2(floor((pf + (1.0 - pc.t) * cands[i]) / 2.0)) - base_cur[i];
+        ivec2 ca = clamp(ivec2(floor((pf - pc.t * cands[i]) / 2.0)) - base_prev[i], ivec2(1), ivec2(6));
+        ivec2 cb = clamp(ivec2(floor((pf + (1.0 - pc.t) * cands[i]) / 2.0)) - base_cur[i], ivec2(1), ivec2(6));
         uint cost = 0u;
         for (int dy = -1; dy <= 1; dy++) {
             for (int dx = -1; dx <= 1; dx++) {
