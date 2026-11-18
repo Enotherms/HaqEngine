@@ -476,6 +476,85 @@ impl BatteryResources {
         step
     }
 
+    /// Debug snapshot: after this frame's submit (same queue), copies the previous and current real
+    /// frames, the generated frame and the level-0 flow to files in `dir`. Waits for the GPU.
+    ///
+    /// # Safety
+    /// Call after this frame's commands were submitted to `queue` and before `submitted()`.
+    pub unsafe fn dump(&self, device: &DeviceData, pool: vk::CommandPool, queue: vk::Queue, dir: &std::path::Path) -> Result<(), vk::Result> {
+        let d = &device.device;
+        let memory = device.instance.instance.get_physical_device_memory_properties(device.physical_device);
+        let flow0 = FLOW_BASE;
+        let picks = [(self.parity.prev(), "prev", 4u64), (self.parity.cur(), "cur", 4), (RAW_OUT, "out", 4), (flow0, "flow", 8)];
+        let mut buffers: Vec<(vk::Buffer, vk::DeviceMemory, u64, &str)> = Vec::new();
+        let result = (|| -> Result<(), vk::Result> {
+            for &(index, name, bpp) in &picks {
+                let img = &self.images[index];
+                let size = img.width as u64 * img.height as u64 * bpp;
+                let buffer = d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST), None)?;
+                let req = d.get_buffer_memory_requirements(buffer);
+                let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+                let Some(kind) = (0..memory.memory_type_count)
+                    .find(|&i| req.memory_type_bits & (1 << i) != 0 && memory.memory_types[i as usize].property_flags.contains(flags))
+                else {
+                    d.destroy_buffer(buffer, None);
+                    return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+                };
+                let mem = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)?;
+                d.bind_buffer_memory(buffer, mem, 0)?;
+                buffers.push((buffer, mem, size, name));
+            }
+            let cmd = d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+            )?[0];
+            if let Some(set) = device.set_loader_data {
+                let _ = set(d.handle(), vk::Handle::as_raw(cmd) as *mut std::ffi::c_void);
+            }
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            memory_barrier(d, cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER);
+            for (i, &(index, _, _)) in picks.iter().enumerate() {
+                let img = &self.images[index];
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                    .image_extent(vk::Extent3D { width: img.width, height: img.height, depth: 1 });
+                d.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::GENERAL, buffers[i].0, &[region]);
+            }
+            let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
+            d.end_command_buffer(cmd)?;
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let cmds = [cmd];
+            let submitted = d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence);
+            let waited = submitted.and_then(|_| d.wait_for_fences(&[fence], true, 2_000_000_000));
+            d.destroy_fence(fence, None);
+            d.free_command_buffers(pool, &cmds);
+            waited?;
+            let _ = std::fs::create_dir_all(dir);
+            for &(_, mem, size, name) in &buffers {
+                let ptr = d.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())?;
+                let bytes = std::slice::from_raw_parts(ptr as *const u8, size as usize);
+                let _ = std::fs::write(dir.join(format!("{name}.raw")), bytes);
+                d.unmap_memory(mem);
+            }
+            let f0 = &self.images[flow0];
+            let meta = format!(
+                "{} {} {} {} {}\n",
+                self.extent.width,
+                self.extent.height,
+                self.format.code(),
+                f0.width,
+                f0.height
+            );
+            let _ = std::fs::write(dir.join("meta.txt"), meta);
+            Ok(())
+        })();
+        for (buffer, mem, _, _) in buffers {
+            d.destroy_buffer(buffer, None);
+            d.free_memory(mem, None);
+        }
+        result
+    }
+
     /// Call after the recorded commands were submitted: the current frame becomes the previous one.
     pub fn submitted(&mut self) {
         self.parity.advance();

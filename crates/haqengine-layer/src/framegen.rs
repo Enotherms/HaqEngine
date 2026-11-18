@@ -20,6 +20,19 @@ const LOG_EVERY_MS: u64 = 10_000;
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// Generated-frame count at which the `HAQENGINE_DUMP` snapshot is taken.
+const DUMP_AT: u64 = 300;
+
+/// `HAQENGINE_DUMP`: `1` for `~/haqengine-dump`, or a directory; unset for no snapshot.
+static DUMP_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+    let v = std::env::var("HAQENGINE_DUMP").ok().filter(|v| !v.is_empty() && v != "0")?;
+    if v == "1" {
+        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join("haqengine-dump"))
+    } else {
+        Some(std::path::PathBuf::from(v))
+    }
+});
+
 /// One frame's worth of reusable copy resources.
 pub struct Slot {
     pub cmd: vk::CommandBuffer,
@@ -331,6 +344,12 @@ impl FrameGen {
             ready.stamped[slot_index] = ready.queries != vk::QueryPool::null();
         }
         if used_battery {
+            if st.stats.generated == DUMP_AT {
+                if let (Some(dir), Some(b), Some(ready)) = (DUMP_DIR.as_ref(), st.battery.as_ref(), st.ready.as_ref()) {
+                    let r = b.dump(device, ready.pool, queue, dir);
+                    LOG.log(&format!("debug snapshot to {}: {r:?}", dir.display()));
+                }
+            }
             if let Some(b) = st.battery.as_mut() {
                 b.submitted();
             }
