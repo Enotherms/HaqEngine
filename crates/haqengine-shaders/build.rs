@@ -24,7 +24,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", src.display());
         let dst = out.join(format!("{name}.spv"));
         let status = Command::new(&glslang)
-            .args(["-V", "--target-env", "vulkan1.1", "-o"])
+            .args(["-V", "--target-env", "vulkan1.0", "-o"])
             .arg(&dst)
             .arg(&src)
             .status()

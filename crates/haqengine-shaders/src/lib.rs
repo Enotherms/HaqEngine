@@ -98,6 +98,14 @@ mod tests {
     }
 
     #[test]
+    fn spirv_is_version_1_0_for_vulkan_1_0_apps() {
+        for s in all() {
+            let version = u32::from_le_bytes(s.spirv[4..8].try_into().unwrap());
+            assert_eq!(version, 0x0001_0000, "{} is SPIR-V {:#x}", s.name, version);
+        }
+    }
+
+    #[test]
     fn all_lists_every_shader() {
         let names: Vec<&str> = all().iter().map(|s| s.name).collect();
         assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed"]);
