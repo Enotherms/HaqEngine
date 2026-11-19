@@ -4,7 +4,7 @@
 use crate::pipelines::{Pass, Pipelines};
 use crate::state::DeviceData;
 use ash::vk;
-use haqengine_core::flow::{BLOCK, LEVELS, RADIUS_COARSE, RADIUS_FINE};
+use haqengine_core::flow::{level_radius, BLOCK, LEVELS};
 use haqengine_core::PackedFormat;
 
 /// Luma pyramid sizes for a frame: half resolution, then halving, rounding up.
@@ -513,7 +513,7 @@ impl BatteryResources {
                 let (bw, bh) = flows[l];
                 let has_coarse = l + 1 < LEVELS;
                 let (cw, ch) = if has_coarse { flows[l + 1] } else { (1, 1) };
-                let radius = if has_coarse { RADIUS_FINE } else { RADIUS_COARSE };
+                let radius = level_radius(l);
                 let push = push6([
                     lw.to_le_bytes(),
                     lh.to_le_bytes(),

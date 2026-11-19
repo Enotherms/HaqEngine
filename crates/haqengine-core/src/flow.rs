@@ -12,6 +12,20 @@ pub const LEVELS: usize = 4;
 pub const RADIUS_COARSE: i32 = 4;
 /// Search radius at the finer levels.
 pub const RADIUS_FINE: i32 = 2;
+/// Search radius at level 0, the finest: the coarser levels already place each block within a
+/// pixel or so, and the blend's per-pixel choice handles the rest.
+pub const RADIUS_LEVEL0: i32 = 1;
+
+/// The block-match search radius at `level` (`LEVELS - 1` is the coarsest).
+pub fn level_radius(level: usize) -> i32 {
+    if level + 1 == LEVELS {
+        RADIUS_COARSE
+    } else if level == 0 {
+        RADIUS_LEVEL0
+    } else {
+        RADIUS_FINE
+    }
+}
 /// Luma is matched as integers in `0..=QUANT`.
 pub const QUANT: f32 = 1023.0;
 
@@ -167,7 +181,7 @@ pub fn estimate_flow(prev: &[Image<f32>], cur: &[Image<f32>]) -> Flow {
     let top = prev.len() - 1;
     let mut flow = block_match(&prev[top], &cur[top], None, RADIUS_COARSE);
     for level in (0..top).rev() {
-        flow = block_match(&prev[level], &cur[level], Some(&median_flow(&flow)), RADIUS_FINE);
+        flow = block_match(&prev[level], &cur[level], Some(&median_flow(&flow)), level_radius(level));
     }
     flow
 }
@@ -303,6 +317,14 @@ pub fn bilinear(img: &Image<Rgba8>, x: f32, y: f32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn level_radius_values() {
+        assert_eq!(level_radius(LEVELS - 1), RADIUS_COARSE);
+        assert_eq!(level_radius(1), RADIUS_FINE);
+        assert_eq!(level_radius(0), RADIUS_LEVEL0);
+        assert_eq!(RADIUS_LEVEL0, 1);
+    }
+
     use super::*;
     use crate::image::{noise, shift};
 

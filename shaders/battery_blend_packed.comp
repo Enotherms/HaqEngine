@@ -69,6 +69,9 @@ vec4 bilinear(bool previous, vec2 p) {
     ivec2 p0 = ivec2(floor(c));
     ivec2 p1 = min(p0 + ivec2(1), ivec2(int(pc.w) - 1, int(pc.h) - 1));
     vec2 f = c - vec2(p0);
+    if (f == vec2(0.0)) {
+        return load(previous, p0);
+    }
     vec4 a = load(previous, p0);
     vec4 b = load(previous, ivec2(p1.x, p0.y));
     vec4 c0 = load(previous, ivec2(p0.x, p1.y));
@@ -147,6 +150,9 @@ void main() {
         if (cost < best_cost) {
             best_cost = cost;
             best = cands[i];
+        }
+        if (best_cost == 0u) {
+            break;
         }
     }
     vec4 a = bilinear(true, pf - pc.t * best);

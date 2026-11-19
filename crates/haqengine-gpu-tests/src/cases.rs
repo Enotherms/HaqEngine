@@ -3,7 +3,7 @@
 use crate::fsr3::run_sequence;
 use crate::gpu::{push_bytes, Bind, Gpu, StorageImage};
 use ash::vk;
-use haqengine_core::flow::{self, Flow, BLOCK, LEVELS, RADIUS_COARSE, RADIUS_FINE};
+use haqengine_core::flow::{self, level_radius, Flow, BLOCK, LEVELS};
 use haqengine_core::{
     blend, checker, compare_f32, compare_rg32f, compare_rgba8, gradient, luma_downsample, noise, shift, CompareReport,
     Image, Rgba8,
@@ -294,9 +294,11 @@ fn battery_packed_case(gpu: &Gpu) -> Result<CaseResult, String> {
 struct Flows {
     images: Vec<StorageImage>,
     checks: Vec<CompareReport>,
+    pass_us: Vec<(String, f64)>,
 }
 
 fn gpu_flows(gpu: &Gpu, prev: &Frame, cur: &Frame, time: &mut f64) -> Result<Flows, String> {
+    let mut pass_us: Vec<(String, f64)> = Vec::new();
     let dummy = gpu.create_storage_image(vk::Format::R32G32_SFLOAT, 1, 1)?;
     let mut by_level: Vec<Option<StorageImage>> = (0..LEVELS).map(|_| None).collect();
     let mut medians: Vec<StorageImage> = Vec::new();
@@ -309,7 +311,7 @@ fn gpu_flows(gpu: &Gpu, prev: &Frame, cur: &Frame, time: &mut f64) -> Result<Flo
             let out = gpu.create_storage_image(vk::Format::R32G32_SFLOAT, bw, bh)?;
             gpu.clear(&out, CANARY_FLOAT)?;
             let coarse_img = coarse.map(|i| &medians[i]);
-            let radius = if coarse_img.is_some() { RADIUS_FINE } else { RADIUS_COARSE };
+            let radius = level_radius(level);
             let (cw, ch) = coarse_img.map_or((1, 1), |c| (c.width, c.height));
             let push = push_bytes(&[
                 pl.width.to_le_bytes(),
@@ -319,7 +321,9 @@ fn gpu_flows(gpu: &Gpu, prev: &Frame, cur: &Frame, time: &mut f64) -> Result<Flo
                 radius.to_le_bytes(),
                 (coarse_img.is_some() as u32).to_le_bytes(),
             ]);
-            *time += gpu.run(&BLOCK_MATCH, &[pl, cl, coarse_img.unwrap_or(&dummy), &out], &push, block_groups(bw, bh))?;
+            let us = gpu.run(&BLOCK_MATCH, &[pl, cl, coarse_img.unwrap_or(&dummy), &out], &push, block_groups(bw, bh))?;
+            *time += us;
+            pass_us.push((format!("match L{level}"), us));
             let cpu_coarse: Option<Flow> = coarse_img.map(|c| gpu.read_rg32f(c)).transpose()?;
             let gpu_flow = gpu.read_rg32f(&out)?;
             let expected = flow::block_match(&gpu.read_r32f(pl)?, &gpu.read_r32f(cl)?, cpu_coarse.as_ref(), radius);
@@ -328,7 +332,9 @@ fn gpu_flows(gpu: &Gpu, prev: &Frame, cur: &Frame, time: &mut f64) -> Result<Flo
                 let median = gpu.create_storage_image(vk::Format::R32G32_SFLOAT, bw, bh)?;
                 gpu.clear(&median, CANARY_FLOAT)?;
                 let push = push_bytes(&[bw.to_le_bytes(), bh.to_le_bytes()]);
-                *time += gpu.run(&FLOW_MEDIAN, &[&out, &median], &push, groups(bw, bh))?;
+                let us = gpu.run(&FLOW_MEDIAN, &[&out, &median], &push, groups(bw, bh))?;
+                *time += us;
+                pass_us.push((format!("median L{level}"), us));
                 let median_check = compare_rg32f(&flow::median_flow(&gpu_flow), &gpu.read_rg32f(&median)?, 0.0);
                 report = merge(&[report, median_check]);
                 medians.push(median);
@@ -350,7 +356,7 @@ fn gpu_flows(gpu: &Gpu, prev: &Frame, cur: &Frame, time: &mut f64) -> Result<Flo
         }
         return Err(e);
     }
-    Ok(Flows { images, checks })
+    Ok(Flows { images, checks, pass_us })
 }
 
 fn merge(reports: &[CompareReport]) -> CompareReport {
@@ -774,7 +780,8 @@ fn fsr3_pipeline_case(gpu: &Gpu) -> Result<CaseResult, String> {
 }
 
 /// Odd full-resolution motion is between two half-resolution vectors, so neither engine can hit
-/// it exactly; FSR 3 must do at least as well as Battery on the same frames.
+/// it exactly; FSR 3 must keep its M4a level (84% of blocks within 1 px), and Battery's result on
+/// the same frames is printed next to it.
 fn fsr3_odd_case(gpu: &Gpu) -> Result<CaseResult, String> {
     fsr3_ready(gpu)?;
     let frames = pan_frames(1280, 800, 7, -3, FSR3_FRAMES, 63);
@@ -786,8 +793,8 @@ fn fsr3_odd_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let (fh, ft) = fsr3_hits(&flow, [7.0, -3.0], keep);
     let (bh, bt) = fsr3_hits(&battery_px, [7.0, -3.0], keep);
     println!("      odd shift within 1 px: fsr3 {fh}/{ft}, battery {bh}/{bt}; fsr3 most common {}", common(&flow));
-    if fh * bt < bh * ft {
-        return Err(format!("fsr3 {fh}/{ft} is below battery {bh}/{bt}"));
+    if fh * 100 < ft * 84 {
+        return Err(format!("fsr3 {fh}/{ft} is below 84% (battery {bh}/{bt})"));
     }
     Ok(fsr3_result(us))
 }
@@ -1259,6 +1266,7 @@ struct BatteryPair {
     flow_us: f64,
     blend_us: f64,
     counts: haqengine_core::frame_change::ChangeCounts,
+    pass_us: Vec<(String, f64)>,
 }
 
 fn unpack_image(f: PackedFormat, img: &Image<u32>) -> Image<Rgba8> {
@@ -1290,7 +1298,10 @@ fn battery_pair_at(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<
         }
     };
     let result = (|| {
+        let luma_us = flow_us;
         let flows = gpu_flows(gpu, &fp, &fc, &mut flow_us)?;
+        let mut pass_us = vec![("luma + reduce".to_string(), luma_us)];
+        pass_us.extend(flows.pass_us.iter().cloned());
         let run = || -> Result<_, String> {
             let (old, _) = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
             let (new, counts, blend_us) =
@@ -1302,7 +1313,8 @@ fn battery_pair_at(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<
             gpu.destroy_image(img);
         }
         let (old, new, counts, blend_us, flow, prev_luma, cur_luma) = r?;
-        Ok(BatteryPair { old: unpack_image(f, &old), new_rgba: unpack_image(f, &new), new, flow, prev_luma, cur_luma, flow_us, blend_us, counts })
+        pass_us.push(("blend + fixup".to_string(), blend_us));
+        Ok(BatteryPair { old: unpack_image(f, &old), new_rgba: unpack_image(f, &new), new, flow, prev_luma, cur_luma, flow_us, blend_us, counts, pass_us })
     })();
     fp.destroy(gpu);
     fc.destroy(gpu);
@@ -1547,6 +1559,8 @@ fn battery_total_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
     let total = pair.flow_us + pair.blend_us;
     println!("      battery with the new blend: total {total:.1} us (budget 2500 us): flow {:.0}, blend {:.0}", pair.flow_us, pair.blend_us);
+    let parts: Vec<String> = pair.pass_us.iter().map(|(n, t)| format!("{n} {t:.0}")).collect();
+    println!("      battery passes: {}", parts.join(", "));
     Ok(battery_result(total))
 }
 
