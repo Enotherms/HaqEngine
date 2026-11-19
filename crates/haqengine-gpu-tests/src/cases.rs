@@ -1274,7 +1274,7 @@ fn battery_parity_case(gpu: &Gpu, f: PackedFormat, width: u32, height: u32, t: f
     }
     let pair = battery_pair_at(gpu, f, &frames[0], &frames[1], t)?;
     let (pp, cp) = (packed::to_packed(f, &frames[0]), packed::to_packed(f, &frames[1]));
-    let expected = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, t);
+    let (expected, _) = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, t);
     Ok(CaseResult { report: packed::compare_packed(f, &expected, &pair.new, 1.0), gpu_us: pair.blend_us, tolerance: 1.0 })
 }
 

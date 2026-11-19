@@ -251,7 +251,7 @@ fn luma(img: &Image<u8>) -> impl Fn(i64, i64) -> i32 + '_ {
 
 /// The blend's per-pixel choice on FSR 3's flow at the midpoint (`crate::blend::choose_vector`).
 fn choose(x: u32, y: u32, flow_raw: &Image<[i16; 2]>, prev_luma: &Image<u8>, cur_luma: &Image<u8>) -> (bool, [f32; 2]) {
-    crate::blend::choose_vector(
+    let (cost, v) = crate::blend::choose_vector(
         x,
         y,
         (flow_raw.width, flow_raw.height),
@@ -259,7 +259,8 @@ fn choose(x: u32, y: u32, flow_raw: &Image<[i16; 2]>, prev_luma: &Image<u8>, cur
         luma(prev_luma),
         luma(cur_luma),
         0.5,
-    )
+    );
+    (cost > DISAGREE8, v)
 }
 
 /// Texel bytes of the image interpolation owns, its output; the frames, the flow, its luma and its

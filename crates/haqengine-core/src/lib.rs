@@ -2,6 +2,7 @@
 
 pub mod blend;
 pub mod flow;
+pub mod frame_change;
 pub mod fsr3_flow;
 pub mod fsr3_interp;
 pub mod handle_map;
