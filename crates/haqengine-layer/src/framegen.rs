@@ -3,6 +3,7 @@
 use crate::battery::BatteryResources;
 use crate::pipelines::QualityPipelines;
 use crate::quality::QualityResources;
+use haqengine_core::frame_change::{is_cut, ChangeCounts, StillDetector};
 use crate::pipelines::Pipelines;
 use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
@@ -77,6 +78,14 @@ pub struct GenState {
     pub battery_failed: bool,
     pub quality: Option<QualityResources>,
     pub quality_failed: bool,
+    /// Decides when Battery skips generation on a still screen.
+    pub still: StillDetector,
+    /// The frame number last recorded in each slot (0 = never).
+    pub slot_frames: Vec<u64>,
+    pub frames: u64,
+    /// Cuts seen and still presents since the last log line.
+    pub window_cuts: u64,
+    pub window_still: u64,
 }
 
 /// Which engine recorded a present.
@@ -123,6 +132,11 @@ impl FrameGen {
                 battery_failed: false,
                 quality: None,
                 quality_failed: false,
+                still: StillDetector::new(),
+                slot_frames: Vec::new(),
+                frames: 0,
+                window_cuts: 0,
+                window_still: 0,
             }),
         }
     }
@@ -315,6 +329,9 @@ impl FrameGen {
         read_gpu_time(&mut st, d, slot_index);
         let swapchain = *pi.p_swapchains;
         let game_index = *pi.p_image_indices;
+        if self.still_screen(&mut st, d, slot_index) {
+            return self.present_still(&mut st, id, device, queue, pi, slot, slot_index, game_index, start);
+        }
         let mut spare = 0u32;
         let r = (device.swapchain.acquire_next_image_khr)(
             d.handle(),
@@ -338,7 +355,7 @@ impl FrameGen {
             self.disable(id, "image index out of range", vk::Result::ERROR_UNKNOWN);
             return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
         };
-        let recorded = match self.record_frame(&mut st, id, device, slot.cmd, slot_index, game_image, spare_image) {
+        let recorded = match self.record_frame(&mut st, id, device, slot.cmd, slot_index, game_image, Some(spare_image)) {
             Ok(b) => b,
             Err(e) => {
                 self.disable(id, "recording the frame", e);
@@ -378,6 +395,7 @@ impl FrameGen {
         if let Some(ready) = st.ready.as_mut() {
             ready.stamped[slot_index] = ready.queries != vk::QueryPool::null();
         }
+        note_slot_frame(&mut st, slot_index);
         if recorded == Recorded::Quality {
             if let Some(q) = st.quality.as_mut() {
                 q.submitted();
@@ -415,6 +433,103 @@ impl FrameGen {
         combine_present_results(r_copy, r_real)
     }
 
+    /// Whether this present should skip generation because the screen has been still. Also counts
+    /// the reused slot's frame as a cut when it was one. Battery swapchains only.
+    unsafe fn still_screen(&self, st: &mut GenState, d: &ash::Device, slot_index: usize) -> bool {
+        if self.quality {
+            return false;
+        }
+        let Some(battery) = st.battery.as_ref() else { return false };
+        if battery.counts(slot_index).is_some_and(|c| is_cut(&c)) {
+            st.window_cuts += 1;
+        }
+        let Some(ready) = st.ready.as_ref() else { return false };
+        let slots: Vec<(bool, u64, Option<ChangeCounts>)> = ready
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let done = i == slot_index || d.get_fence_status(s.fence).unwrap_or(false);
+                (done, st.slot_frames.get(i).copied().unwrap_or(0), battery.counts(i))
+            })
+            .collect();
+        let counts = newest_ready_counts(&slots);
+        st.still.observe(counts)
+    }
+
+    /// A present on a still screen: Battery still runs (so the counts stay current and the next
+    /// moving frame has its history), but only the game's frame is shown, without waiting a
+    /// refresh behind a generated one.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn present_still(
+        &self,
+        st: &mut GenState,
+        id: u64,
+        device: &DeviceData,
+        queue: vk::Queue,
+        pi: &vk::PresentInfoKHR,
+        slot: Slot,
+        slot_index: usize,
+        game_index: u32,
+        start: Instant,
+    ) -> vk::Result {
+        let d = &device.device;
+        let next_present = device.swapchain.queue_present_khr;
+        let plain = |st: &mut GenState| {
+            let r = next_present(queue, pi);
+            record(st, id, start, false, false);
+            r
+        };
+        let Some(&game_image) = self.images.get(game_index as usize) else {
+            return plain(st);
+        };
+        let real_ready = match st.ready.as_ref().and_then(|r| r.image_ready.get(game_index as usize).copied()) {
+            Some(s) => s,
+            None => return plain(st),
+        };
+        if let Err(e) = self.record_frame(st, id, device, slot.cmd, slot_index, game_image, None) {
+            self.disable(id, "recording a still frame", e);
+            return plain(st);
+        }
+        let n = pi.wait_semaphore_count as usize;
+        let mut waits = [vk::Semaphore::null(); MAX_WAITS + 1];
+        if n > 0 {
+            waits[..n].copy_from_slice(std::slice::from_raw_parts(pi.p_wait_semaphores, n));
+        }
+        let stages = [vk::PipelineStageFlags::TRANSFER; MAX_WAITS + 1];
+        let signals = [real_ready];
+        let cmds = [slot.cmd];
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&waits[..n])
+            .wait_dst_stage_mask(&stages[..n])
+            .command_buffers(&cmds)
+            .signal_semaphores(&signals);
+        if let Err(e) = d.reset_fences(&[slot.fence]) {
+            self.disable(id, "resetting a fence", e);
+            return plain(st);
+        }
+        if let Err(e) = d.queue_submit(queue, &[submit], slot.fence) {
+            let _ = d.queue_submit(queue, &[], slot.fence);
+            self.disable(id, "submitting a still frame", e);
+            return plain(st);
+        }
+        if let Some(ready) = st.ready.as_mut() {
+            ready.stamped[slot_index] = ready.queries != vk::QueryPool::null();
+        }
+        note_slot_frame(st, slot_index);
+        if let Some(b) = st.battery.as_mut() {
+            b.submitted();
+        }
+        st.window_still += 1;
+        let real_wait = [real_ready];
+        let mut real_present = *pi;
+        real_present.wait_semaphore_count = 1;
+        real_present.p_wait_semaphores = real_wait.as_ptr();
+        let r = next_present(queue, &real_present);
+        record(st, id, start, false, false);
+        r
+    }
+
     /// Records this present's commands: Quality or Battery interpolation when available, otherwise
     /// a copy, bracketed by timestamps. Returns which engine recorded the frame.
     #[allow(clippy::too_many_arguments)]
@@ -426,7 +541,7 @@ impl FrameGen {
         cmd: vk::CommandBuffer,
         slot_index: usize,
         game: vk::Image,
-        spare: vk::Image,
+        spare: Option<vk::Image>,
     ) -> Result<Recorded, vk::Result> {
         let d = &device.device;
         d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
@@ -438,17 +553,19 @@ impl FrameGen {
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, first);
         }
         let quality = self.quality_pipelines(st, id, device);
-        let recorded = if let (Some(p), Some(q)) = (quality, st.quality.as_mut()) {
+        let recorded = if let (Some(p), Some(q), Some(spare)) = (quality, st.quality.as_mut(), spare) {
             q.record(d, cmd, &p, game, spare, slot_index);
             Recorded::Quality
         } else {
             match (self.battery_pipelines(st, id, device), st.battery.as_mut()) {
                 (Some(p), Some(b)) => {
-                    b.record(d, cmd, &p, game, spare);
+                    b.record(d, cmd, &p, game, spare, slot_index);
                     Recorded::Battery
                 }
                 _ => {
-                    self.record_copy_body(d, cmd, game, spare);
+                    if let Some(spare) = spare {
+                        self.record_copy_body(d, cmd, game, spare);
+                    }
                     Recorded::Copy
                 }
             }
@@ -508,7 +625,8 @@ impl FrameGen {
             }
         };
         if st.battery.is_none() {
-            match BatteryResources::create(device, &pipelines, self.extent, format) {
+            let slots = st.ready.as_ref().map_or(0, |r| r.slots.len());
+            match BatteryResources::create(device, &pipelines, self.extent, format, slots) {
                 Ok(b) => st.battery = Some(b),
                 Err(e) => {
                     st.battery_failed = true;
@@ -605,7 +723,7 @@ unsafe fn read_gpu_time(st: &mut GenState, d: &ash::Device, slot_index: usize) {
 /// Updates counters and timing windows after one real present, logging every 10 seconds.
 fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: bool) {
     let now = Instant::now();
-    let GenState { stats: s, quality: q, .. } = st;
+    let GenState { stats: s, quality: q, battery: bat, window_cuts, window_still, .. } = st;
     s.real += 1;
     if generated {
         s.generated += 1;
@@ -631,6 +749,14 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: 
                 .map(|q| q.take_counts())
                 .map(|c| format!(", quality cuts {} copies {} restarts {}", c.cuts, c.copies, c.restarts))
                 .unwrap_or_default();
+            let quality = if bat.is_some() {
+                let c = change_suffix(*window_cuts, *window_still);
+                *window_cuts = 0;
+                *window_still = 0;
+                quality + &c
+            } else {
+                quality
+            };
             let gpu = s
                 .gpu_cost
                 .summary()
@@ -658,6 +784,26 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: 
 pub const ACQUIRE_TIMEOUT_NS: u64 = 50_000_000;
 
 /// The worst of the two present results, so the game always learns about a stale or lost swapchain.
+/// Remembers which frame number the slot now holds.
+fn note_slot_frame(st: &mut GenState, slot_index: usize) {
+    st.frames += 1;
+    if st.slot_frames.len() <= slot_index {
+        st.slot_frames.resize(slot_index + 1, 0);
+    }
+    st.slot_frames[slot_index] = st.frames;
+}
+
+/// The counts of the newest frame whose slot has finished: `(finished, frame number, counts)` per
+/// slot. `None` when no slot has finished or the newest finished one has no counts.
+pub fn newest_ready_counts(slots: &[(bool, u64, Option<ChangeCounts>)]) -> Option<ChangeCounts> {
+    slots.iter().filter(|s| s.0 && s.1 > 0).max_by_key(|s| s.1).and_then(|s| s.2)
+}
+
+/// The log line's change fields.
+pub fn change_suffix(cuts: u64, still: u64) -> String {
+    format!(", cuts {cuts}, still {still}")
+}
+
 /// The image semaphores a generated present signals: the spare image's (shown first) and the game
 /// image's. `None` when an index is out of range or both name the same image.
 pub fn present_semaphore_indices(images: usize, spare: u32, game: u32) -> Option<(usize, usize)> {
@@ -712,6 +858,22 @@ mod tests {
         assert_eq!(combine_present_results(R::ERROR_OUT_OF_DATE_KHR, R::ERROR_DEVICE_LOST), R::ERROR_DEVICE_LOST);
         assert_eq!(combine_present_results(R::SUCCESS, R::SUCCESS), R::SUCCESS);
         assert_eq!(combine_present_results(R::ERROR_SURFACE_LOST_KHR, R::SUBOPTIMAL_KHR), R::ERROR_SURFACE_LOST_KHR);
+    }
+
+    #[test]
+    fn newest_ready_slot_counts() {
+        use haqengine_core::frame_change::ChangeCounts;
+        let c = |n: u32| Some(ChangeCounts { disagree: n, still: 0, pixels: 100 });
+        assert_eq!(newest_ready_counts(&[(true, 5, c(1)), (true, 7, c(2)), (false, 9, c(3))]), c(2));
+        assert_eq!(newest_ready_counts(&[(false, 5, c(1)), (false, 7, c(2))]), None);
+        assert_eq!(newest_ready_counts(&[(true, 8, None), (true, 7, c(4))]), None, "the newest ready frame has no counts");
+        assert_eq!(newest_ready_counts(&[]), None);
+    }
+
+    #[test]
+    fn log_line_shows_cuts_and_still() {
+        assert_eq!(change_suffix(3, 41), ", cuts 3, still 41");
+        assert_eq!(change_suffix(0, 0), ", cuts 0, still 0");
     }
 
     #[test]

@@ -66,7 +66,14 @@ const PYR_BASE: usize = 3;
 const FLOW_BASE: usize = PYR_BASE + 2 * LEVELS;
 const MEDIAN_BASE: usize = FLOW_BASE + LEVELS;
 const DUMMY: usize = MEDIAN_BASE + LEVELS - 1;
-const IMAGE_COUNT: usize = DUMMY + 1;
+const COUNTERS: usize = DUMMY + 1;
+const IMAGE_COUNT: usize = COUNTERS + 1;
+/// Bytes per frame slot of the change-count readback.
+const READBACK_STRIDE: usize = 16;
+
+/// The readback's mapping; only touched under the swapchain's state lock.
+struct Mapped(*mut u8);
+unsafe impl Send for Mapped {}
 
 fn pyr(parity: usize, level: usize) -> usize {
     PYR_BASE + parity * LEVELS + level
@@ -90,6 +97,11 @@ pub struct BatteryResources {
     match_sets: [[vk::DescriptorSet; LEVELS]; 2],
     median_sets: [vk::DescriptorSet; LEVELS - 1],
     warp_sets: [vk::DescriptorSet; 2],
+    fixup_sets: [vk::DescriptorSet; 2],
+    readback: vk::Buffer,
+    readback_memory: vk::DeviceMemory,
+    mapped: Mapped,
+    readback_valid: Vec<bool>,
     extent: vk::Extent2D,
     format: PackedFormat,
     parity: Parity,
@@ -268,6 +280,7 @@ impl BatteryResources {
         pipelines: &Pipelines,
         extent: vk::Extent2D,
         format: PackedFormat,
+        slots: usize,
     ) -> Result<BatteryResources, vk::Result> {
         let d = &device.device;
         let memory = device.instance.instance.get_physical_device_memory_properties(device.physical_device);
@@ -289,6 +302,7 @@ impl BatteryResources {
             specs.push((vk::Format::R32G32_SFLOAT, w, h));
         }
         specs.push((vk::Format::R32G32_SFLOAT, 1, 1));
+        specs.push((vk::Format::R32_UINT, 2, 1));
         let mut images: Vec<BatImage> = Vec::with_capacity(IMAGE_COUNT);
         for (f, w, h) in specs {
             match create_image(d, &memory, f, w, h) {
@@ -317,9 +331,10 @@ impl BatteryResources {
             let matching = allocate(d, pool, &pipelines.block_match, 2 * LEVELS)?;
             let median = allocate(d, pool, &pipelines.median, LEVELS - 1)?;
             let warp = allocate(d, pool, &pipelines.warp, 2)?;
-            Ok((luma, reduce, matching, median, warp))
+            let fixup = allocate(d, pool, &pipelines.fixup, 2)?;
+            Ok((luma, reduce, matching, median, warp, fixup))
         })();
-        let (luma, reduce, matching, median, warp) = match sets {
+        let (luma, reduce, matching, median, warp, fixup) = match sets {
             Ok(s) => s,
             Err(e) => {
                 d.destroy_descriptor_pool(pool, None);
@@ -337,6 +352,11 @@ impl BatteryResources {
             match_sets: [[vk::DescriptorSet::null(); LEVELS]; 2],
             median_sets: [vk::DescriptorSet::null(); LEVELS - 1],
             warp_sets: [warp[0], warp[1]],
+            fixup_sets: [fixup[0], fixup[1]],
+            readback: vk::Buffer::null(),
+            readback_memory: vk::DeviceMemory::null(),
+            mapped: Mapped(std::ptr::null_mut()),
+            readback_valid: vec![false; slots],
             extent,
             format,
             parity: Parity::new(),
@@ -353,7 +373,39 @@ impl BatteryResources {
         }
         res.median_sets.copy_from_slice(&median[..LEVELS - 1]);
         res.write_sets(d);
+        if let Err(e) = res.create_readback(d, &memory) {
+            res.destroy(d);
+            return Err(e);
+        }
         Ok(res)
+    }
+
+    unsafe fn create_readback(&mut self, d: &ash::Device, memory: &vk::PhysicalDeviceMemoryProperties) -> Result<(), vk::Result> {
+        let size = (self.readback_valid.len().max(1) * READBACK_STRIDE) as u64;
+        self.readback = d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST), None)?;
+        let req = d.get_buffer_memory_requirements(self.readback);
+        let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let kind = (0..memory.memory_type_count)
+            .find(|&i| req.memory_type_bits & (1 << i) != 0 && memory.memory_types[i as usize].property_flags.contains(flags))
+            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        self.readback_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)?;
+        d.bind_buffer_memory(self.readback, self.readback_memory, 0)?;
+        self.mapped = Mapped(d.map_memory(self.readback_memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u8);
+        Ok(())
+    }
+
+    /// The change counts of the frame last recorded in `slot`, once that slot's fence has
+    /// signalled; `None` before the slot was ever used.
+    pub fn counts(&self, slot: usize) -> Option<haqengine_core::frame_change::ChangeCounts> {
+        if !self.readback_valid.get(slot).copied().unwrap_or(false) || self.mapped.0.is_null() {
+            return None;
+        }
+        let words = unsafe { std::slice::from_raw_parts(self.mapped.0.add(slot * READBACK_STRIDE) as *const u32, 2) };
+        Some(haqengine_core::frame_change::ChangeCounts {
+            disagree: words[0],
+            still: words[1],
+            pixels: self.extent.width * self.extent.height,
+        })
     }
 
     unsafe fn write_sets(&self, d: &ash::Device) {
@@ -368,7 +420,8 @@ impl BatteryResources {
                 let coarse = if l + 1 < LEVELS { v(MEDIAN_BASE + l) } else { v(DUMMY) };
                 write_set(d, set, &[v(pyr(q, l)), v(pyr(p, l)), coarse, v(FLOW_BASE + l)]);
             }
-            write_set(d, self.warp_sets[p], &[v(q), v(p), v(FLOW_BASE), v(RAW_OUT), v(pyr(q, 0)), v(pyr(p, 0))]);
+            write_set(d, self.warp_sets[p], &[v(q), v(p), v(FLOW_BASE), v(RAW_OUT), v(pyr(q, 0)), v(pyr(p, 0)), v(COUNTERS)]);
+            write_set(d, self.fixup_sets[p], &[v(COUNTERS), v(p), v(RAW_OUT)]);
         }
         for l in 1..LEVELS {
             write_set(d, self.median_sets[l - 1], &[v(FLOW_BASE + l), v(MEDIAN_BASE + l - 1)]);
@@ -378,6 +431,15 @@ impl BatteryResources {
     /// # Safety
     /// The GPU must be done with these resources.
     pub unsafe fn destroy(&self, d: &ash::Device) {
+        if !self.mapped.0.is_null() {
+            d.unmap_memory(self.readback_memory);
+        }
+        if self.readback != vk::Buffer::null() {
+            d.destroy_buffer(self.readback, None);
+        }
+        if self.readback_memory != vk::DeviceMemory::null() {
+            d.free_memory(self.readback_memory, None);
+        }
         d.destroy_descriptor_pool(self.pool, None);
         for img in &self.images {
             destroy_image(d, img);
@@ -390,7 +452,15 @@ impl BatteryResources {
     ///
     /// # Safety
     /// `cmd` must be recording; `game` and `spare` must be images of this swapchain.
-    pub unsafe fn record(&mut self, d: &ash::Device, cmd: vk::CommandBuffer, p: &Pipelines, game: vk::Image, spare: vk::Image) -> BatteryStep {
+    pub unsafe fn record(
+        &mut self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        p: &Pipelines,
+        game: vk::Image,
+        spare: Option<vk::Image>,
+        slot: usize,
+    ) -> BatteryStep {
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as S};
         if !self.initialized {
             let barriers: Vec<vk::ImageMemoryBarrier> = self
@@ -433,7 +503,9 @@ impl BatteryResources {
             dispatch(d, cmd, &p.reduce, self.reduce_sets[cur][l - 1], &push2(iw.to_le_bytes(), ih.to_le_bytes()), groups(levels[l].0, levels[l].1));
         }
 
-        image_barrier(d, cmd, spare, L::UNDEFINED, L::TRANSFER_DST_OPTIMAL, A::empty(), A::TRANSFER_WRITE, S::TRANSFER, S::TRANSFER);
+        if let Some(spare) = spare {
+            image_barrier(d, cmd, spare, L::UNDEFINED, L::TRANSFER_DST_OPTIMAL, A::empty(), A::TRANSFER_WRITE, S::TRANSFER, S::TRANSFER);
+        }
         if step == BatteryStep::Interpolate {
             for l in (0..LEVELS).rev() {
                 memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
@@ -456,7 +528,9 @@ impl BatteryResources {
                     dispatch(d, cmd, &p.median, self.median_sets[l - 1], &push2(bw.to_le_bytes(), bh.to_le_bytes()), groups(bw, bh));
                 }
             }
-            memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
+            memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
+            d.cmd_clear_color_image(cmd, self.images[COUNTERS].image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
+            memory_barrier(d, cmd, S::TRANSFER, S::COMPUTE_SHADER);
             let push = push6([
                 w.to_le_bytes(),
                 h.to_le_bytes(),
@@ -466,12 +540,34 @@ impl BatteryResources {
                 fmt.to_le_bytes(),
             ]);
             dispatch(d, cmd, &p.warp, self.warp_sets[cur], &push, groups(w, h));
+            memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
+            let threshold = haqengine_core::frame_change::cut_threshold_pixels(w * h);
+            dispatch(d, cmd, &p.fixup, self.fixup_sets[cur], &push3(w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes()), groups(w, h));
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
-            d.cmd_copy_image(cmd, self.images[RAW_OUT].image, L::GENERAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
+            if slot < self.readback_valid.len() {
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset((slot * READBACK_STRIDE) as u64)
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                    .image_extent(vk::Extent3D { width: 2, height: 1, depth: 1 });
+                d.cmd_copy_image_to_buffer(cmd, self.images[COUNTERS].image, L::GENERAL, self.readback, &[region]);
+                let to_host = vk::MemoryBarrier::default().src_access_mask(A::TRANSFER_WRITE).dst_access_mask(A::HOST_READ);
+                d.cmd_pipeline_barrier(cmd, S::TRANSFER, S::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
+                self.readback_valid[slot] = true;
+            }
+            if let Some(spare) = spare {
+                d.cmd_copy_image(cmd, self.images[RAW_OUT].image, L::GENERAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
+            }
         } else {
-            d.cmd_copy_image(cmd, game, L::TRANSFER_SRC_OPTIMAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
+            if slot < self.readback_valid.len() {
+                self.readback_valid[slot] = false;
+            }
+            if let Some(spare) = spare {
+                d.cmd_copy_image(cmd, game, L::TRANSFER_SRC_OPTIMAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
+            }
         }
-        image_barrier(d, cmd, spare, L::TRANSFER_DST_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_WRITE, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
+        if let Some(spare) = spare {
+            image_barrier(d, cmd, spare, L::TRANSFER_DST_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_WRITE, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
+        }
         image_barrier(d, cmd, game, L::TRANSFER_SRC_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_READ, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
         step
     }

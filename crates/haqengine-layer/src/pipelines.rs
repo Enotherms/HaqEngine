@@ -3,7 +3,7 @@
 use ash::vk;
 use haqengine_core::PackedFormat;
 use haqengine_shaders::{
-    BindingKind, Fsr3Pass, Shader, BATTERY_BLEND_PACKED, BLOCK_MATCH, FI_BLEND_PACKED, FLOW_MEDIAN, LUMA_DOWNSAMPLE_PACKED,
+    BindingKind, Fsr3Pass, Shader, BATTERY_BLEND_PACKED, BLOCK_MATCH, CUT_FIXUP, FI_BLEND_PACKED, FLOW_MEDIAN, LUMA_DOWNSAMPLE_PACKED,
     LUMA_REDUCE, OF_PASSES,
 };
 
@@ -33,6 +33,7 @@ pub struct Pipelines {
     pub block_match: Pass,
     pub median: Pass,
     pub warp: Pass,
+    pub fixup: Pass,
 }
 
 fn spirv_words(bytes: &[u8]) -> Vec<u32> {
@@ -101,13 +102,14 @@ impl Pipelines {
     /// # Safety
     /// `d` must be a live device.
     pub unsafe fn create(d: &ash::Device) -> Result<Pipelines, vk::Result> {
-        let mut made: Vec<Pass> = Vec::with_capacity(5);
-        let specs: [(&Shader, u32, u32); 5] = [
+        let mut made: Vec<Pass> = Vec::with_capacity(6);
+        let specs: [(&Shader, u32, u32); 6] = [
             (&LUMA_DOWNSAMPLE_PACKED, 2, 12),
             (&LUMA_REDUCE, 2, 8),
             (&BLOCK_MATCH, 4, 24),
             (&FLOW_MEDIAN, 2, 8),
-            (&BATTERY_BLEND_PACKED, 6, 24),
+            (&BATTERY_BLEND_PACKED, 7, 24),
+            (&CUT_FIXUP, 3, 12),
         ];
         for (shader, bindings, push) in specs {
             match create_pass(d, shader, bindings, push) {
@@ -121,14 +123,14 @@ impl Pipelines {
             }
         }
         let mut it = made.into_iter();
-        let mut next = || it.next().expect("five passes were created");
-        Ok(Pipelines { luma: next(), reduce: next(), block_match: next(), median: next(), warp: next() })
+        let mut next = || it.next().expect("six passes were created");
+        Ok(Pipelines { luma: next(), reduce: next(), block_match: next(), median: next(), warp: next(), fixup: next() })
     }
 
     /// # Safety
     /// `d` must be the device the pipelines were created on, idle for these pipelines.
     pub unsafe fn destroy(&self, d: &ash::Device) {
-        for p in [&self.luma, &self.reduce, &self.block_match, &self.median, &self.warp] {
+        for p in [&self.luma, &self.reduce, &self.block_match, &self.median, &self.warp, &self.fixup] {
             destroy_pass(d, p);
         }
     }
