@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: &[&str] = &["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed", "of_luma_half", "fi_blend", "fi_blend_packed", "battery_blend_packed"];
+const SHADERS: &[&str] = &["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed", "of_luma_half", "fi_blend", "fi_blend_packed", "battery_blend_packed", "cut_fixup"];
 
 const FSR3_PASSES: &[(&str, &str, &str)] = &[
     ("of_prepare_luma", "opticalflow", "ffx_opticalflow_prepare_luma_pass"),

@@ -1197,6 +1197,57 @@ fn interp_pipeline_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(fsr3_result(us))
 }
 
+/// The new blend with its change counters, then the cut fixup; returns the output, the counts and
+/// the GPU time of both passes.
+#[allow(clippy::too_many_arguments)]
+fn run_battery_blend(
+    gpu: &Gpu,
+    f: PackedFormat,
+    prev: &StorageImage,
+    cur: &StorageImage,
+    flow_img: &StorageImage,
+    prev_luma: &StorageImage,
+    cur_luma: &StorageImage,
+    t: f32,
+) -> Result<(Image<u32>, haqengine_core::frame_change::ChangeCounts, f64), String> {
+    let dst = gpu.create_storage_image(vk::Format::R32_UINT, prev.width, prev.height)?;
+    let counters = match gpu.create_storage_image(vk::Format::R32_UINT, 2, 1) {
+        Ok(c) => c,
+        Err(e) => {
+            gpu.destroy_image(dst);
+            return Err(e);
+        }
+    };
+    let result = (|| {
+        gpu.clear_u32(&dst, CANARY_U32)?;
+        gpu.clear_u32(&counters, 0)?;
+        let push = push_bytes(&[
+            prev.width.to_le_bytes(),
+            prev.height.to_le_bytes(),
+            flow_img.width.to_le_bytes(),
+            flow_img.height.to_le_bytes(),
+            t.to_le_bytes(),
+            f.code().to_le_bytes(),
+        ]);
+        let mut us = gpu.run(
+            &haqengine_shaders::BATTERY_BLEND_PACKED,
+            &[prev, cur, flow_img, &dst, prev_luma, cur_luma, &counters],
+            &push,
+            groups(prev.width, prev.height),
+        )?;
+        let pixels = prev.width * prev.height;
+        let threshold = haqengine_core::frame_change::cut_threshold_pixels(pixels);
+        let fix_push = push_bytes(&[prev.width.to_le_bytes(), prev.height.to_le_bytes(), threshold.to_le_bytes()]);
+        us += gpu.run(&haqengine_shaders::CUT_FIXUP, &[&counters, cur, &dst], &fix_push, groups(prev.width, prev.height))?;
+        let c = gpu.read_u32(&counters)?;
+        let counts = haqengine_core::frame_change::ChangeCounts { disagree: c.data[0], still: c.data[1], pixels };
+        Ok((gpu.read_u32(&dst)?, counts, us))
+    })();
+    gpu.destroy_image(dst);
+    gpu.destroy_image(counters);
+    result
+}
+
 /// One frame pair through Battery on the GPU: its flow, then M3c's warp and the new blend.
 struct BatteryPair {
     old: Image<Rgba8>,
@@ -1207,6 +1258,7 @@ struct BatteryPair {
     cur_luma: Image<f32>,
     flow_us: f64,
     blend_us: f64,
+    counts: haqengine_core::frame_change::ChangeCounts,
 }
 
 fn unpack_image(f: PackedFormat, img: &Image<u32>) -> Image<Rgba8> {
@@ -1241,25 +1293,16 @@ fn battery_pair_at(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<
         let flows = gpu_flows(gpu, &fp, &fc, &mut flow_us)?;
         let run = || -> Result<_, String> {
             let (old, _) = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
-            let (new, blend_us) = run_warp_packed_with(
-                gpu,
-                &haqengine_shaders::BATTERY_BLEND_PACKED,
-                f,
-                &fp.color,
-                &fc.color,
-                &flows.images[0],
-                &fp.levels[0],
-                &fc.levels[0],
-                t,
-            )?;
-            Ok((old, new, blend_us, gpu.read_rg32f(&flows.images[0])?, gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?))
+            let (new, counts, blend_us) =
+                run_battery_blend(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
+            Ok((old, new, counts, blend_us, gpu.read_rg32f(&flows.images[0])?, gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?))
         };
         let r = run();
         for img in flows.images {
             gpu.destroy_image(img);
         }
-        let (old, new, blend_us, flow, prev_luma, cur_luma) = r?;
-        Ok(BatteryPair { old: unpack_image(f, &old), new_rgba: unpack_image(f, &new), new, flow, prev_luma, cur_luma, flow_us, blend_us })
+        let (old, new, counts, blend_us, flow, prev_luma, cur_luma) = r?;
+        Ok(BatteryPair { old: unpack_image(f, &old), new_rgba: unpack_image(f, &new), new, flow, prev_luma, cur_luma, flow_us, blend_us, counts })
     })();
     fp.destroy(gpu);
     fc.destroy(gpu);
@@ -1276,6 +1319,75 @@ fn battery_parity_case(gpu: &Gpu, f: PackedFormat, width: u32, height: u32, t: f
     let (pp, cp) = (packed::to_packed(f, &frames[0]), packed::to_packed(f, &frames[1]));
     let (expected, _) = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, t);
     Ok(CaseResult { report: packed::compare_packed(f, &expected, &pair.new, 1.0), gpu_us: pair.blend_us, tolerance: 1.0 })
+}
+
+/// GPU counts and output must equal the CPU reference fed with the GPU's flow and luma.
+fn battery_counts_parity(gpu: &Gpu, prev: &Image<Rgba8>, cur: &Image<Rgba8>) -> Result<CompareReport, String> {
+    let f = BF;
+    let pair = battery_pair(gpu, f, prev, cur)?;
+    let (pp, cp) = (packed::to_packed(f, prev), packed::to_packed(f, cur));
+    let (expected, counts) = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, 0.5);
+    if counts != pair.counts {
+        return Err(format!("counts: GPU {:?}, CPU {counts:?}", pair.counts));
+    }
+    Ok(packed::compare_packed(f, &expected, &pair.new, 1.0))
+}
+
+fn battery_counts_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let mut reports = Vec::new();
+    for (w, h) in [(1280u32, 800u32), (1283, 797)] {
+        let pan = pan_frames(w, h, 12, -8, 1, 261);
+        reports.push(battery_counts_parity(gpu, &pan[0], &pan[1])?);
+        reports.push(battery_counts_parity(gpu, &pan[0], &gradient(w, h))?);
+        reports.push(battery_counts_parity(gpu, &pan[0], &pan[0])?);
+    }
+    Ok(CaseResult { report: merge(&reports), gpu_us: 0.0, tolerance: 1.0 })
+}
+
+fn battery_cut_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let a = pan_frames(1280, 800, 12, -8, 1, 271).remove(0);
+    let b = gradient(1280, 800);
+    let pair = battery_pair(gpu, BF, &a, &b)?;
+    println!("      cut: {:?}", pair.counts);
+    if !haqengine_core::frame_change::is_cut(&pair.counts) {
+        return Err(format!("not detected as a cut: {:?}", pair.counts));
+    }
+    let differs = pair.new_rgba.data.iter().zip(&b.data).filter(|(o, c)| o[..3] != c[..3]).count();
+    if differs > 0 {
+        return Err(format!("cut: {differs} pixels are not the new frame"));
+    }
+    Ok(battery_result(pair.blend_us))
+}
+
+fn battery_flash_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let a = pan_frames(1280, 800, 0, 0, 1, 281).remove(0);
+    let mut b = a.clone();
+    for y in 0..800 {
+        for x in 768..1280 {
+            let p = a.get(x, y);
+            b.set(x, y, [p[0].saturating_add(80), p[1].saturating_add(80), p[2].saturating_add(80), 255]);
+        }
+    }
+    let pair = battery_pair(gpu, BF, &a, &b)?;
+    println!("      flash: {:?}", pair.counts);
+    if haqengine_core::frame_change::is_cut(&pair.counts) {
+        return Err(format!("a 40% flash counted as a cut: {:?}", pair.counts));
+    }
+    Ok(battery_result(pair.blend_us))
+}
+
+fn battery_still_pan_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let frames = pan_frames(1280, 800, 1, 0, 1, 291);
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    println!("      1 px pan: {:?}", pair.counts);
+    if haqengine_core::frame_change::is_still(&pair.counts) {
+        return Err(format!("a 1 px pan counted as still: {:?}", pair.counts));
+    }
+    let same = battery_pair(gpu, BF, &frames[0], &frames[0])?;
+    if !haqengine_core::frame_change::is_still(&same.counts) {
+        return Err(format!("identical frames not still: {:?}", same.counts));
+    }
+    Ok(battery_result(pair.blend_us))
 }
 
 fn battery_result(us: f64) -> CaseResult {
@@ -1609,6 +1721,10 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("battery blend no ghosts", battery_ghost_case),
         case("battery blend menu fade", battery_menu_case),
         case("battery blend pipeline total", battery_total_case),
+        case("battery counts match CPU", battery_counts_case),
+        case("battery cut takes the new frame", battery_cut_case),
+        case("battery cut flash is not a cut", battery_flash_case),
+        case("battery still counts on a 1 px pan", battery_still_pan_case),
     ]);
     if self_test_fail {
         cases.push(case("blend self-test (must fail)", |g| {
@@ -1702,6 +1818,10 @@ mod tests {
             "battery blend no ghosts",
             "battery blend menu fade",
             "battery blend pipeline total",
+            "battery counts match CPU",
+            "battery cut takes the new frame",
+            "battery cut flash is not a cut",
+            "battery still counts on a 1 px pan",
         ] {
             assert!(names.contains(&required), "missing case {required}");
         }

@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D counters;
+layout(set = 0, binding = 1, r32ui) uniform readonly uimage2D cur_frame;
+layout(set = 0, binding = 2, r32ui) uniform writeonly uimage2D dst;
+
+layout(push_constant) uniform Push {
+    uint w;
+    uint h;
+    uint cut_threshold;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.w) || p.y >= int(pc.h)) {
+        return;
+    }
+    if (imageLoad(counters, ivec2(0, 0)).r <= pc.cut_threshold) {
+        return;
+    }
+    imageStore(dst, p, uvec4(imageLoad(cur_frame, p).r, 0u, 0u, 0u));
+}

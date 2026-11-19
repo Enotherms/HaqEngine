@@ -8,6 +8,7 @@ layout(set = 0, binding = 2, rg32f) uniform readonly image2D flow;
 layout(set = 0, binding = 3, r32ui) uniform writeonly uimage2D dst;
 layout(set = 0, binding = 4, r32f) uniform readonly image2D prev_luma;
 layout(set = 0, binding = 5, r32f) uniform readonly image2D cur_luma;
+layout(set = 0, binding = 6, r32ui) uniform uimage2D counters;
 
 layout(push_constant) uniform Push {
     uint w;
@@ -81,6 +82,8 @@ vec2 vector_at(ivec2 block) {
 
 shared int win_prev[6][8][8];
 shared int win_cur[6][8][8];
+shared uint group_disagree;
+shared uint group_still;
 
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -92,6 +95,10 @@ void main() {
             imageStore(dst, p, uvec4(w, 0u, 0u, 0u));
         }
         return;
+    }
+    if (gl_LocalInvocationIndex == 0u) {
+        group_disagree = 0u;
+        group_still = 0u;
     }
     ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8;
     ivec2 own = min(origin / BLOCK, ivec2(int(pc.flow_w) - 1, int(pc.flow_h) - 1));
@@ -123,9 +130,7 @@ void main() {
         win_cur[i][l.y][l.x] = luma_at(false, base_cur[i] + l);
     }
     barrier();
-    if (!inside) {
-        return;
-    }
+    if (inside) {
     vec2 pf = vec2(p);
     uint best_cost = 0xFFFFFFFFu;
     vec2 best = vec2(0.0);
@@ -148,4 +153,20 @@ void main() {
     vec4 b = bilinear(false, pf + (1.0 - pc.t) * best);
     vec3 c = best_cost > DISAGREE8 ? (pc.t >= 0.5 ? b.rgb : a.rgb) : a.rgb * (1.0 - pc.t) + b.rgb * pc.t;
     imageStore(dst, p, uvec4(pack_pixel(vec4(c, 1.0)), 0u, 0u, 0u));
+    if (best_cost > DISAGREE8) {
+        atomicAdd(group_disagree, 1u);
+    }
+    if (best_cost == 0u && best == vec2(0.0)) {
+        atomicAdd(group_still, 1u);
+    }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (group_disagree > 0u) {
+            imageAtomicAdd(counters, ivec2(0, 0), group_disagree);
+        }
+        if (group_still > 0u) {
+            imageAtomicAdd(counters, ivec2(1, 0), group_still);
+        }
+    }
 }

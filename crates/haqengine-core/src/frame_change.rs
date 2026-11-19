@@ -19,6 +19,12 @@ pub fn is_cut(c: &ChangeCounts) -> bool {
     c.pixels > 0 && c.disagree as f32 > CUT_FRACTION * c.pixels as f32
 }
 
+/// The disagreeing-pixel count above which a frame of `pixels` is a cut, as an integer for the GPU:
+/// `disagree > cut_threshold_pixels(pixels)` exactly when `is_cut`.
+pub fn cut_threshold_pixels(pixels: u32) -> u32 {
+    (CUT_FRACTION * pixels as f32) as u32
+}
+
 /// At least `STILL_FRACTION` of the pixels did not change at all.
 pub fn is_still(c: &ChangeCounts) -> bool {
     c.pixels > 0 && c.still as f32 >= STILL_FRACTION * c.pixels as f32
@@ -60,6 +66,16 @@ mod tests {
         assert!(!is_still(&counts(0, 994)));
         assert!(is_still(&counts(0, 995)));
         assert!(!is_cut(&ChangeCounts::default()) && !is_still(&ChangeCounts::default()));
+    }
+
+    #[test]
+    fn integer_cut_threshold_agrees() {
+        for pixels in [1000u32, 1280 * 800, 1283 * 797, 7] {
+            let t = cut_threshold_pixels(pixels);
+            for d in [t.saturating_sub(1), t, t + 1] {
+                assert_eq!(d > t, is_cut(&ChangeCounts { disagree: d, still: 0, pixels }), "{pixels} {d}");
+            }
+        }
     }
 
     #[test]
