@@ -450,16 +450,11 @@ impl FrameGen {
             st.window_buckets.add(&c);
         }
         let Some(ready) = st.ready.as_ref() else { return false };
-        let slots: Vec<(bool, u64, Option<ChangeCounts>)> = ready
-            .slots
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let done = i == slot_index || d.get_fence_status(s.fence).unwrap_or(false);
-                (done, st.slot_frames.get(i).copied().unwrap_or(0), battery.counts(i))
-            })
-            .collect();
-        let counts = newest_ready_counts(&slots);
+        let slots = ready.slots.iter().enumerate().map(|(i, s)| {
+            let done = i == slot_index || d.get_fence_status(s.fence).unwrap_or(false);
+            (done, st.slot_frames.get(i).copied().unwrap_or(0), battery.counts(i))
+        });
+        let counts = newest_ready_counts(slots);
         st.still.observe(counts)
     }
 
@@ -801,9 +796,10 @@ fn note_slot_frame(st: &mut GenState, slot_index: usize) {
 }
 
 /// The counts of the newest frame whose slot has finished: `(finished, frame number, counts)` per
-/// slot. `None` when no slot has finished or the newest finished one has no counts.
-pub fn newest_ready_counts(slots: &[(bool, u64, Option<ChangeCounts>)]) -> Option<ChangeCounts> {
-    slots.iter().filter(|s| s.0 && s.1 > 0).max_by_key(|s| s.1).and_then(|s| s.2)
+/// slot. `None` when no slot has finished or the newest finished one has no counts. Takes an
+/// iterator so a present allocates nothing.
+pub fn newest_ready_counts(slots: impl Iterator<Item = (bool, u64, Option<ChangeCounts>)>) -> Option<ChangeCounts> {
+    slots.filter(|s| s.0 && s.1 > 0).max_by_key(|s| s.1).and_then(|s| s.2)
 }
 
 /// The log line's change fields.
@@ -871,10 +867,11 @@ mod tests {
     fn newest_ready_slot_counts() {
         use haqengine_core::frame_change::ChangeCounts;
         let c = |n: u32| Some(ChangeCounts { disagree: n, still: 0, pixels: 100 });
-        assert_eq!(newest_ready_counts(&[(true, 5, c(1)), (true, 7, c(2)), (false, 9, c(3))]), c(2));
-        assert_eq!(newest_ready_counts(&[(false, 5, c(1)), (false, 7, c(2))]), None);
-        assert_eq!(newest_ready_counts(&[(true, 8, None), (true, 7, c(4))]), None, "the newest ready frame has no counts");
-        assert_eq!(newest_ready_counts(&[]), None);
+        let n = |slots: &[(bool, u64, Option<ChangeCounts>)]| newest_ready_counts(slots.iter().copied());
+        assert_eq!(n(&[(true, 5, c(1)), (true, 7, c(2)), (false, 9, c(3))]), c(2));
+        assert_eq!(n(&[(false, 5, c(1)), (false, 7, c(2))]), None);
+        assert_eq!(n(&[(true, 8, None), (true, 7, c(4))]), None, "the newest ready frame has no counts");
+        assert_eq!(n(&[]), None);
     }
 
     #[test]
