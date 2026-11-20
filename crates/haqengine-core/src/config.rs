@@ -61,8 +61,8 @@ fn parse_value(raw: &str) -> Option<Value> {
 
 /// Parses the supported subset of TOML: `[default]` and `[game."name"]` sections holding
 /// `mode = "battery" | "copy" | "quality"` and `multiplier = 1..=4`, with `#` comments. Unknown
-/// sections and keys, and out-of-range values, are skipped with a note; a malformed line is an
-/// error naming its line number.
+/// sections and keys are skipped with a note; a malformed line or a bad mode or multiplier is an
+/// error naming its line number, so a half-finished edit never replaces good settings.
 pub fn parse_config(text: &str) -> Result<(FileConfig, Vec<String>), String> {
     let mut config = FileConfig::default();
     let mut notes = Vec::new();
@@ -97,10 +97,10 @@ pub fn parse_config(text: &str) -> Result<(FileConfig, Vec<String>), String> {
         match (key, value) {
             ("mode", Value::Text(t)) => match parse_mode(&t) {
                 Some(m) => profile.mode = Some(m),
-                None => notes.push(format!("config line {n}: unknown mode {t:?} ignored")),
+                None => return Err(format!("line {n}: unknown mode {t:?}")),
             },
             ("multiplier", Value::Number(m)) if (1..=MAX_MULTIPLIER as i64).contains(&m) => profile.multiplier = Some(m as u32),
-            ("mode" | "multiplier", _) => notes.push(format!("config line {n}: bad {key} ignored")),
+            ("mode" | "multiplier", _) => return Err(format!("line {n}: bad {key}, expected mode = \"battery\" | \"copy\" | \"quality\" or multiplier = 1..{MAX_MULTIPLIER}")),
             _ => notes.push(format!("config line {n}: unknown key {key:?} ignored")),
         }
     }
@@ -139,6 +139,59 @@ pub fn apply_reload(current: Live, reloaded: Result<Profile, String>, cap: u32) 
     let multiplier = wanted.min(cap.max(1));
     let note = (multiplier < wanted).then(|| format!("multiplier {wanted} applies after the game recreates its swapchain; using {multiplier}"));
     (Live { mode: profile.mode.unwrap_or(Mode::Battery), multiplier }, note)
+}
+
+/// The shortest time between two looks at the config file.
+pub const WATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Where the config file lives: `$XDG_CONFIG_HOME/haqengine/conf.toml`, else
+/// `$HOME/.config/haqengine/conf.toml`.
+pub fn config_path(get: impl Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    let non_empty = |k: &str| get(k).filter(|v| !v.is_empty());
+    non_empty("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| non_empty("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|base| base.join("haqengine/conf.toml"))
+}
+
+type Stamp = (std::time::SystemTime, u64);
+
+fn stamp(path: &std::path::Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// Notices edits to the config file by its timestamp and size, looking at most every
+/// `WATCH_EVERY` (no watcher thread).
+#[derive(Debug)]
+pub struct ConfigWatch {
+    path: std::path::PathBuf,
+    seen: Option<Stamp>,
+    next_look: std::time::Instant,
+}
+
+impl ConfigWatch {
+    /// Starts watching; the file as it is now counts as already read.
+    pub fn new(path: std::path::PathBuf, now: std::time::Instant) -> ConfigWatch {
+        let seen = stamp(&path);
+        ConfigWatch { path, seen, next_look: now + WATCH_EVERY }
+    }
+
+    /// The file's new contents when it changed since the last look. A removed or unreadable file
+    /// is not a change.
+    pub fn poll(&mut self, now: std::time::Instant) -> Option<String> {
+        if now < self.next_look {
+            return None;
+        }
+        self.next_look = now + WATCH_EVERY;
+        let current = stamp(&self.path)?;
+        if self.seen == Some(current) {
+            return None;
+        }
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        self.seen = Some(current);
+        Some(text)
+    }
 }
 
 #[cfg(test)]
@@ -182,10 +235,10 @@ mode = "quality"
     }
 
     #[test]
-    fn bad_values_are_notes_not_errors() {
-        let (c, notes) = parse_config("[default]\nmultiplier = 7\nmode = \"turbo\"\n").expect("parses");
-        assert_eq!(c.default, Profile::default());
-        assert_eq!(notes.len(), 2, "{notes:?}");
+    fn bad_values_reject_the_file() {
+        assert!(parse_config("[default]\nmultiplier = 7\n").unwrap_err().contains("line 2"));
+        assert!(parse_config("[default]\nmode = \"turbo\"\n").unwrap_err().contains("turbo"));
+        assert!(parse_config("[default]\nmode = 2\n").unwrap_err().contains("line 2"));
     }
 
     #[test]
@@ -257,5 +310,33 @@ mode = "quality"
         let (live, note) = apply_reload(current, Ok(Profile { mode: None, multiplier: Some(4) }), 2);
         assert_eq!(live.multiplier, 2);
         assert!(note.unwrap().contains("multiplier 4 applies after the game recreates its swapchain"));
+    }
+
+    #[test]
+    fn config_poll_throttles_and_detects_change() {
+        let dir = std::env::temp_dir().join(format!("haqengine-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("conf.toml");
+        std::fs::write(&path, "[default]\nmultiplier = 2\n").expect("write");
+        let t0 = std::time::Instant::now();
+        let mut w = ConfigWatch::new(path.clone(), t0);
+        assert_eq!(w.poll(t0 + WATCH_EVERY), None, "the file seen at start is not a change");
+        std::fs::write(&path, "[default]\nmultiplier = 3\n").expect("write");
+        assert_eq!(w.poll(t0 + WATCH_EVERY + WATCH_EVERY / 2), None, "throttled");
+        assert_eq!(w.poll(t0 + 2 * WATCH_EVERY).as_deref(), Some("[default]\nmultiplier = 3\n"));
+        assert_eq!(w.poll(t0 + 3 * WATCH_EVERY), None, "unchanged");
+        std::fs::remove_file(&path).expect("remove");
+        assert_eq!(w.poll(t0 + 4 * WATCH_EVERY), None, "a removed file changes nothing");
+        std::fs::write(&path, "[default]\nmode = \"copy\"\n").expect("write");
+        assert!(w.poll(t0 + 5 * WATCH_EVERY).is_some(), "a file created later is read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_path_prefers_xdg() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+        assert_eq!(config_path(env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")])), Some("/x/haqengine/conf.toml".into()));
+        assert_eq!(config_path(env(&[("HOME", "/h")])), Some("/h/.config/haqengine/conf.toml".into()));
+        assert_eq!(config_path(env(&[])), None);
     }
 }

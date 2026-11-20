@@ -9,7 +9,7 @@ use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
 use ash::vk;
 use ash::vk::Handle;
-use haqengine_core::{should_log, FrameStats, PackedFormat, MAX_GENERATED};
+use haqengine_core::{should_log, FrameStats, Mode, PackedFormat, MAX_GENERATED};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -90,6 +90,12 @@ pub struct GenState {
     pub window_still: u64,
     /// How still each frame was since the last log line.
     pub window_buckets: StillBuckets,
+    /// The engine this swapchain runs now (changes with a live config edit).
+    pub mode: Mode,
+    /// Frames per real frame now: the live setting, at most the swapchain's `multiplier`.
+    pub live_multiplier: u32,
+    /// The live-settings change counter last applied.
+    pub seen_generation: u64,
 }
 
 /// Which engine recorded a present.
@@ -103,10 +109,11 @@ pub enum Recorded {
 pub struct FrameGen {
     pub images: Vec<vk::Image>,
     pub extent: vk::Extent2D,
-    /// Battery mode's packed layout for this swapchain, or `None` for copy mode.
+    /// The packed layout Battery and Quality use for this swapchain, or `None` when its format
+    /// only allows copy mode.
     pub battery_format: Option<PackedFormat>,
-    /// Whether this swapchain runs Quality mode (falling back to Battery if it cannot start).
-    pub quality: bool,
+    /// Whether the device can run Quality mode.
+    pub quality_ok: bool,
     /// Frames shown per real frame this swapchain was created for (its extra images).
     pub multiplier: u32,
     pub disabled: AtomicBool,
@@ -118,14 +125,15 @@ impl FrameGen {
         images: Vec<vk::Image>,
         extent: vk::Extent2D,
         battery_format: Option<PackedFormat>,
-        quality: bool,
+        quality_ok: bool,
+        mode: Mode,
         multiplier: u32,
     ) -> FrameGen {
         FrameGen {
             images,
             extent,
             battery_format,
-            quality: quality && battery_format.is_some(),
+            quality_ok,
             multiplier,
             disabled: AtomicBool::new(false),
             state: Mutex::new(GenState {
@@ -151,6 +159,9 @@ impl FrameGen {
                 window_cuts: 0,
                 window_still: 0,
                 window_buckets: StillBuckets::default(),
+                mode: engine_mode(mode, battery_format.is_some(), quality_ok),
+                live_multiplier: multiplier,
+                seen_generation: crate::state::live().0,
             }),
         }
     }
@@ -287,8 +298,52 @@ impl FrameGen {
     /// Generated frames this present makes: the swapchain's count for Battery, one for Quality and
     /// copy mode.
     fn generated_now(&self, st: &GenState) -> usize {
-        let battery = self.battery_format.is_some() && !st.battery_failed && !(self.quality && !st.quality_failed);
-        if battery { self.max_generated() } else { 1 }
+        let quality = st.mode == Mode::Quality && !st.quality_failed;
+        let battery = st.mode != Mode::Copy && self.battery_format.is_some() && !st.battery_failed && !quality;
+        if battery { crate::battery::outputs_for_multiplier(st.live_multiplier).min(self.max_generated()) } else { 1 }
+    }
+
+    /// Applies a live config change to this swapchain: the multiplier at once (within what the
+    /// swapchain was created for), a mode change after the slots' work is done, freeing the
+    /// resources the new mode does not use.
+    unsafe fn apply_live(&self, st: &mut GenState, id: u64, device: &DeviceData, generation: u64, live: haqengine_core::config::Live) {
+        st.seen_generation = generation;
+        let m = effective_multiplier(live.multiplier, self.multiplier);
+        if m < live.multiplier {
+            LOG.log(&format!("swapchain {id}: multiplier {} applies after the game recreates its swapchain; using {m}", live.multiplier));
+        }
+        let mode = engine_mode(live.mode, self.battery_format.is_some(), self.quality_ok);
+        if live.mode == Mode::Quality && mode != Mode::Quality {
+            LOG.log(&format!("swapchain {id}: quality unavailable on this device or format; using {mode:?}"));
+        }
+        if mode != st.mode {
+            let (drop_battery, drop_quality) = mode_change_drops(st.mode, mode);
+            let d = &device.device;
+            if let Some(ready) = st.ready.as_ref() {
+                let fences: Vec<vk::Fence> = ready.slots.iter().map(|s| s.fence).collect();
+                if d.wait_for_fences(&fences, true, SLOT_WAIT_NS).is_err() {
+                    LOG.log(&format!("swapchain {id}: mode change waits for in-flight frames"));
+                    st.seen_generation = generation.wrapping_sub(1);
+                    return;
+                }
+            }
+            if drop_battery {
+                if let Some(b) = st.battery.take() {
+                    b.destroy(d);
+                }
+                st.battery_failed = false;
+            }
+            if drop_quality {
+                if let Some(q) = st.quality.take() {
+                    q.destroy(d);
+                }
+                st.quality_failed = false;
+            }
+            st.still = StillDetector::new();
+            st.mode = mode;
+        }
+        st.live_multiplier = m;
+        LOG.log(&format!("swapchain {id}: now {:?} {}x", st.mode, shown_multiplier(st.mode, m)));
     }
 
     /// Turns generation off for this swapchain and logs it once.
@@ -324,6 +379,14 @@ impl FrameGen {
             record(st, id, start, 0, skipped);
             r
         };
+        crate::state::poll_config(start);
+        let (generation, live) = crate::state::live();
+        if generation != st.seen_generation {
+            self.apply_live(&mut st, id, device, generation, live);
+        }
+        if st.live_multiplier < 2 {
+            return pass(&mut st, false);
+        }
         if pi.wait_semaphore_count as usize > MAX_WAITS {
             return pass(&mut st, true);
         }
@@ -485,7 +548,7 @@ impl FrameGen {
     /// Whether this present should skip generation because the screen has been still. Also counts
     /// the reused slot's frame as a cut when it was one. Battery swapchains only.
     unsafe fn still_screen(&self, st: &mut GenState, d: &ash::Device, slot_index: usize) -> bool {
-        if self.quality {
+        if st.mode != Mode::Battery {
             return false;
         }
         let Some(battery) = st.battery.as_ref() else { return false };
@@ -628,7 +691,7 @@ impl FrameGen {
     /// The device's Quality pipelines with this swapchain's resources created, or `None` when the
     /// swapchain does not run Quality (or after a creation failure, logged once; Battery takes over).
     unsafe fn quality_pipelines(&self, st: &mut GenState, id: u64, device: &DeviceData) -> Option<Arc<QualityPipelines>> {
-        if !self.quality || st.quality_failed {
+        if st.mode != Mode::Quality || st.quality_failed {
             return None;
         }
         let format = self.battery_format?;
@@ -661,7 +724,7 @@ impl FrameGen {
     /// mode (or after a creation failure, logged once).
     unsafe fn battery_pipelines(&self, st: &mut GenState, id: u64, device: &DeviceData) -> Option<Arc<Pipelines>> {
         let format = self.battery_format?;
-        if st.battery_failed {
+        if st.battery_failed || st.mode == Mode::Copy {
             return None;
         }
         let pipelines = match device.pipelines.get_or_init(|| Pipelines::create(&device.device).map(Arc::new)) {
@@ -856,6 +919,40 @@ pub fn change_suffix(cuts: u64, still: u64, buckets: &StillBuckets) -> String {
     format!(", cuts {cuts}, still {still}, {buckets}")
 }
 
+/// Frames per real frame a swapchain created for `created` runs when the live setting is `live`.
+pub fn effective_multiplier(live: u32, created: u32) -> u32 {
+    live.min(created)
+}
+
+/// Frames per real frame the engine `mode` shows at multiplier `m`: Quality and copy mode make
+/// one generated frame.
+pub fn shown_multiplier(mode: Mode, m: u32) -> u32 {
+    if mode == Mode::Battery { m } else { m.min(2) }
+}
+
+/// Which resources a switch from `from` to `to` frees: `(battery, quality)`. Copy mode keeps
+/// neither; Battery drops Quality's and Quality drops Battery's.
+pub fn mode_change_drops(from: Mode, to: Mode) -> (bool, bool) {
+    if from == to {
+        return (false, false);
+    }
+    match to {
+        Mode::Copy => (true, true),
+        Mode::Battery => (false, true),
+        Mode::Quality => (true, false),
+    }
+}
+
+/// The engine a swapchain can run for the requested mode: Quality needs the device's support
+/// (else Battery), and both need a packed layout for the swapchain's format (else copy).
+pub fn engine_mode(requested: Mode, battery_format: bool, quality_ok: bool) -> Mode {
+    match requested {
+        _ if !battery_format => Mode::Copy,
+        Mode::Quality if !quality_ok => Mode::Battery,
+        m => m,
+    }
+}
+
 /// The image semaphores a generated present signals, in present order: each spare image's, then
 /// the game image's (the entries after those are unused). `None` when there are no spares or more
 /// than `MAX_GENERATED`, or when an index is out of range or two are the same image.
@@ -957,6 +1054,42 @@ mod tests {
         assert_eq!(present_semaphore_indices(6, &[2, 2], 1), None);
         assert_eq!(present_semaphore_indices(6, &[], 1), None);
         assert_eq!(present_semaphore_indices(9, &[1, 2, 3, 4], 0), None);
+    }
+
+    #[test]
+    fn live_multiplier_change_applies_within_cap() {
+        assert_eq!(effective_multiplier(2, 3), 2);
+        assert_eq!(effective_multiplier(3, 3), 3);
+        assert_eq!(effective_multiplier(4, 3), 3);
+        assert_eq!(effective_multiplier(1, 3), 1);
+    }
+
+    #[test]
+    fn mode_change_marks_resources_for_rebuild() {
+        use haqengine_core::Mode;
+        assert_eq!(mode_change_drops(Mode::Battery, Mode::Battery), (false, false));
+        assert_eq!(mode_change_drops(Mode::Battery, Mode::Copy), (true, true));
+        assert_eq!(mode_change_drops(Mode::Quality, Mode::Battery), (false, true));
+        assert_eq!(mode_change_drops(Mode::Battery, Mode::Quality), (true, false));
+    }
+
+    #[test]
+    fn shown_multiplier_follows_the_engine() {
+        use haqengine_core::Mode;
+        assert_eq!(shown_multiplier(Mode::Battery, 3), 3);
+        assert_eq!(shown_multiplier(Mode::Copy, 3), 2);
+        assert_eq!(shown_multiplier(Mode::Quality, 4), 2);
+        assert_eq!(shown_multiplier(Mode::Copy, 1), 1);
+    }
+
+    #[test]
+    fn engine_mode_falls_back() {
+        use haqengine_core::Mode;
+        assert_eq!(engine_mode(Mode::Quality, true, true), Mode::Quality);
+        assert_eq!(engine_mode(Mode::Quality, true, false), Mode::Battery);
+        assert_eq!(engine_mode(Mode::Battery, false, true), Mode::Copy);
+        assert_eq!(engine_mode(Mode::Quality, false, true), Mode::Copy);
+        assert_eq!(engine_mode(Mode::Copy, true, true), Mode::Copy);
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct Settings {
     pub mode: Mode,
     /// Set when `HAQENGINE_MODE` held an unknown value.
     pub mode_note: Option<String>,
+    /// Notes from reading `conf.toml` at start.
+    pub config_notes: Vec<String>,
 }
 
 impl Settings {
@@ -52,7 +54,7 @@ impl Settings {
             Some("quality") => (Mode::Quality, None),
             Some(other) => (Mode::Battery, Some(format!("unknown HAQENGINE_MODE {other:?}; using battery"))),
         };
-        Settings { log_path, multiplier, multiplier_note, mode, mode_note }
+        Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new() }
     }
 }
 
@@ -77,7 +79,7 @@ impl Settings {
 impl Settings {
     /// Warnings about the environment, to log once when HaqEngine loads.
     pub fn notes(&self) -> Vec<String> {
-        self.mode_note.iter().chain(self.multiplier_note.iter()).cloned().collect()
+        self.mode_note.iter().chain(self.multiplier_note.iter()).chain(self.config_notes.iter()).cloned().collect()
     }
 }
 

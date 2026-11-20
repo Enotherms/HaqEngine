@@ -177,7 +177,7 @@ unsafe fn create_swapchain_inner(
         (r == vk::Result::SUCCESS)
             .then(|| {
                 let m = crate::plan::engine_multiplier(
-                    crate::state::SETTINGS.mode,
+                    crate::state::live_mode(),
                     packed_format(ci.image_format).is_some(),
                     data.quality.is_ok(),
                     multiplier(),
@@ -209,12 +209,15 @@ unsafe fn create_swapchain_inner(
                 Some(p) => p.reason,
             };
             let generate = plan.is_some_and(|p| p.generate) && r == vk::Result::SUCCESS && !images.is_empty();
-            let (battery_format, quality, engine) = match (crate::state::SETTINGS.mode, packed_format(ci.image_format)) {
-                (Mode::Copy, _) => (None, false, " copy (mode copy)".to_string()),
-                (Mode::Quality, Some(f)) if data.quality.is_ok() => (Some(f), true, " quality".to_string()),
-                (Mode::Quality, Some(f)) => (Some(f), false, " battery (quality unavailable)".to_string()),
-                (Mode::Battery, Some(f)) => (Some(f), false, " battery".to_string()),
-                (Mode::Battery | Mode::Quality, None) => (None, false, format!(" copy (format {:?} not supported)", ci.image_format)),
+            let battery_format = packed_format(ci.image_format);
+            let requested = crate::state::live_mode();
+            let mode = crate::framegen::engine_mode(requested, battery_format.is_some(), data.quality.is_ok());
+            let engine = match (requested, mode) {
+                (Mode::Copy, _) => " copy (mode copy)".to_string(),
+                (_, Mode::Quality) => " quality".to_string(),
+                (Mode::Quality, Mode::Battery) => " battery (quality unavailable)".to_string(),
+                (_, Mode::Battery) => " battery".to_string(),
+                (_, Mode::Copy) => format!(" copy (format {:?} not supported)", ci.image_format),
             };
             let engine = match plan {
                 Some(p) if generate => format!("{engine} {}x", p.multiplier),
@@ -245,7 +248,9 @@ unsafe fn create_swapchain_inner(
                     images: count,
                     presents: AtomicU64::new(0),
                     device: Some(Arc::clone(&data)),
-                    gen: generate.then(|| FrameGen::new(images, ci.image_extent, battery_format, quality, plan.map_or(1, |p| p.multiplier))),
+                    gen: generate.then(|| {
+                        FrameGen::new(images, ci.image_extent, battery_format, data.quality.is_ok(), mode, plan.map_or(1, |p| p.multiplier))
+                    }),
                     fifo_only_modes,
                 },
             );
