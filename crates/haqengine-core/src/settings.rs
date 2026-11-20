@@ -57,6 +57,24 @@ impl Settings {
 }
 
 impl Settings {
+    /// Settings from the environment over the config file's profile for `process`: a variable that
+    /// is set wins, otherwise the game's section, then `[default]`, then the built-in values.
+    pub fn from_lookup_and_file(get: impl Fn(&str) -> Option<String>, file: Option<&crate::config::FileConfig>, process: &str) -> Settings {
+        let profile = crate::config::resolve(file, process, get("HAQENGINE_PROFILE").as_deref().filter(|p| !p.is_empty()));
+        let set = |k: &str| get(k).is_some_and(|v| !v.trim().is_empty());
+        let (mode_set, multiplier_set) = (set("HAQENGINE_MODE"), set("HAQENGINE_MULTIPLIER"));
+        let mut s = Settings::from_lookup(get);
+        if !mode_set {
+            s.mode = profile.mode.unwrap_or(Mode::Battery);
+        }
+        if !multiplier_set {
+            s.multiplier = profile.multiplier.unwrap_or(1);
+        }
+        s
+    }
+}
+
+impl Settings {
     /// Warnings about the environment, to log once when HaqEngine loads.
     pub fn notes(&self) -> Vec<String> {
         self.mode_note.iter().chain(self.multiplier_note.iter()).cloned().collect()
