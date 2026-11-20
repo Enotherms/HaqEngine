@@ -10,7 +10,7 @@ use crate::state::{device_can_transfer, dispatch_key, multiplier, DeviceData, DE
 use ash::vk;
 use ash::vk::Handle;
 use haqengine_core::HandleMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Once};
 
 pub struct SwapchainInfo {
@@ -25,6 +25,8 @@ pub struct SwapchainInfo {
     pub gen: Option<crate::framegen::FrameGen>,
     /// Created with the game's present-mode list rewritten to `[FIFO]`; presents must stay FIFO.
     pub fifo_only_modes: bool,
+    /// Made without generation, and the log already said a live multiplier waits for recreation.
+    pub idle_noted: AtomicBool,
 }
 
 /// Live swapchains, keyed by raw handle.
@@ -55,6 +57,22 @@ impl SwapchainRegistry {
     /// The device that created a live swapchain.
     pub fn device_of(&self, handle: u64) -> Option<Arc<DeviceData>> {
         self.map.get(handle as usize).and_then(|info| info.device.clone())
+    }
+    /// Stops the present watchers of every swapchain `device` still owns, so none outlives it
+    /// (a game may destroy its device without destroying its swapchains).
+    pub fn stop_watches_for(&self, device: &Arc<DeviceData>) {
+        let mut owned = Vec::new();
+        self.map.retain(|info| {
+            if info.device.as_ref().is_some_and(|d| Arc::ptr_eq(d, device)) {
+                owned.push(Arc::clone(info));
+            }
+            true
+        });
+        for info in owned {
+            if let Some(gen) = info.gen.as_ref() {
+                gen.stop_watch();
+            }
+        }
     }
 }
 
@@ -150,6 +168,7 @@ unsafe fn create_swapchain_inner(
     let Some(data) = DEVICES.get(dispatch_key(device)) else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
+    crate::state::poll_config(std::time::Instant::now());
     let ci = &*create_info;
     let mut chain = ChainCopy::new();
     let mut rewritten_head: Option<*const std::ffi::c_void> = None;
@@ -252,6 +271,7 @@ unsafe fn create_swapchain_inner(
                         FrameGen::new(images, ci.image_extent, battery_format, data.quality.is_ok(), mode, plan.map_or(1, |p| p.multiplier))
                     }),
                     fifo_only_modes,
+                    idle_noted: AtomicBool::new(false),
                 },
             );
         });
@@ -292,6 +312,7 @@ unsafe fn destroy_swapchain_inner(
 
 unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::PresentInfoKHR) -> vk::Result {
     let start = std::time::Instant::now();
+    crate::state::poll_config(start);
     guard("present counting", (), || unsafe {
         let pi = &*present_info;
         if !pi.p_swapchains.is_null() {
@@ -331,6 +352,13 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
                 if let Some(info) = SWAPCHAINS.get((*pi.p_swapchains).as_raw()) {
                     if let Some(gen) = info.gen.as_ref().filter(|g| !g.disabled.load(Ordering::Relaxed)) {
                         return gen.present(info.id, &data, queue, pi, start);
+                    }
+                    let asked = crate::state::live().1.multiplier;
+                    if info.gen.is_none() && asked >= 2 && !info.idle_noted.swap(true, Ordering::Relaxed) {
+                        LOG.log(&format!(
+                            "swapchain {}: multiplier {asked} applies after the game recreates its swapchain (it was made without generation)",
+                            info.id
+                        ));
                     }
                 }
             }
@@ -403,6 +431,7 @@ mod tests {
             device: None,
             gen: None,
             fifo_only_modes: false,
+            idle_noted: AtomicBool::new(false),
         }
     }
 
@@ -658,6 +687,70 @@ mod tests {
         assert_eq!(game_modes, [vk::PresentModeKHR::IMMEDIATE], "the game's struct must not change");
         let seen = PRESENTED_MODES.lock().unwrap();
         seen.iter().rev().find(|(sc, _)| *sc == handle).map(|(_, m)| m.clone()).expect("presented")
+    }
+
+    unsafe extern "system" fn ok_present(_: vk::Queue, _: *const vk::PresentInfoKHR) -> vk::Result {
+        vk::Result::SUCCESS
+    }
+
+    #[test]
+    fn config_edits_reach_swapchains_that_do_not_generate() {
+        use std::ffi::{c_void, CStr};
+        let _serial = MULTIPLIER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("haqengine-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("conf.toml");
+        std::fs::write(&path, "[default]\nmultiplier = 1\n").expect("write");
+        let before = crate::state::test_support::watch_config(Some(path.clone()));
+        let load = |name: &CStr| -> *const c_void { if name == c"vkQueuePresentKHR" { ok_present as *const c_void } else { std::ptr::null() } };
+        let (device, data) = crate::state::test_support::fake_device(load, vec![]);
+        let h = 0x5c_b001u64;
+        SWAPCHAINS.created(h, SwapchainInfo { device: Some(data), ..info(h) });
+        std::fs::write(&path, "[default]\nmultiplier = 3\n").expect("write");
+        let swapchains = [vk::SwapchainKHR::from_raw(h)];
+        let indices = [0u32];
+        let present = vk::PresentInfoKHR::default().swapchains(&swapchains).image_indices(&indices);
+        let queue = vk::Queue::from_raw(device.as_raw());
+        for _ in 0..6 {
+            assert_eq!(unsafe { queue_present(queue, &present) }, vk::Result::SUCCESS);
+            std::thread::sleep(haqengine_core::config::WATCH_EVERY + std::time::Duration::from_millis(4));
+        }
+        let now = crate::state::live().1.multiplier;
+        crate::state::test_support::watch_config(None);
+        crate::state::test_support::set_live(before);
+        SWAPCHAINS.destroyed(h);
+        DEVICES.remove(dispatch_key(device));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(now, 3, "a present on a swapchain that does not generate still reads conf.toml");
+    }
+
+    unsafe extern "system" fn never_shown(_: vk::Device, _: vk::SwapchainKHR, _: u64, timeout: u64) -> vk::Result {
+        std::thread::sleep(std::time::Duration::from_nanos(timeout.min(5_000_000)));
+        vk::Result::TIMEOUT
+    }
+
+    fn watched_gen() -> FrameGen {
+        let gen = FrameGen::new(Vec::new(), vk::Extent2D { width: 64, height: 64 }, None, false, Mode::Copy, 2);
+        gen.state.lock().unwrap().watch =
+            crate::present_watch::PresentWatch::start(vk::Device::from_raw(9), vk::SwapchainKHR::from_raw(9), never_shown);
+        gen
+    }
+
+    #[test]
+    fn destroying_a_device_stops_its_swapchains_watchers() {
+        let (dev_a, a) = crate::state::test_support::fake_device(|_| std::ptr::null(), vec![]);
+        let (dev_b, b) = crate::state::test_support::fake_device(|_| std::ptr::null(), vec![]);
+        let (sa, sb) = (0x5c_a001u64, 0x5c_a002u64);
+        SWAPCHAINS.created(sa, SwapchainInfo { device: Some(Arc::clone(&a)), gen: Some(watched_gen()), ..info(sa) });
+        SWAPCHAINS.created(sb, SwapchainInfo { device: Some(Arc::clone(&b)), gen: Some(watched_gen()), ..info(sb) });
+        SWAPCHAINS.stop_watches_for(&a);
+        let watching = |h: u64| SWAPCHAINS.get(h).unwrap().gen.as_ref().unwrap().state.lock().unwrap().watch.is_some();
+        assert!(!watching(sa), "the destroyed device's watcher is stopped");
+        assert!(watching(sb), "other devices keep theirs");
+        SWAPCHAINS.destroyed(sa);
+        SWAPCHAINS.destroyed(sb);
+        DEVICES.remove(dispatch_key(dev_a));
+        DEVICES.remove(dispatch_key(dev_b));
     }
 
     #[test]

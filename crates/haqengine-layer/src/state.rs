@@ -164,6 +164,20 @@ pub mod test_support {
     }
 
     /// A handle whose first word (the dispatch key) is a fresh, unique address.
+    /// Points the live-settings watcher at `path` (or none), returning the live settings before.
+    pub fn watch_config(path: Option<std::path::PathBuf>) -> Live {
+        let mut st = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        st.watch = path.map(|p| ConfigWatch::new(p, Instant::now()));
+        st.live
+    }
+
+    /// Sets the live settings back.
+    pub fn set_live(live: Live) {
+        let mut st = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        st.live = live;
+        st.generation += 1;
+    }
+
     pub fn fake_handle() -> u64 {
         let word: &'static mut usize = Box::leak(Box::new(0));
         *word = word as *mut usize as usize;

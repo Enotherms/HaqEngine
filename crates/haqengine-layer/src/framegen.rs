@@ -270,6 +270,13 @@ impl FrameGen {
         }
     }
 
+    /// Stops watching presents for good (the device is going away).
+    pub fn stop_watch(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.watch = None;
+        state.watch_off = true;
+    }
+
     /// Waits for in-flight copies (up to 1 s) and destroys the pool and slots.
     ///
     /// # Safety
@@ -440,7 +447,6 @@ impl FrameGen {
             record(st, id, start, 0, skipped);
             r
         };
-        crate::state::poll_config(start);
         let (generation, live) = crate::state::live();
         if generation != st.seen_generation {
             self.apply_live(&mut st, id, device, generation, live);

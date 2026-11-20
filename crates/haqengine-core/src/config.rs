@@ -167,6 +167,8 @@ fn stamp(path: &std::path::Path) -> Option<Stamp> {
 pub struct ConfigWatch {
     path: std::path::PathBuf,
     seen: Option<Stamp>,
+    /// A change seen on the last look, read only if the next look finds it unchanged.
+    settling: Option<Stamp>,
     next_look: std::time::Instant,
 }
 
@@ -174,11 +176,11 @@ impl ConfigWatch {
     /// Starts watching; the file as it is now counts as already read.
     pub fn new(path: std::path::PathBuf, now: std::time::Instant) -> ConfigWatch {
         let seen = stamp(&path);
-        ConfigWatch { path, seen, next_look: now + WATCH_EVERY }
+        ConfigWatch { path, seen, settling: None, next_look: now + WATCH_EVERY }
     }
 
-    /// The file's new contents when it changed since the last look. A removed or unreadable file
-    /// is not a change.
+    /// The file's new contents once a change has stayed the same for two looks in a row, so a
+    /// file caught mid-save is not read. A removed, unreadable or empty file is not a change.
     pub fn poll(&mut self, now: std::time::Instant) -> Option<String> {
         if now < self.next_look {
             return None;
@@ -186,10 +188,19 @@ impl ConfigWatch {
         self.next_look = now + WATCH_EVERY;
         let current = stamp(&self.path)?;
         if self.seen == Some(current) {
+            self.settling = None;
             return None;
         }
+        if self.settling != Some(current) {
+            self.settling = Some(current);
+            return None;
+        }
+        self.settling = None;
         let text = std::fs::read_to_string(&self.path).ok()?;
         self.seen = Some(current);
+        if text.trim().is_empty() {
+            return None;
+        }
         Some(text)
     }
 }
@@ -312,23 +323,66 @@ mode = "quality"
         assert!(note.unwrap().contains("multiplier 4 applies after the game recreates its swapchain"));
     }
 
+    fn watch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("haqengine-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
     #[test]
     fn config_poll_throttles_and_detects_change() {
-        let dir = std::env::temp_dir().join(format!("haqengine-watch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = watch_dir("watch");
         let path = dir.join("conf.toml");
         std::fs::write(&path, "[default]\nmultiplier = 2\n").expect("write");
         let t0 = std::time::Instant::now();
+        let look = |k: u32| t0 + k * WATCH_EVERY;
         let mut w = ConfigWatch::new(path.clone(), t0);
-        assert_eq!(w.poll(t0 + WATCH_EVERY), None, "the file seen at start is not a change");
+        assert_eq!(w.poll(look(1)), None, "the file seen at start is not a change");
         std::fs::write(&path, "[default]\nmultiplier = 3\n").expect("write");
-        assert_eq!(w.poll(t0 + WATCH_EVERY + WATCH_EVERY / 2), None, "throttled");
-        assert_eq!(w.poll(t0 + 2 * WATCH_EVERY).as_deref(), Some("[default]\nmultiplier = 3\n"));
-        assert_eq!(w.poll(t0 + 3 * WATCH_EVERY), None, "unchanged");
+        assert_eq!(w.poll(look(1) + WATCH_EVERY / 2), None, "throttled");
+        assert_eq!(w.poll(look(2)), None, "a change waits one more look to settle");
+        assert_eq!(w.poll(look(3)).as_deref(), Some("[default]\nmultiplier = 3\n"));
+        assert_eq!(w.poll(look(4)), None, "unchanged");
         std::fs::remove_file(&path).expect("remove");
-        assert_eq!(w.poll(t0 + 4 * WATCH_EVERY), None, "a removed file changes nothing");
+        assert_eq!(w.poll(look(5)), None, "a removed file changes nothing");
+        assert_eq!(w.poll(look(6)), None);
         std::fs::write(&path, "[default]\nmode = \"copy\"\n").expect("write");
-        assert!(w.poll(t0 + 5 * WATCH_EVERY).is_some(), "a file created later is read");
+        assert_eq!(w.poll(look(7)), None);
+        assert!(w.poll(look(8)).is_some(), "a file created later is read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_poll_ignores_an_empty_file_mid_save() {
+        let dir = watch_dir("empty");
+        let path = dir.join("conf.toml");
+        std::fs::write(&path, "[default]\nmultiplier = 3\n").expect("write");
+        let t0 = std::time::Instant::now();
+        let look = |k: u32| t0 + k * WATCH_EVERY;
+        let mut w = ConfigWatch::new(path.clone(), t0);
+        std::fs::write(&path, "").expect("truncate");
+        for k in 1..=4 {
+            assert_eq!(w.poll(look(k)), None, "an empty file is never applied (look {k})");
+        }
+        std::fs::write(&path, "[default]\nmultiplier = 2\n").expect("write");
+        assert_eq!(w.poll(look(5)), None);
+        assert_eq!(w.poll(look(6)).as_deref(), Some("[default]\nmultiplier = 2\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_poll_waits_while_the_file_keeps_changing() {
+        let dir = watch_dir("growing");
+        let path = dir.join("conf.toml");
+        std::fs::write(&path, "").expect("write");
+        let t0 = std::time::Instant::now();
+        let look = |k: u32| t0 + k * WATCH_EVERY;
+        let mut w = ConfigWatch::new(path.clone(), t0);
+        std::fs::write(&path, "[default]\n").expect("write");
+        assert_eq!(w.poll(look(1)), None);
+        std::fs::write(&path, "[default]\nmultiplier = 3\n").expect("write");
+        assert_eq!(w.poll(look(2)), None, "still being written");
+        assert_eq!(w.poll(look(3)).as_deref(), Some("[default]\nmultiplier = 3\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

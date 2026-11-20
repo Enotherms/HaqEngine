@@ -163,6 +163,7 @@ pub unsafe extern "system" fn destroy_device(device: vk::Device, allocator: *con
     guard("vkDestroyDevice", (), || unsafe {
         let key = dispatch_key(device);
         if let Some(data) = DEVICES.remove(key) {
+            crate::swapchain::SWAPCHAINS.stop_watches_for(&data);
             crate::queue::forget_device(key);
             if let Some(Ok(p)) = data.pipelines.get() {
                 p.destroy(&data.device);

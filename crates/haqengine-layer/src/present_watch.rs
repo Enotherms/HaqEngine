@@ -12,10 +12,8 @@ use std::time::{Duration, Instant};
 const SLICE_NS: u64 = 20_000_000;
 /// A present not on screen after this long is forgotten (it was dropped or never shown).
 const LOST_AFTER: Duration = Duration::from_millis(200);
-/// RADV can report `ERROR_DEVICE_LOST` for a wait that starts before the driver submitted the
-/// present while the GPU is busy; the wait is retried until the error lasts this long.
-const DEVICE_LOST_FOR: Duration = Duration::from_secs(1);
-/// Pause before retrying a wait that reported `ERROR_DEVICE_LOST`.
+/// Pause before retrying a wait that reported `ERROR_DEVICE_LOST`: RADV can report it for a
+/// present it has not submitted yet while the GPU is busy, so it is treated like a timeout.
 const RETRY_PAUSE: Duration = Duration::from_millis(5);
 
 struct Watched {
@@ -115,7 +113,6 @@ fn watch(shared: &Shared, device: vk::Device, swapchain: vk::SwapchainKHR, wait:
             w.queue.oldest().expect("not empty")
         };
         let began = Instant::now();
-        let mut lost_since: Option<Instant> = None;
         loop {
             let r = unsafe { wait(device, swapchain, id, SLICE_NS) };
             let mut w = shared.lock();
@@ -125,16 +122,17 @@ fn watch(shared: &Shared, device: vk::Device, swapchain: vk::SwapchainKHR, wait:
                     queue.shown(id, Instant::now(), |us| shown_us.push(us));
                     w.shown_id = w.shown_id.max(id);
                 }
-                vk::Result::TIMEOUT if w.stop => return,
-                vk::Result::TIMEOUT if began.elapsed() < LOST_AFTER => continue,
-                vk::Result::TIMEOUT => {
+                vk::Result::TIMEOUT | vk::Result::ERROR_DEVICE_LOST if w.stop => return,
+                vk::Result::TIMEOUT | vk::Result::ERROR_DEVICE_LOST if began.elapsed() < LOST_AFTER => {
+                    if r == vk::Result::ERROR_DEVICE_LOST {
+                        drop(w);
+                        std::thread::sleep(RETRY_PAUSE);
+                    }
+                    continue;
+                }
+                vk::Result::TIMEOUT | vk::Result::ERROR_DEVICE_LOST => {
                     w.queue.drop_oldest();
                     w.shown_id = w.shown_id.max(id);
-                }
-                vk::Result::ERROR_DEVICE_LOST if !w.stop && lost_since.get_or_insert_with(Instant::now).elapsed() < DEVICE_LOST_FOR => {
-                    drop(w);
-                    std::thread::sleep(RETRY_PAUSE);
-                    continue;
                 }
                 e => {
                     w.failed = Some(e);
@@ -206,12 +204,35 @@ mod tests {
         assert_eq!(w.take_shown().map(|s| s.count), Some(1));
     }
 
+    static LONG_LOST_SINCE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+    unsafe extern "system" fn lost_for_a_while(_: vk::Device, _: vk::SwapchainKHR, id: u64, _: u64) -> vk::Result {
+        let began = *LONG_LOST_SINCE.lock().unwrap().get_or_insert_with(Instant::now);
+        if id == 1 && began.elapsed() < Duration::from_millis(1500) {
+            std::thread::sleep(Duration::from_millis(2));
+            vk::Result::ERROR_DEVICE_LOST
+        } else {
+            vk::Result::SUCCESS
+        }
+    }
+
     #[test]
-    fn a_lasting_device_lost_stops_watching() {
+    fn a_long_device_lost_is_a_slow_present_not_the_end() {
+        let w = start(lost_for_a_while);
+        w.queued(1, None);
+        w.queued(2, Some(Instant::now()));
+        std::thread::sleep(Duration::from_millis(1700));
+        assert!(w.failed().is_none(), "a hitch longer than a second must not stop pacing");
+        assert!(w.wait_shown(2, Duration::from_secs(1)) < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_lasting_device_lost_keeps_waits_bounded() {
         let w = start(always_lost);
         w.queued(1, None);
-        w.wait_shown(1, Duration::from_secs(5));
-        assert_eq!(w.failed(), Some(vk::Result::ERROR_DEVICE_LOST));
+        let waited = w.wait_shown(1, Duration::from_secs(2));
+        assert!(waited < Duration::from_secs(1), "the present is forgotten after LOST_AFTER, {waited:?}");
+        assert!(w.failed().is_none());
     }
 
     #[test]
