@@ -62,6 +62,13 @@ unsafe fn create_device_inner(
         None
     };
     let base: &vk::DeviceCreateInfo = patch.as_ref().map_or(&*create_info, |p| &p.info);
+    let present_exts: Vec<String> = (0..base.enabled_extension_count as usize)
+        .map(|i| CStr::from_ptr(*base.pp_enabled_extension_names.add(i)).to_string_lossy().into_owned())
+        .filter(|n| n.contains("present") || n.contains("swapchain_maintenance"))
+        .collect();
+    if !present_exts.is_empty() {
+        LOG.log(&format!("the game enables {present_exts:?}"));
+    }
     let wait_state = crate::features::present_wait_state(base);
     let present = if wait_state == crate::features::PresentWaitState::Absent && present_wait_supported(&instance, physical_device) {
         crate::features::present_patch(base)

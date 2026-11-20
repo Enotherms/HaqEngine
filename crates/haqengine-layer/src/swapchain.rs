@@ -115,7 +115,7 @@ pub unsafe fn non_fifo_mode_on_fifo_only(pi: &vk::PresentInfoKHR) -> Option<vk::
 }
 
 /// The structure types in a `pNext` chain, for diagnostics (at most 16).
-unsafe fn chain_types(p_next: *const std::ffi::c_void) -> Vec<i32> {
+pub unsafe fn chain_types(p_next: *const std::ffi::c_void) -> Vec<i32> {
     let mut out = Vec::new();
     let mut cur = p_next as *const vk::BaseInStructure;
     while !cur.is_null() && out.len() < 16 {

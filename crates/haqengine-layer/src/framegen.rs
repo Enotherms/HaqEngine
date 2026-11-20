@@ -112,6 +112,10 @@ pub struct GenState {
     /// The last present id handed out, and the newest one queued for the screen.
     pub next_present_id: u64,
     pub last_present_id: u64,
+    /// The game sets present ids on this swapchain, so HaqEngine never numbers a real frame.
+    pub game_numbered: bool,
+    /// A game-numbered present without an id was logged.
+    pub seen_unnumbered: bool,
 }
 
 /// Which engine recorded a present.
@@ -185,6 +189,8 @@ impl FrameGen {
                 watch_off: false,
                 next_present_id: 0,
                 last_present_id: 0,
+                game_numbered: false,
+                seen_unnumbered: false,
             }),
         }
     }
@@ -372,13 +378,17 @@ impl FrameGen {
 
     /// Whether this present's frames are tagged and watched (and paced, unless `HAQENGINE_PACING`
     /// is off): the device has present waits and the watch thread runs (started here on first use).
-    unsafe fn pacing_ready(&self, st: &mut GenState, id: u64, device: &DeviceData, swapchain: vk::SwapchainKHR) -> bool {
+    unsafe fn pacing_ready(&self, st: &mut GenState, id: u64, device: &DeviceData, swapchain: vk::SwapchainKHR, pi: &vk::PresentInfoKHR) -> bool {
         let Some(wait) = device.wait_for_present else { return false };
         if st.watch_off {
             return false;
         }
         if let Some(e) = st.watch.as_ref().and_then(|w| w.failed()) {
-            let why = format!("waiting for presents failed {e:?}");
+            let why = format!(
+                "waiting for presents failed {e:?} (last id {}, present chain {:?})",
+                st.last_present_id,
+                crate::swapchain::chain_types(pi.p_next)
+            );
             st.watch_off = true;
             st.watch = None;
             LOG.log(&format!("swapchain {id}: pacing off: {why}"));
@@ -430,6 +440,13 @@ impl FrameGen {
             r
         };
         let game_id = game_present_id(pi);
+        if find_present_id(pi.p_next).is_some() {
+            if game_id.is_none() && !st.seen_unnumbered {
+                st.seen_unnumbered = true;
+                LOG.log(&format!("swapchain {id}: the game presented without an id after {}", st.next_present_id));
+            }
+            st.game_numbered = true;
+        }
         let last_used = st.next_present_id;
         if let Some(g) = game_id {
             st.next_present_id = st.next_present_id.max(g);
@@ -479,7 +496,7 @@ impl FrameGen {
             return self.present_still(&mut st, id, device, queue, pi, slot, slot_index, game_index, start);
         }
         let count = self.generated_now(&st);
-        let tag = self.pacing_ready(&mut st, id, device, swapchain);
+        let tag = self.pacing_ready(&mut st, id, device, swapchain, pi);
         if tag && crate::state::SETTINGS.pacing {
             if let (Some(target), Some(w)) = (pace_target(st.last_present_id), st.watch.as_ref()) {
                 let waited = w.wait_shown(target, PACE_TIMEOUT);
@@ -591,25 +608,9 @@ impl FrameGen {
             }
         }
         let swapchains = [swapchain];
-        let mut ids = [0u64; MAX_GENERATED + 1];
-        if tag {
-            match game_id {
-                Some(g) => {
-                    ids[count] = g;
-                    if let Some(first) = haqengine_core::pacing::ids_before(g, count, last_used) {
-                        for (k, slot_id) in ids.iter_mut().take(count).enumerate() {
-                            *slot_id = first + k as u64;
-                        }
-                    }
-                }
-                None => {
-                    for slot_id in ids.iter_mut().take(count + 1) {
-                        st.next_present_id += 1;
-                        *slot_id = st.next_present_id;
-                    }
-                }
-            }
-        }
+        let game_numbered = st.game_numbered;
+        let ids = if tag { batch_ids(count, game_id, game_numbered, last_used, &mut st.next_present_id) } else { None };
+        let ids = ids.unwrap_or([0; MAX_GENERATED + 1]);
         let mut result = vk::Result::SUCCESS;
         for k in 0..count {
             let wait = [signals[k]];
@@ -631,11 +632,11 @@ impl FrameGen {
         let mut real_present = *pi;
         real_present.wait_semaphore_count = 1;
         real_present.p_wait_semaphores = real_wait.as_ptr();
-        if tag && game_id.is_none() {
+        if ids[count] > 0 && !game_numbered {
             real_present.p_next = &real_id as *const vk::PresentIdKHR as *const std::ffi::c_void;
         }
         let r_real = next_present(queue, &real_present);
-        if tag {
+        if ids[count] > 0 {
             let resumed = st.stats.last_present;
             note_queued(&mut st, r_real, ids[count], resumed);
         }
@@ -1060,6 +1061,32 @@ pub unsafe fn game_present_id(pi: &vk::PresentInfoKHR) -> Option<u64> {
     Some(*(*s).p_present_ids).filter(|&id| id > 0)
 }
 
+/// Present ids for a batch of `count` generated presents and the real one (at index `count`):
+/// the game's (scaled) id with the generated ones just below it, or, on a swapchain the game never
+/// numbers, ids counted up from `next`. `None` when the game numbers this swapchain but left this
+/// present without an id: numbering it here could collide with the game's next id.
+pub fn batch_ids(count: usize, game_id: Option<u64>, game_numbered: bool, last_used: u64, next: &mut u64) -> Option<[u64; MAX_GENERATED + 1]> {
+    let mut ids = [0u64; MAX_GENERATED + 1];
+    match game_id {
+        Some(g) => {
+            ids[count] = g;
+            if let Some(first) = haqengine_core::pacing::ids_before(g, count, last_used) {
+                for (k, id) in ids.iter_mut().take(count).enumerate() {
+                    *id = first + k as u64;
+                }
+            }
+        }
+        None if game_numbered => return None,
+        None => {
+            for id in ids.iter_mut().take(count + 1) {
+                *next += 1;
+                *id = *next;
+            }
+        }
+    }
+    Some(ids)
+}
+
 /// Frames shown per second in a log window with `real` real and `generated` generated presents.
 pub fn out_fps(real_fps: f32, real: u64, generated: u64) -> f32 {
     if real == 0 { real_fps } else { real_fps * (real + generated) as f32 / real as f32 }
@@ -1178,6 +1205,28 @@ mod tests {
         let without = vk::PresentInfoKHR::default().push_next(&mut regions);
         assert_eq!(unsafe { game_present_id(&without) }, None);
         assert!(unsafe { find_present_id(std::ptr::null()) }.is_none());
+    }
+
+    #[test]
+    fn own_ids_count_up_when_the_game_sets_none() {
+        let mut next = 10;
+        assert_eq!(batch_ids(2, None, false, 10, &mut next), Some([11, 12, 13, 0]));
+        assert_eq!(next, 13);
+    }
+
+    #[test]
+    fn game_ids_put_generated_ones_just_below() {
+        let mut next = 16;
+        assert_eq!(batch_ids(3, Some(20), true, 16, &mut next), Some([17, 18, 19, 20]));
+        assert_eq!(batch_ids(3, Some(20), true, 18, &mut next), Some([0, 0, 0, 20]), "no room above the last id");
+        assert_eq!(next, 16, "the caller tracks game ids");
+    }
+
+    #[test]
+    fn a_game_present_without_an_id_is_not_tagged() {
+        let mut next = 1116;
+        assert_eq!(batch_ids(2, None, true, 1116, &mut next), None);
+        assert_eq!(next, 1116, "own ids must never run ahead of the game's next id");
     }
 
     #[test]
