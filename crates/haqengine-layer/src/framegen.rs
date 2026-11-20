@@ -3,7 +3,7 @@
 use crate::battery::BatteryResources;
 use crate::pipelines::QualityPipelines;
 use crate::quality::QualityResources;
-use haqengine_core::frame_change::{is_cut, ChangeCounts, StillDetector};
+use haqengine_core::frame_change::{is_cut, ChangeCounts, StillBuckets, StillDetector};
 use crate::pipelines::Pipelines;
 use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
@@ -86,6 +86,8 @@ pub struct GenState {
     /// Cuts seen and still presents since the last log line.
     pub window_cuts: u64,
     pub window_still: u64,
+    /// How still each frame was since the last log line.
+    pub window_buckets: StillBuckets,
 }
 
 /// Which engine recorded a present.
@@ -137,6 +139,7 @@ impl FrameGen {
                 frames: 0,
                 window_cuts: 0,
                 window_still: 0,
+                window_buckets: StillBuckets::default(),
             }),
         }
     }
@@ -440,8 +443,11 @@ impl FrameGen {
             return false;
         }
         let Some(battery) = st.battery.as_ref() else { return false };
-        if battery.counts(slot_index).is_some_and(|c| is_cut(&c)) {
-            st.window_cuts += 1;
+        if let Some(c) = battery.counts(slot_index) {
+            if is_cut(&c) {
+                st.window_cuts += 1;
+            }
+            st.window_buckets.add(&c);
         }
         let Some(ready) = st.ready.as_ref() else { return false };
         let slots: Vec<(bool, u64, Option<ChangeCounts>)> = ready
@@ -723,7 +729,7 @@ unsafe fn read_gpu_time(st: &mut GenState, d: &ash::Device, slot_index: usize) {
 /// Updates counters and timing windows after one real present, logging every 10 seconds.
 fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: bool) {
     let now = Instant::now();
-    let GenState { stats: s, quality: q, battery: bat, window_cuts, window_still, .. } = st;
+    let GenState { stats: s, quality: q, battery: bat, window_cuts, window_still, window_buckets, .. } = st;
     s.real += 1;
     if generated {
         s.generated += 1;
@@ -750,9 +756,10 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: 
                 .map(|c| format!(", quality cuts {} copies {} restarts {}", c.cuts, c.copies, c.restarts))
                 .unwrap_or_default();
             let quality = if bat.is_some() {
-                let c = change_suffix(*window_cuts, *window_still);
+                let c = change_suffix(*window_cuts, *window_still, window_buckets);
                 *window_cuts = 0;
                 *window_still = 0;
+                window_buckets.clear();
                 quality + &c
             } else {
                 quality
@@ -800,8 +807,8 @@ pub fn newest_ready_counts(slots: &[(bool, u64, Option<ChangeCounts>)]) -> Optio
 }
 
 /// The log line's change fields.
-pub fn change_suffix(cuts: u64, still: u64) -> String {
-    format!(", cuts {cuts}, still {still}")
+pub fn change_suffix(cuts: u64, still: u64, buckets: &StillBuckets) -> String {
+    format!(", cuts {cuts}, still {still}, {buckets}")
 }
 
 /// The image semaphores a generated present signals: the spare image's (shown first) and the game
@@ -872,8 +879,10 @@ mod tests {
 
     #[test]
     fn log_line_shows_cuts_and_still() {
-        assert_eq!(change_suffix(3, 41), ", cuts 3, still 41");
-        assert_eq!(change_suffix(0, 0), ", cuts 0, still 0");
+        let mut b = StillBuckets::default();
+        b.add(&ChangeCounts { disagree: 0, still: 90, pixels: 100 });
+        assert_eq!(change_suffix(3, 41, &b), ", cuts 3, still 41, still% <50 0, <75 0, <85 0, <99.5 1, rest 0");
+        assert_eq!(change_suffix(0, 0, &StillBuckets::default()), ", cuts 0, still 0, still% <50 0, <75 0, <85 0, <99.5 0, rest 0");
     }
 
     #[test]

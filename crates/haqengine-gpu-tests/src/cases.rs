@@ -1392,7 +1392,7 @@ fn battery_still_pan_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let frames = pan_frames(1280, 800, 1, 0, 1, 291);
     let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
     println!("      1 px pan: {:?}", pair.counts);
-    if haqengine_core::frame_change::is_still(&pair.counts) {
+    if haqengine_core::frame_change::stays_still(&pair.counts) {
         return Err(format!("a 1 px pan counted as still: {:?}", pair.counts));
     }
     let same = battery_pair(gpu, BF, &frames[0], &frames[0])?;
