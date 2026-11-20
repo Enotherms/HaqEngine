@@ -302,7 +302,7 @@ impl BatteryResources {
             specs.push((vk::Format::R32G32_SFLOAT, w, h));
         }
         specs.push((vk::Format::R32G32_SFLOAT, 1, 1));
-        specs.push((vk::Format::R32_UINT, 2, 1));
+        specs.push((vk::Format::R32_UINT, 2, haqengine_core::MAX_GENERATED as u32));
         let mut images: Vec<BatImage> = Vec::with_capacity(IMAGE_COUNT);
         for (f, w, h) in specs {
             match create_image(d, &memory, f, w, h) {
@@ -531,18 +531,21 @@ impl BatteryResources {
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
             d.cmd_clear_color_image(cmd, self.images[COUNTERS].image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
             memory_barrier(d, cmd, S::TRANSFER, S::COMPUTE_SHADER);
-            let push = push6([
+            let row = 0u32;
+            let push = [
                 w.to_le_bytes(),
                 h.to_le_bytes(),
                 flows[0].0.to_le_bytes(),
                 flows[0].1.to_le_bytes(),
                 0.5f32.to_le_bytes(),
                 fmt.to_le_bytes(),
-            ]);
-            dispatch(d, cmd, &p.warp, self.warp_sets[cur], &push, groups(w, h));
+                row.to_le_bytes(),
+            ];
+            dispatch(d, cmd, &p.warp, self.warp_sets[cur], push.as_flattened(), groups(w, h));
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
             let threshold = haqengine_core::frame_change::cut_threshold_pixels(w * h);
-            dispatch(d, cmd, &p.fixup, self.fixup_sets[cur], &push3(w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes()), groups(w, h));
+            let fix = [w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes(), row.to_le_bytes()];
+            dispatch(d, cmd, &p.fixup, self.fixup_sets[cur], fix.as_flattened(), groups(w, h));
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
             if slot < self.readback_valid.len() {
                 let region = vk::BufferImageCopy::default()
