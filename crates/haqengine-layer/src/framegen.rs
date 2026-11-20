@@ -9,6 +9,8 @@ use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
 use ash::vk;
 use ash::vk::Handle;
+use crate::present_watch::PresentWatch;
+use haqengine_core::pacing::pace_target;
 use haqengine_core::{should_log, FrameStats, Mode, PackedFormat, MAX_GENERATED};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -18,6 +20,8 @@ use std::time::Instant;
 const MAX_WAITS: usize = 16;
 /// How long to wait for a slot's previous copy before skipping a frame.
 const SLOT_WAIT_NS: u64 = 50_000_000;
+/// Longest wait for the screen before queueing a real frame's presents.
+const PACE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(40);
 /// How often pacing statistics are logged.
 const LOG_EVERY_MS: u64 = 10_000;
 
@@ -70,6 +74,11 @@ pub struct GenStats {
     pub gpu_cost: FrameStats,
     pub last_present: Option<Instant>,
     pub last_log_ms: u64,
+    /// Real and generated presents since the last log line.
+    pub window_real: u64,
+    pub window_generated: u64,
+    /// Time spent waiting for the screen before queueing generated presents.
+    pub pace_wait: FrameStats,
 }
 
 pub struct GenState {
@@ -96,6 +105,13 @@ pub struct GenState {
     pub live_multiplier: u32,
     /// The live-settings change counter last applied.
     pub seen_generation: u64,
+    /// Watches tagged presents reach the screen while pacing is on.
+    pub watch: Option<PresentWatch>,
+    /// Pacing is off for this swapchain (the game tags presents itself, or watching failed).
+    pub watch_off: bool,
+    /// The last present id handed out, and the newest one queued for the screen.
+    pub next_present_id: u64,
+    pub last_present_id: u64,
 }
 
 /// Which engine recorded a present.
@@ -148,6 +164,9 @@ impl FrameGen {
                     gpu_cost: FrameStats::new(),
                     last_present: None,
                     last_log_ms: 0,
+                    window_real: 0,
+                    window_generated: 0,
+                    pace_wait: FrameStats::new(),
                 },
                 battery: None,
                 battery_failed: false,
@@ -162,6 +181,10 @@ impl FrameGen {
                 mode: engine_mode(mode, battery_format.is_some(), quality_ok),
                 live_multiplier: multiplier,
                 seen_generation: crate::state::live().0,
+                watch: None,
+                watch_off: false,
+                next_present_id: 0,
+                last_present_id: 0,
             }),
         }
     }
@@ -253,6 +276,7 @@ impl FrameGen {
     /// `device` must be the live device that owns this swapchain.
     pub unsafe fn destroy(&self, device: &DeviceData) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.watch = None;
         if let Some(ready) = state.ready.take() {
             destroy_ready(device, &ready);
         }
@@ -346,6 +370,37 @@ impl FrameGen {
         LOG.log(&format!("swapchain {id}: now {:?} {}x", st.mode, shown_multiplier(st.mode, m)));
     }
 
+    /// Whether this present's frames are tagged and watched (and paced, unless `HAQENGINE_PACING`
+    /// is off): the device has present waits, the game does not tag its own presents, and the
+    /// watch thread runs (started here on first use).
+    unsafe fn pacing_ready(&self, st: &mut GenState, id: u64, device: &DeviceData, swapchain: vk::SwapchainKHR, pi: &vk::PresentInfoKHR) -> bool {
+        let Some(wait) = device.wait_for_present else { return false };
+        if st.watch_off {
+            return false;
+        }
+        let off = if has_present_id(pi.p_next) {
+            Some("the game sets present ids".to_string())
+        } else {
+            st.watch.as_ref().and_then(|w| w.failed()).map(|e| format!("waiting for presents failed {e:?}"))
+        };
+        if let Some(why) = off {
+            st.watch_off = true;
+            st.watch = None;
+            LOG.log(&format!("swapchain {id}: pacing off: {why}"));
+            return false;
+        }
+        if st.watch.is_none() {
+            st.watch = PresentWatch::start(device.device.handle(), swapchain, wait);
+            if st.watch.is_none() {
+                st.watch_off = true;
+                LOG.log(&format!("swapchain {id}: pacing off: the watch thread did not start"));
+                return false;
+            }
+            LOG.log(&format!("swapchain {id}: watching presents, pacing {}", if crate::state::SETTINGS.pacing { "on" } else { "off" }));
+        }
+        true
+    }
+
     /// Turns generation off for this swapchain and logs it once.
     fn disable(&self, id: u64, step: &str, result: vk::Result) {
         if !self.disabled.swap(true, Ordering::Relaxed) {
@@ -424,6 +479,13 @@ impl FrameGen {
             return self.present_still(&mut st, id, device, queue, pi, slot, slot_index, game_index, start);
         }
         let count = self.generated_now(&st);
+        let tag = self.pacing_ready(&mut st, id, device, swapchain, pi);
+        if tag && crate::state::SETTINGS.pacing {
+            if let (Some(target), Some(w)) = (pace_target(st.last_present_id), st.watch.as_ref()) {
+                let waited = w.wait_shown(target, PACE_TIMEOUT);
+                st.stats.pace_wait.push(waited.as_micros().min(u32::MAX as u128) as u32);
+            }
+        }
         let mut spares = [0u32; MAX_GENERATED];
         for k in 0..count {
             let r = (device.swapchain.acquire_next_image_khr)(
@@ -529,18 +591,42 @@ impl FrameGen {
             }
         }
         let swapchains = [swapchain];
+        let mut ids = [0u64; MAX_GENERATED + 1];
+        if tag {
+            for slot_id in ids.iter_mut().take(count + 1) {
+                st.next_present_id += 1;
+                *slot_id = st.next_present_id;
+            }
+        }
         let mut result = vk::Result::SUCCESS;
         for k in 0..count {
             let wait = [signals[k]];
             let index = [spares[k]];
-            let present = vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&index);
-            result = combine_present_results(result, next_present(queue, &present));
+            let mut present_id = vk::PresentIdKHR::default().present_ids(&ids[k..=k]);
+            let mut present = vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&index);
+            if tag {
+                present = present.push_next(&mut present_id);
+            }
+            let r = next_present(queue, &present);
+            if tag {
+                note_queued(&mut st, r, ids[k], None);
+            }
+            result = combine_present_results(result, r);
         }
         let real_wait = [signals[count]];
+        let mut real_id = vk::PresentIdKHR::default().present_ids(&ids[count..=count]);
+        real_id.p_next = pi.p_next;
         let mut real_present = *pi;
         real_present.wait_semaphore_count = 1;
         real_present.p_wait_semaphores = real_wait.as_ptr();
+        if tag {
+            real_present.p_next = &real_id as *const vk::PresentIdKHR as *const std::ffi::c_void;
+        }
         let r_real = next_present(queue, &real_present);
+        if tag {
+            let resumed = st.stats.last_present;
+            note_queued(&mut st, r_real, ids[count], resumed);
+        }
         record(&mut st, id, start, count as u64, false);
         combine_present_results(result, r_real)
     }
@@ -835,12 +921,25 @@ unsafe fn read_gpu_time(st: &mut GenState, d: &ash::Device, slot_index: usize) {
     }
 }
 
+/// Hands a tagged present that reached the queue to the watch thread.
+fn note_queued(st: &mut GenState, r: vk::Result, present_id: u64, real_start: Option<Instant>) {
+    if r != vk::Result::SUCCESS && r != vk::Result::SUBOPTIMAL_KHR {
+        return;
+    }
+    if let Some(w) = st.watch.as_ref() {
+        w.queued(present_id, real_start);
+        st.last_present_id = present_id;
+    }
+}
+
 /// Updates counters and timing windows after one real present, logging every 10 seconds.
 fn record(st: &mut GenState, id: u64, start: Instant, generated: u64, skipped: bool) {
     let now = Instant::now();
-    let GenState { stats: s, quality: q, battery: bat, window_cuts, window_still, window_buckets, .. } = st;
+    let GenState { stats: s, quality: q, battery: bat, window_cuts, window_still, window_buckets, watch, .. } = st;
     s.real += 1;
     s.generated += generated;
+    s.window_real += 1;
+    s.window_generated += generated;
     if skipped {
         s.skipped += 1;
     }
@@ -856,7 +955,6 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: u64, skipped: b
         let secs = (now_ms - s.last_log_ms) as f32 / 1000.0;
         if let (Some(iv), Some(cost)) = (s.intervals.summary(), s.present_cost.summary()) {
             let real_fps = iv.count as f32 / secs;
-            let out_per_real = if s.real > 0 { (s.real + s.generated) as f32 / s.real as f32 } else { 1.0 };
             let quality = q
                 .as_mut()
                 .map(|q| q.take_counts())
@@ -876,9 +974,15 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: u64, skipped: b
                 .summary()
                 .map(|g| format!(", gpu {:.2} ms p99 {:.2}", g.mean_ms, g.p99_ms))
                 .unwrap_or_default();
+            let shown = watch
+                .as_ref()
+                .and_then(|w| w.take_shown())
+                .map(|v| format!(", to screen {:.2} ms p99 {:.2}", v.mean_ms, v.p99_ms))
+                .unwrap_or_default();
+            let paced = s.pace_wait.summary().map(|p| format!(", paced {:.2} ms p99 {:.2}", p.mean_ms, p.p99_ms)).unwrap_or_default();
             LOG.log(&format!(
-                "swapchain {id}: real {real_fps:.1} fps, out {:.1} fps, interval mean {:.2} ms sd {:.2} p99 {:.2}, added {:.2} ms p99 {:.2}, skipped {}{gpu}{quality}",
-                real_fps * out_per_real,
+                "swapchain {id}: real {real_fps:.1} fps, out {:.1} fps, interval mean {:.2} ms sd {:.2} p99 {:.2}, added {:.2} ms p99 {:.2}, skipped {}{shown}{paced}{gpu}{quality}",
+                out_fps(real_fps, s.window_real, s.window_generated),
                 iv.mean_ms,
                 iv.stddev_ms,
                 iv.p99_ms,
@@ -890,6 +994,9 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: u64, skipped: b
         s.intervals.clear();
         s.present_cost.clear();
         s.gpu_cost.clear();
+        s.pace_wait.clear();
+        s.window_real = 0;
+        s.window_generated = 0;
         s.last_log_ms = now_ms;
     }
 }
@@ -912,6 +1019,26 @@ fn note_slot_frame(st: &mut GenState, slot_index: usize) {
 /// iterator so a present allocates nothing.
 pub fn newest_ready_counts(slots: impl Iterator<Item = (bool, u64, Option<ChangeCounts>)>) -> Option<ChangeCounts> {
     slots.filter(|s| s.0 && s.1 > 0).max_by_key(|s| s.1).and_then(|s| s.2)
+}
+
+/// Whether a present's `pNext` chain carries the game's own `VkPresentIdKHR`.
+///
+/// # Safety
+/// `p_next` must be null or a valid structure chain.
+pub unsafe fn has_present_id(p_next: *const std::ffi::c_void) -> bool {
+    let mut cur = p_next as *const vk::BaseInStructure;
+    while !cur.is_null() {
+        if (*cur).s_type == vk::StructureType::PRESENT_ID_KHR {
+            return true;
+        }
+        cur = (*cur).p_next;
+    }
+    false
+}
+
+/// Frames shown per second in a log window with `real` real and `generated` generated presents.
+pub fn out_fps(real_fps: f32, real: u64, generated: u64) -> f32 {
+    if real == 0 { real_fps } else { real_fps * (real + generated) as f32 / real as f32 }
 }
 
 /// The log line's change fields.
@@ -1010,6 +1137,26 @@ pub fn present_shape_ok(pi: &vk::PresentInfoKHR) -> bool {
 mod tests {
     use super::*;
     use vk::Result as R;
+
+    #[test]
+    fn game_present_ids_are_found_in_the_chain() {
+        let ids = [7u64];
+        let mut id = vk::PresentIdKHR::default().present_ids(&ids);
+        let mut regions = vk::PresentRegionsKHR::default();
+        let with = vk::PresentInfoKHR::default().push_next(&mut regions).push_next(&mut id);
+        assert!(unsafe { has_present_id(with.p_next) });
+        let mut regions = vk::PresentRegionsKHR::default();
+        let without = vk::PresentInfoKHR::default().push_next(&mut regions);
+        assert!(!unsafe { has_present_id(without.p_next) });
+        assert!(!unsafe { has_present_id(std::ptr::null()) });
+    }
+
+    #[test]
+    fn out_fps_counts_this_window_only() {
+        assert_eq!(out_fps(30.0, 300, 600), 90.0);
+        assert_eq!(out_fps(30.0, 300, 0), 30.0);
+        assert_eq!(out_fps(30.0, 0, 0), 30.0);
+    }
 
     #[test]
     fn combine_present_results_prefers_worst() {

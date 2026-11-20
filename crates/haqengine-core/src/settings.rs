@@ -27,6 +27,9 @@ pub struct Settings {
     pub mode_note: Option<String>,
     /// Notes from reading `conf.toml` at start.
     pub config_notes: Vec<String>,
+    /// Whether generated presents wait for the screen so at most one frame queues ahead
+    /// (`HAQENGINE_PACING=0` or `off` turns it off; presents are still watched and timed).
+    pub pacing: bool,
 }
 
 impl Settings {
@@ -54,7 +57,8 @@ impl Settings {
             Some("quality") => (Mode::Quality, None),
             Some(other) => (Mode::Battery, Some(format!("unknown HAQENGINE_MODE {other:?}; using battery"))),
         };
-        Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new() }
+        let pacing = !matches!(get("HAQENGINE_PACING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0") | Some("off"));
+        Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new(), pacing }
     }
 }
 
@@ -150,6 +154,15 @@ mod tests {
     fn multiplier_rejects_garbage() {
         for v in ["0", "9", "x", "", "-2"] {
             assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", v)])).multiplier, 1, "{v}");
+        }
+    }
+
+    #[test]
+    fn pacing_is_on_unless_turned_off() {
+        assert!(Settings::from_lookup(env(&[])).pacing);
+        assert!(Settings::from_lookup(env(&[("HAQENGINE_PACING", "1")])).pacing);
+        for v in ["0", "off", "OFF"] {
+            assert!(!Settings::from_lookup(env(&[("HAQENGINE_PACING", v)])).pacing, "{v}");
         }
     }
 

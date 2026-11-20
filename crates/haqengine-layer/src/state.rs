@@ -40,6 +40,8 @@ pub struct DeviceData {
     pub quality: Result<(), String>,
     /// Quality-mode pipelines, created on the first Quality swapchain.
     pub quality_pipelines: std::sync::OnceLock<Result<Arc<crate::pipelines::QualityPipelines>, vk::Result>>,
+    /// `vkWaitForPresentKHR` when the device has present ids and waits on (pacing is possible).
+    pub wait_for_present: Option<vk::PFN_vkWaitForPresentKHR>,
 }
 
 pub static INSTANCES: LazyLock<HandleMap<Arc<InstanceData>>> = LazyLock::new(HandleMap::new);
@@ -217,6 +219,7 @@ pub mod test_support {
             pipelines: std::sync::OnceLock::new(),
             quality: Err("test device".into()),
             quality_pipelines: std::sync::OnceLock::new(),
+            wait_for_present: None,
         });
         DEVICES.insert(dispatch_key(handle), Arc::clone(&data));
         (handle, data)

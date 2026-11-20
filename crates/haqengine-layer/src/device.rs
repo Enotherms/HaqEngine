@@ -61,8 +61,30 @@ unsafe fn create_device_inner(
     } else {
         None
     };
-    let (result, patched) =
-        crate::features::create_with_fallback(
+    let base: &vk::DeviceCreateInfo = patch.as_ref().map_or(&*create_info, |p| &p.info);
+    let wait_state = crate::features::present_wait_state(base);
+    let present = if wait_state == crate::features::PresentWaitState::Absent && present_wait_supported(&instance, physical_device) {
+        crate::features::present_patch(base)
+    } else {
+        None
+    };
+    let mut paced = wait_state == crate::features::PresentWaitState::Enabled;
+    let mut created = None;
+    if let Some(p) = &present {
+        let r = next_create(physical_device, &p.info, allocator, out);
+        if r == vk::Result::SUCCESS {
+            paced = true;
+            created = Some((r, patch.is_some()));
+        } else {
+            LOG.log(&format!("pacing off: the device would not start with present waits ({r:?})"));
+            if let Some(l) = find_device_link(base.p_next) {
+                (*l).u.p_layer_info = layer_link;
+            }
+        }
+    }
+    let (result, patched) = match created {
+        Some(c) => c,
+        None => crate::features::create_with_fallback(
             next_create,
             physical_device,
             create_info,
@@ -70,9 +92,16 @@ unsafe fn create_device_inner(
             &mut || (*info).u.p_layer_info = layer_link,
             allocator,
             out,
-        );
+        ),
+    };
     if result != vk::Result::SUCCESS {
         return result;
+    }
+    if !paced && present.is_none() {
+        LOG.log(match wait_state {
+            crate::features::PresentWaitState::Absent => "pacing off: the GPU lacks present waits",
+            _ => "pacing off: no swapchain extension, or the game set present-wait features itself",
+        });
     }
     if wants_quality {
         if patch.is_some() && !patched {
@@ -93,6 +122,16 @@ unsafe fn create_device_inner(
     let device = ash::Device::load_with(load, handle);
     let swapchain = ash::khr::swapchain::DeviceFn::load(load);
     let queue_families = instance.instance.get_physical_device_queue_family_properties(physical_device);
+    let wait_for_present = if paced {
+        let f: Option<vk::PFN_vkWaitForPresentKHR> =
+            next_gdpa(handle, c"vkWaitForPresentKHR".as_ptr()).map(|p| std::mem::transmute(p));
+        if f.is_none() {
+            LOG.log("pacing off: vkWaitForPresentKHR missing");
+        }
+        f
+    } else {
+        None
+    };
     DEVICES.insert(
         dispatch_key(handle),
         Arc::new(DeviceData {
@@ -106,6 +145,7 @@ unsafe fn create_device_inner(
             pipelines: std::sync::OnceLock::new(),
             quality,
             quality_pipelines: std::sync::OnceLock::new(),
+            wait_for_present,
         }),
     );
     vk::Result::SUCCESS
@@ -165,6 +205,29 @@ unsafe fn quality_patch(
         device_api_13,
     };
     crate::features::patch_create_info(ci, &supported)
+}
+
+/// Whether the GPU offers present ids and present waits (both extensions and features).
+/// Below Vulkan 1.1 the features cannot be read, so the extensions decide (a device that then
+/// refuses them is created again without).
+unsafe fn present_wait_supported(instance: &InstanceData, physical: vk::PhysicalDevice) -> bool {
+    let i = &instance.instance;
+    let has = |name: &CStr| {
+        i.enumerate_device_extension_properties(physical)
+            .map(|exts| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name)))
+            .unwrap_or(false)
+    };
+    if !has(ash::khr::present_id::NAME) || !has(ash::khr::present_wait::NAME) {
+        return false;
+    }
+    if !at_least_1_1(instance.api_version) {
+        return true;
+    }
+    let mut id = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+    let mut wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
+    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut id).push_next(&mut wait);
+    i.get_physical_device_features2(physical, &mut f2);
+    id.present_id == vk::TRUE && wait.present_wait == vk::TRUE
 }
 
 /// Quality's gate over what the created device really enabled.

@@ -210,6 +210,79 @@ pub unsafe fn patch_create_info(ci: &vk::DeviceCreateInfo, supported: &Supported
     Ok(Some(FeaturePatch { info, _features: features, _robust: robust, _chain: chain, _extensions: extensions }))
 }
 
+/// Whether a device create info gives HaqEngine present ids and present waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentWaitState {
+    /// Both extensions and both features are on.
+    Enabled,
+    /// Neither feature struct is in the chain, so HaqEngine may add both.
+    Absent,
+    /// The game set a feature struct itself (without turning both on), or makes no swapchains.
+    Unavailable,
+}
+
+unsafe fn lists(ci: &vk::DeviceCreateInfo, name: &CStr) -> bool {
+    (0..ci.enabled_extension_count as usize).any(|i| CStr::from_ptr(*ci.pp_enabled_extension_names.add(i)) == name)
+}
+
+/// What the create info does with `VK_KHR_present_id` and `VK_KHR_present_wait`.
+///
+/// # Safety
+/// `ci` must be a valid device create info.
+pub unsafe fn present_wait_state(ci: &vk::DeviceCreateInfo) -> PresentWaitState {
+    use vk::StructureType as S;
+    if !lists(ci, ash::khr::swapchain::NAME) {
+        return PresentWaitState::Unavailable;
+    }
+    let (mut id, mut wait) = (None, None);
+    each(ci.p_next, |c| match (*c).s_type {
+        S::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR => id = Some((*(c as *const vk::PhysicalDevicePresentIdFeaturesKHR)).present_id == vk::TRUE),
+        S::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR => {
+            wait = Some((*(c as *const vk::PhysicalDevicePresentWaitFeaturesKHR)).present_wait == vk::TRUE)
+        }
+        _ => {}
+    });
+    match (id, wait) {
+        (None, None) => PresentWaitState::Absent,
+        (Some(true), Some(true)) if lists(ci, ash::khr::present_id::NAME) && lists(ci, ash::khr::present_wait::NAME) => PresentWaitState::Enabled,
+        _ => PresentWaitState::Unavailable,
+    }
+}
+
+/// A create info with present ids and present waits added, and everything it points to.
+pub struct PresentPatch {
+    pub info: vk::DeviceCreateInfo<'static>,
+    _id: Box<vk::PhysicalDevicePresentIdFeaturesKHR<'static>>,
+    _wait: Box<vk::PhysicalDevicePresentWaitFeaturesKHR<'static>>,
+    _extensions: Vec<*const c_char>,
+}
+
+/// `ci` with both present-wait extensions listed and their features turned on, by prepending two
+/// structs to the game's (shared, unchanged) chain. `None` unless the state is `Absent`.
+///
+/// # Safety
+/// `ci` must be a valid device create info, alive while the patch is used.
+pub unsafe fn present_patch(ci: &vk::DeviceCreateInfo) -> Option<PresentPatch> {
+    if present_wait_state(ci) != PresentWaitState::Absent {
+        return None;
+    }
+    let mut wait = Box::new(vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true));
+    wait.p_next = ci.p_next as *mut c_void;
+    let mut id = Box::new(vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true));
+    id.p_next = &mut *wait as *mut vk::PhysicalDevicePresentWaitFeaturesKHR as *mut c_void;
+    let mut extensions: Vec<*const c_char> = (0..ci.enabled_extension_count as usize).map(|i| *ci.pp_enabled_extension_names.add(i)).collect();
+    for name in [ash::khr::present_id::NAME, ash::khr::present_wait::NAME] {
+        if !lists(ci, name) {
+            extensions.push(name.as_ptr());
+        }
+    }
+    let mut info: vk::DeviceCreateInfo<'static> = std::ptr::read(ci as *const vk::DeviceCreateInfo as *const vk::DeviceCreateInfo<'static>);
+    info.p_next = &*id as *const vk::PhysicalDevicePresentIdFeaturesKHR as *const c_void;
+    info.enabled_extension_count = extensions.len() as u32;
+    info.pp_enabled_extension_names = extensions.as_ptr();
+    Some(PresentPatch { info, _id: id, _wait: wait, _extensions: extensions })
+}
+
 pub type CreateDevice = unsafe extern "system" fn(
     vk::PhysicalDevice,
     *const vk::DeviceCreateInfo<'_>,
@@ -380,6 +453,66 @@ mod tests {
                 find(patch.info.p_next, vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES).unwrap();
             assert_eq!((*v13c).robust_image_access, vk::TRUE);
             assert_eq!(v13.robust_image_access, vk::FALSE);
+        }
+    }
+
+    unsafe fn present_features(info: &vk::DeviceCreateInfo) -> (bool, bool) {
+        let id: Option<*const vk::PhysicalDevicePresentIdFeaturesKHR> = find(info.p_next, vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+        let wait: Option<*const vk::PhysicalDevicePresentWaitFeaturesKHR> =
+            find(info.p_next, vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
+        (id.is_some_and(|p| (*p).present_id == vk::TRUE), wait.is_some_and(|p| (*p).present_wait == vk::TRUE))
+    }
+
+    #[test]
+    fn present_patch_adds_extensions_and_features() {
+        unsafe {
+            let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+            let swapchain = [ash::khr::swapchain::NAME.as_ptr()];
+            let ci = vk::DeviceCreateInfo::default().enabled_extension_names(&swapchain).push_next(&mut v13);
+            assert_eq!(present_wait_state(&ci), PresentWaitState::Absent);
+            let patch = present_patch(&ci).expect("patch");
+            assert_eq!(present_features(&patch.info), (true, true));
+            let names = ext_names(&patch.info);
+            assert_eq!(names, ["VK_KHR_swapchain", "VK_KHR_present_id", "VK_KHR_present_wait"]);
+            assert!(find::<vk::PhysicalDeviceVulkan13Features>(patch.info.p_next, vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES).is_some());
+            assert_eq!(present_wait_state(&patch.info), PresentWaitState::Enabled);
+            assert_eq!(present_features(&ci), (false, false));
+            assert_eq!(ci.enabled_extension_count, 1);
+        }
+    }
+
+    #[test]
+    fn present_patch_does_not_repeat_a_listed_extension() {
+        unsafe {
+            let names = [ash::khr::swapchain::NAME.as_ptr(), ash::khr::present_id::NAME.as_ptr()];
+            let ci = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+            let patch = present_patch(&ci).expect("patch");
+            assert_eq!(ext_names(&patch.info), ["VK_KHR_swapchain", "VK_KHR_present_id", "VK_KHR_present_wait"]);
+        }
+    }
+
+    #[test]
+    fn present_wait_already_on_needs_no_patch() {
+        unsafe {
+            let names = [ash::khr::swapchain::NAME.as_ptr(), ash::khr::present_id::NAME.as_ptr(), ash::khr::present_wait::NAME.as_ptr()];
+            let mut id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+            let mut wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+            let ci = vk::DeviceCreateInfo::default().enabled_extension_names(&names).push_next(&mut id).push_next(&mut wait);
+            assert_eq!(present_wait_state(&ci), PresentWaitState::Enabled);
+            assert!(present_patch(&ci).is_none());
+        }
+    }
+
+    #[test]
+    fn present_wait_turned_off_by_the_game_is_left_alone() {
+        unsafe {
+            let swapchain = [ash::khr::swapchain::NAME.as_ptr()];
+            let mut wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
+            let ci = vk::DeviceCreateInfo::default().enabled_extension_names(&swapchain).push_next(&mut wait);
+            assert_eq!(present_wait_state(&ci), PresentWaitState::Unavailable);
+            assert!(present_patch(&ci).is_none());
+            let none = vk::DeviceCreateInfo::default();
+            assert_eq!(present_wait_state(&none), PresentWaitState::Unavailable, "no swapchain extension");
         }
     }
 
