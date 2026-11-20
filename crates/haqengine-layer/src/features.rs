@@ -217,7 +217,8 @@ pub enum PresentWaitState {
     Enabled,
     /// Neither feature struct is in the chain, so HaqEngine may add both.
     Absent,
-    /// The game set a feature struct itself (without turning both on), or makes no swapchains.
+    /// The game set a feature struct itself (without turning both on), uses the newer present
+    /// ids (`VK_KHR_present_id2`/`VK_KHR_present_wait2`), or makes no swapchains.
     Unavailable,
 }
 
@@ -231,7 +232,7 @@ unsafe fn lists(ci: &vk::DeviceCreateInfo, name: &CStr) -> bool {
 /// `ci` must be a valid device create info.
 pub unsafe fn present_wait_state(ci: &vk::DeviceCreateInfo) -> PresentWaitState {
     use vk::StructureType as S;
-    if !lists(ci, ash::khr::swapchain::NAME) {
+    if !lists(ci, ash::khr::swapchain::NAME) || lists(ci, c"VK_KHR_present_id2") || lists(ci, c"VK_KHR_present_wait2") {
         return PresentWaitState::Unavailable;
     }
     let (mut id, mut wait) = (None, None);
@@ -500,6 +501,18 @@ mod tests {
             let ci = vk::DeviceCreateInfo::default().enabled_extension_names(&names).push_next(&mut id).push_next(&mut wait);
             assert_eq!(present_wait_state(&ci), PresentWaitState::Enabled);
             assert!(present_patch(&ci).is_none());
+        }
+    }
+
+    #[test]
+    fn present_id2_from_the_game_is_left_alone() {
+        unsafe {
+            for ext in [c"VK_KHR_present_id2", c"VK_KHR_present_wait2"] {
+                let names = [ash::khr::swapchain::NAME.as_ptr(), ext.as_ptr()];
+                let ci = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+                assert_eq!(present_wait_state(&ci), PresentWaitState::Unavailable, "{ext:?}");
+                assert!(present_patch(&ci).is_none());
+            }
         }
     }
 

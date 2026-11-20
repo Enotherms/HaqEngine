@@ -75,7 +75,7 @@ unsafe fn create_device_inner(
     } else {
         None
     };
-    let mut paced = wait_state == crate::features::PresentWaitState::Enabled;
+    let mut paced = false;
     let mut created = None;
     if let Some(p) = &present {
         let r = next_create(physical_device, &p.info, allocator, out);
@@ -107,7 +107,8 @@ unsafe fn create_device_inner(
     if !paced && present.is_none() {
         LOG.log(match wait_state {
             crate::features::PresentWaitState::Absent => "pacing off: the GPU lacks present waits",
-            _ => "pacing off: no swapchain extension, or the game set present-wait features itself",
+            crate::features::PresentWaitState::Enabled => "pacing off: the game waits for its own presents",
+            crate::features::PresentWaitState::Unavailable => "pacing off: no swapchain extension, or the game uses present ids itself",
         });
     }
     if wants_quality {
@@ -271,7 +272,6 @@ pub fn extension_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCreateSwapchainKHR" => crate::erase(crate::swapchain::create_swapchain as *const ()),
         b"vkDestroySwapchainKHR" => crate::erase(crate::swapchain::destroy_swapchain as *const ()),
         b"vkQueuePresentKHR" => crate::erase(crate::swapchain::queue_present as *const ()),
-        b"vkWaitForPresentKHR" => crate::erase(crate::swapchain::wait_for_present as *const ()),
         _ => None,
     }
 }
