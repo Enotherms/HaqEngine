@@ -1,12 +1,15 @@
 //! Decides, per swapchain, whether HaqEngine generates frames and how the swapchain must change.
 
 use ash::vk;
+use haqengine_core::MAX_MULTIPLIER;
 
 /// What HaqEngine does with one swapchain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwapchainPlan {
     pub generate: bool,
     pub reason: &'static str,
+    /// Frames shown per real frame this swapchain can hold (1 when not generating).
+    pub multiplier: u32,
     pub min_image_count: u32,
     pub image_usage: vk::ImageUsageFlags,
     pub present_mode: vk::PresentModeKHR,
@@ -29,6 +32,7 @@ pub fn plan_swapchain_with(
         return SwapchainPlan {
             generate: false,
             reason: "game present modes include non-FIFO (swapchain_maintenance1)",
+            multiplier: 1,
             min_image_count: ci.min_image_count,
             image_usage: ci.image_usage,
             present_mode: ci.present_mode,
@@ -48,6 +52,7 @@ pub fn plan_swapchain(
     let off = |reason| SwapchainPlan {
         generate: false,
         reason,
+        multiplier: 1,
         min_image_count: ci.min_image_count,
         image_usage: ci.image_usage,
         present_mode: ci.present_mode,
@@ -64,13 +69,21 @@ pub fn plan_swapchain(
     if !queue_can_transfer {
         return off("present queue cannot transfer");
     }
-    if caps.max_image_count != 0 && ci.min_image_count + 1 > caps.max_image_count {
+    let room = if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count.saturating_sub(ci.min_image_count) };
+    let fits = multiplier.min(MAX_MULTIPLIER).min(room.saturating_add(1));
+    if fits < 2 {
         return off("no room for an extra image");
     }
+    let reason = match (fits < multiplier.min(MAX_MULTIPLIER), fits) {
+        (false, _) => "generating",
+        (true, 2) => "generating at 2x: no room for more images",
+        (true, _) => "generating at 3x: no room for more images",
+    };
     SwapchainPlan {
         generate: true,
-        reason: "generating",
-        min_image_count: ci.min_image_count + 1,
+        reason,
+        multiplier: fits,
+        min_image_count: ci.min_image_count + fits - 1,
         image_usage: ci.image_usage | copy,
         present_mode: vk::PresentModeKHR::FIFO,
     }
@@ -108,6 +121,35 @@ mod tests {
         assert_eq!(p.min_image_count, c.min_image_count);
         assert_eq!(p.image_usage, c.image_usage);
         assert_eq!(p.present_mode, c.present_mode);
+    }
+
+    #[test]
+    fn plan_adds_m_minus_1_images() {
+        let c = ci(3, vk::PresentModeKHR::FIFO);
+        for (m, images) in [(2, 4), (3, 5), (4, 6)] {
+            let p = plan_swapchain(&c, &caps(8, all_usage()), m, true);
+            assert!(p.generate);
+            assert_eq!((p.multiplier, p.min_image_count), (m, images), "{m}");
+        }
+    }
+
+    #[test]
+    fn plan_falls_back_when_no_room_for_three() {
+        let c = ci(3, vk::PresentModeKHR::FIFO);
+        let p = plan_swapchain(&c, &caps(4, all_usage()), 3, true);
+        assert!(p.generate);
+        assert_eq!((p.multiplier, p.min_image_count), (2, 4));
+        assert_eq!(p.reason, "generating at 2x: no room for more images");
+        let p = plan_swapchain(&c, &caps(5, all_usage()), 4, true);
+        assert_eq!((p.multiplier, p.min_image_count, p.reason), (3, 5, "generating at 3x: no room for more images"));
+    }
+
+    #[test]
+    fn plan_off_when_no_room_for_two() {
+        let c = ci(3, vk::PresentModeKHR::FIFO);
+        let p = plan_swapchain(&c, &caps(3, all_usage()), 3, true);
+        assert_unchanged(&p, &c);
+        assert_eq!(p.multiplier, 1);
     }
 
     #[test]

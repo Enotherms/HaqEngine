@@ -208,7 +208,10 @@ unsafe fn create_swapchain_inner(
                 (Mode::Battery, Some(f)) => (Some(f), false, " battery".to_string()),
                 (Mode::Battery | Mode::Quality, None) => (None, false, format!(" copy (format {:?} not supported)", ci.image_format)),
             };
-            let engine = if generate { engine } else { String::new() };
+            let engine = match plan {
+                Some(p) if generate => format!("{engine} {}x", p.multiplier),
+                _ => String::new(),
+            };
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             LOG.log(&format!(
                 "swapchain {id}: {}x{} format {:?} colour {:?} images {count} mode {:?} gen {reason}{engine}{}",
@@ -234,7 +237,7 @@ unsafe fn create_swapchain_inner(
                     images: count,
                     presents: AtomicU64::new(0),
                     device: Some(Arc::clone(&data)),
-                    gen: generate.then(|| FrameGen::new(images, ci.image_extent, battery_format, quality)),
+                    gen: generate.then(|| FrameGen::new(images, ci.image_extent, battery_format, quality, plan.map_or(1, |p| p.multiplier))),
                     fifo_only_modes,
                 },
             );

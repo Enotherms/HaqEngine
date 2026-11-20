@@ -18,7 +18,7 @@ pub enum Mode {
 pub struct Settings {
     /// Where to write the log, or `None` for no log.
     pub log_path: Option<PathBuf>,
-    /// Frames shown per real frame: 1 (pass-through) or 2.
+    /// Frames shown per real frame: 1 (pass-through) to `MAX_MULTIPLIER`.
     pub multiplier: u32,
     /// Set when the requested multiplier was clamped.
     pub multiplier_note: Option<String>,
@@ -40,9 +40,11 @@ impl Settings {
                 .map(|base| base.join("haqengine/haqengine.log")),
         };
         let (multiplier, multiplier_note) = match get("HAQENGINE_MULTIPLIER").as_deref().map(str::trim) {
-            Some("2") => (2, None),
-            Some(v @ ("3" | "4")) => (2, Some(format!("multiplier {v} requested; 3x/4x arrive in M5, using 2"))),
-            _ => (1, None),
+            None => (1, None),
+            Some(v) => match v.parse::<u32>() {
+                Ok(m @ 1..=crate::pacing::MAX_MULTIPLIER) => (m, None),
+                _ => (1, Some(format!("unknown HAQENGINE_MULTIPLIER {v:?}; using 1"))),
+            },
         };
         let (mode, mode_note) = match get("HAQENGINE_MODE").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") | Some("battery") => (Mode::Battery, None),
@@ -108,16 +110,20 @@ mod tests {
     }
 
     #[test]
-    fn multiplier_accepts_1_and_2() {
-        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", "2")])).multiplier, 2);
-        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", "1")])).multiplier, 1);
+    fn multiplier_accepts_1_to_4() {
+        for m in 1..=4u32 {
+            let s = Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", &m.to_string())]));
+            assert_eq!((s.multiplier, s.multiplier_note), (m, None), "{m}");
+        }
     }
 
     #[test]
-    fn multiplier_clamps_3_and_4_with_note() {
-        let s = Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", "4")]));
-        assert_eq!(s.multiplier, 2);
-        assert!(s.multiplier_note.unwrap().contains("M5"));
+    fn multiplier_rejects_5_and_garbage_with_note() {
+        for v in ["5", "0", "x"] {
+            let s = Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", v)]));
+            assert_eq!(s.multiplier, 1, "{v}");
+            assert!(s.multiplier_note.is_some(), "{v}");
+        }
     }
 
     #[test]
@@ -157,11 +163,11 @@ mod tests {
 
     #[test]
     fn notes_report_mode_and_multiplier_problems() {
-        let s = Settings::from_lookup(env(&[("HAQENGINE_MODE", "cpy"), ("HAQENGINE_MULTIPLIER", "4")]));
+        let s = Settings::from_lookup(env(&[("HAQENGINE_MODE", "cpy"), ("HAQENGINE_MULTIPLIER", "9")]));
         let notes = s.notes();
         assert_eq!(notes.len(), 2);
         assert!(notes.iter().any(|n| n.contains("cpy")));
-        assert!(notes.iter().any(|n| n.contains("M5")));
+        assert!(notes.iter().any(|n| n.contains("\"9\"")));
         assert!(Settings::from_lookup(env(&[])).notes().is_empty());
     }
 

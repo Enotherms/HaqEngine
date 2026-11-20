@@ -105,17 +105,26 @@ pub struct FrameGen {
     pub battery_format: Option<PackedFormat>,
     /// Whether this swapchain runs Quality mode (falling back to Battery if it cannot start).
     pub quality: bool,
+    /// Frames shown per real frame this swapchain was created for (its extra images).
+    pub multiplier: u32,
     pub disabled: AtomicBool,
     pub state: Mutex<GenState>,
 }
 
 impl FrameGen {
-    pub fn new(images: Vec<vk::Image>, extent: vk::Extent2D, battery_format: Option<PackedFormat>, quality: bool) -> FrameGen {
+    pub fn new(
+        images: Vec<vk::Image>,
+        extent: vk::Extent2D,
+        battery_format: Option<PackedFormat>,
+        quality: bool,
+        multiplier: u32,
+    ) -> FrameGen {
         FrameGen {
             images,
             extent,
             battery_format,
             quality: quality && battery_format.is_some(),
+            multiplier,
             disabled: AtomicBool::new(false),
             state: Mutex::new(GenState {
                 ready: None,
