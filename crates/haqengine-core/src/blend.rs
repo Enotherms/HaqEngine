@@ -208,13 +208,29 @@ pub fn battery_blend_packed_reference(
     cur_luma: &Image<f32>,
     t: f32,
 ) -> (Image<u32>, ChangeCounts) {
+    let (out, counts, _) = battery_blend_packed_with_tiles(f, prev, cur, flow, prev_luma, cur_luma, t);
+    (out, counts)
+}
+
+/// `battery_blend_packed_reference` that also returns the no-match count of each tile (empty at
+/// `t = 0` and `t = 1`, where nothing is blended).
+pub fn battery_blend_packed_with_tiles(
+    f: PackedFormat,
+    prev: &Image<u32>,
+    cur: &Image<u32>,
+    flow: &Flow,
+    prev_luma: &Image<f32>,
+    cur_luma: &Image<f32>,
+    t: f32,
+) -> (Image<u32>, ChangeCounts, Image<u32>) {
     use crate::packed::{bilinear_packed, pack};
     let mut counts = ChangeCounts { pixels: cur.width * cur.height, ..ChangeCounts::default() };
+    let none = Image::new(cur.width.div_ceil(TILE), cur.height.div_ceil(TILE), 0u32);
     if t == 0.0 {
-        return (prev.clone(), counts);
+        return (prev.clone(), counts, none);
     }
     if t == 1.0 {
-        return (cur.clone(), counts);
+        return (cur.clone(), counts, none);
     }
     let mut out = cur.clone();
     let mut flags = vec![false; (cur.width * cur.height) as usize];
@@ -239,10 +255,10 @@ pub fn battery_blend_packed_reference(
             out.set(x, y, pack(f, c));
         }
     }
-    if is_cut(&counts) {
-        return (cur.clone(), counts);
-    }
     let tiles = tile_counts(|x, y| flags[(y * cur.width + x) as usize], cur.width, cur.height);
+    if is_cut(&counts) {
+        return (cur.clone(), counts, tiles);
+    }
     let nearer = if t < 0.5 { prev } else { cur };
     for y in 0..cur.height {
         for x in 0..cur.width {
@@ -257,7 +273,7 @@ pub fn battery_blend_packed_reference(
             }
         }
     }
-    (out, counts)
+    (out, counts, tiles)
 }
 
 #[cfg(test)]

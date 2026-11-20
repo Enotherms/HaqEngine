@@ -9,6 +9,7 @@ layout(set = 0, binding = 3, r32ui) uniform writeonly uimage2D dst;
 layout(set = 0, binding = 4, r32f) uniform readonly image2D prev_luma;
 layout(set = 0, binding = 5, r32f) uniform readonly image2D cur_luma;
 layout(set = 0, binding = 6, r32ui) uniform uimage2D counters;
+layout(set = 0, binding = 7, r32ui) uniform uimage2D tiles;
 
 layout(push_constant) uniform Push {
     uint w;
@@ -224,6 +225,8 @@ void main() {
     if (gl_LocalInvocationIndex == 0u) {
         if (group_disagree > 0u) {
             imageAtomicAdd(counters, ivec2(0, int(pc.row)), group_disagree);
+            int tiles_h = int((pc.h + 15u) / 16u);
+            imageAtomicAdd(tiles, ivec2(origin.x / 16, origin.y / 16 + int(pc.row) * tiles_h), group_disagree);
         }
         if (group_still > 0u) {
             imageAtomicAdd(counters, ivec2(1, int(pc.row)), group_still);

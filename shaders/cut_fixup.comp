@@ -4,22 +4,119 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D counters;
 layout(set = 0, binding = 1, r32ui) uniform readonly uimage2D cur_frame;
-layout(set = 0, binding = 2, r32ui) uniform writeonly uimage2D dst;
+layout(set = 0, binding = 2, r32ui) uniform uimage2D dst;
+layout(set = 0, binding = 3, r32ui) uniform readonly uimage2D prev_frame;
+layout(set = 0, binding = 4, r32ui) uniform readonly uimage2D tiles;
 
 layout(push_constant) uniform Push {
     uint w;
     uint h;
     uint cut_threshold;
     uint row;
+    float t;
+    uint format;
 } pc;
+
+const uint TILE = 16u;
+const float FALLBACK_FROM = 0.35;
+const float FALLBACK_FULL = 0.65;
+
+vec4 unpack_pixel(uint w) {
+    if (pc.format == 2u) {
+        return vec4(
+            float(w & 1023u) / 1023.0,
+            float((w >> 10u) & 1023u) / 1023.0,
+            float((w >> 20u) & 1023u) / 1023.0,
+            float(w >> 30u) / 3.0
+        );
+    }
+    vec4 b = vec4(float(w & 255u), float((w >> 8u) & 255u), float((w >> 16u) & 255u), float(w >> 24u)) / 255.0;
+    return pc.format == 1u ? b.zyxw : b;
+}
+
+uint quantize(float c, float m) {
+    precise float v = clamp(c, 0.0, 1.0) * m;
+    precise float r = v + 0.5;
+    return uint(floor(r));
+}
+
+uint pack_pixel(vec4 c) {
+    if (pc.format == 2u) {
+        return quantize(c.r, 1023.0) | (quantize(c.g, 1023.0) << 10u) | (quantize(c.b, 1023.0) << 20u)
+            | (quantize(c.a, 3.0) << 30u);
+    }
+    vec4 o = pc.format == 1u ? c.zyxw : c;
+    return quantize(o.x, 255.0) | (quantize(o.y, 255.0) << 8u) | (quantize(o.z, 255.0) << 16u)
+        | (quantize(o.w, 255.0) << 24u);
+}
+
+shared float near_shares[3][3];
+shared uint any_over;
+
+float share(int tx, int ty) {
+    int tw = int((pc.w + TILE - 1u) / TILE);
+    int th = int((pc.h + TILE - 1u) / TILE);
+    tx = clamp(tx, 0, tw - 1);
+    ty = clamp(ty, 0, th - 1);
+    uint pw = min(TILE, pc.w - uint(tx) * TILE);
+    uint ph = min(TILE, pc.h - uint(ty) * TILE);
+    uint n = imageLoad(tiles, ivec2(tx, ty + int(pc.row) * th)).r;
+    return float(n) / float(pw * ph);
+}
+
+float near_share(int tx, int ty, ivec2 home) {
+    return near_shares[ty - home.y + 1][tx - home.x + 1];
+}
+
+float fallback_weight(ivec2 p, ivec2 home) {
+    float u = (float(p.x) + 0.5) / float(TILE) - 0.5;
+    float v = (float(p.y) + 0.5) / float(TILE) - 0.5;
+    float u0 = floor(u);
+    float v0 = floor(v);
+    float fu = u - u0;
+    float fv = v - v0;
+    int i = int(u0);
+    int j = int(v0);
+    float top = near_share(i, j, home) * (1.0 - fu) + near_share(i + 1, j, home) * fu;
+    float bottom = near_share(i, j + 1, home) * (1.0 - fu) + near_share(i + 1, j + 1, home) * fu;
+    float s = top * (1.0 - fv) + bottom * fv;
+    return clamp((s - FALLBACK_FROM) / (FALLBACK_FULL - FALLBACK_FROM), 0.0, 1.0);
+}
 
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    if (p.x >= int(pc.w) || p.y >= int(pc.h)) {
+    bool inside = p.x < int(pc.w) && p.y < int(pc.h);
+    if (imageLoad(counters, ivec2(0, int(pc.row))).r > pc.cut_threshold) {
+        if (inside) {
+            imageStore(dst, p, uvec4(imageLoad(cur_frame, p).r, 0u, 0u, 0u));
+        }
         return;
     }
-    if (imageLoad(counters, ivec2(0, int(pc.row))).r <= pc.cut_threshold) {
+    ivec2 home = ivec2(gl_WorkGroupID.xy) * 8 / int(TILE);
+    uint l = gl_LocalInvocationIndex;
+    if (l == 0u) {
+        any_over = 0u;
+    }
+    barrier();
+    if (l < 9u) {
+        int dx = int(l % 3u) - 1;
+        int dy = int(l / 3u) - 1;
+        float sh = share(home.x + dx, home.y + dy);
+        near_shares[dy + 1][dx + 1] = sh;
+        if (sh > FALLBACK_FROM) {
+            atomicOr(any_over, 1u);
+        }
+    }
+    barrier();
+    if (any_over == 0u || !inside) {
         return;
     }
-    imageStore(dst, p, uvec4(imageLoad(cur_frame, p).r, 0u, 0u, 0u));
+    float weight = fallback_weight(p, home);
+    if (weight <= 0.0) {
+        return;
+    }
+    vec4 o = unpack_pixel(imageLoad(dst, p).r);
+    vec4 n = unpack_pixel(pc.t < 0.5 ? imageLoad(prev_frame, p).r : imageLoad(cur_frame, p).r);
+    vec3 c = o.rgb * (1.0 - weight) + n.rgb * weight;
+    imageStore(dst, p, uvec4(pack_pixel(vec4(c, 1.0)), 0u, 0u, 0u));
 }

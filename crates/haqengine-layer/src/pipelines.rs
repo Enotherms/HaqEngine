@@ -108,8 +108,8 @@ impl Pipelines {
             (&LUMA_REDUCE, 2, 8),
             (&BLOCK_MATCH, 4, 24),
             (&FLOW_MEDIAN, 2, 8),
-            (&BATTERY_BLEND_PACKED, 7, 28),
-            (&CUT_FIXUP, 3, 16),
+            (&BATTERY_BLEND_PACKED, 8, 28),
+            (&CUT_FIXUP, 5, 24),
         ];
         for (shader, bindings, push) in specs {
             match create_pass(d, shader, bindings, push) {
