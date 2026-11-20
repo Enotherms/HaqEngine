@@ -27,6 +27,30 @@ pub const FALLBACK_FROM: f32 = 0.35;
 /// ...and where it is complete.
 pub const FALLBACK_FULL: f32 = 0.65;
 
+/// Whether both samples of vector `v` at time `t` for pixel `(x, y)` lie inside the frame.
+pub fn samples_inside(x: u32, y: u32, v: [f32; 2], t: f32, width: u32, height: u32) -> bool {
+    let (px, py) = (x as f32, y as f32);
+    let (ax, ay) = (px - t * v[0], py - t * v[1]);
+    let (bx, by) = (px + (1.0 - t) * v[0], py + (1.0 - t) * v[1]);
+    let (mx, my) = ((width - 1) as f32, (height - 1) as f32);
+    [ax, bx].iter().all(|&c| (0.0..=mx).contains(&c)) && [ay, by].iter().all(|&c| (0.0..=my).contains(&c))
+}
+
+/// Whether pixel `(x, y)` may be scenery entering or leaving at the frame edge: a candidate vector
+/// (its own block's or an edge neighbour's, as `choose_vector` uses them) sends a sample outside the
+/// frame. Such no-match pixels do not count toward the regional fallback.
+pub fn edge_scenery(x: u32, y: u32, t: f32, flow: &Flow, width: u32, height: u32) -> bool {
+    let (bx, by) = ((x / 16).min(flow.width - 1) as i64, (y / 16).min(flow.height - 1) as i64);
+    [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)].iter().any(|&(ox, oy)| {
+        let (nx, ny) = (bx + ox, by + oy);
+        if nx < 0 || ny < 0 || nx >= flow.width as i64 || ny >= flow.height as i64 {
+            return false;
+        }
+        let v: [f32; 2] = flow.get(nx as u32, ny as u32);
+        !samples_inside(x, y, [v[0] * 2.0, v[1] * 2.0], t, width, height)
+    })
+}
+
 /// No-match pixels per `TILE`×`TILE` tile of a `width`×`height` frame.
 pub fn tile_counts(disagree: impl Fn(u32, u32) -> bool, width: u32, height: u32) -> Image<u32> {
     let mut tiles = Image::new(width.div_ceil(TILE), height.div_ceil(TILE), 0u32);
@@ -163,7 +187,7 @@ pub fn battery_blend_reference(
             };
             let (cost, v) = choose_vector(x, y, (flow.width, flow.height), vector_at, luma8(prev_luma), luma8(cur_luma), t);
             let disagree = cost > DISAGREE8;
-            flags[(y * cur.width + x) as usize] = disagree;
+            flags[(y * cur.width + x) as usize] = disagree && !edge_scenery(x, y, t, flow, cur.width, cur.height);
             counts.disagree += disagree as u32;
             counts.still += (cost == 0 && v == [0.0, 0.0]) as u32;
             let (px, py) = (x as f32, y as f32);
@@ -242,7 +266,7 @@ pub fn battery_blend_packed_with_tiles(
             };
             let (cost, v) = choose_vector(x, y, (flow.width, flow.height), vector_at, luma8(prev_luma), luma8(cur_luma), t);
             let disagree = cost > DISAGREE8;
-            flags[(y * cur.width + x) as usize] = disagree;
+            flags[(y * cur.width + x) as usize] = disagree && !edge_scenery(x, y, t, flow, cur.width, cur.height);
             counts.disagree += disagree as u32;
             counts.still += (cost == 0 && v == [0.0, 0.0]) as u32;
             let (px, py) = (x as f32, y as f32);
@@ -335,6 +359,51 @@ mod tests {
         for y in 8..184 {
             for x in 112..224 {
                 assert_eq!(out.get(x, y)[..3], want.get(x, y)[..3], "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn scenery_entering_at_the_edge_never_falls_back() {
+        for (dx, dy) in [(60, 0), (-40, 0), (0, 40), (0, -40)] {
+            let prev = noise(256, 192, 59);
+            let cur = shift(&prev, dx, dy);
+            let (lp, lc) = (luma_downsample(&prev), luma_downsample(&cur));
+            let flow = uniform(256, 192, [dx as f32 / 2.0, dy as f32 / 2.0]);
+            let f = PackedFormat::Rgba8;
+            for t in [1.0 / 3.0, 0.5, 2.0 / 3.0] {
+                let (_, counts, tiles) = battery_blend_packed_with_tiles(f, &to_packed(f, &prev), &to_packed(f, &cur), &flow, &lp, &lc, t);
+                assert!(counts.disagree > 0, "the entering strip still counts toward cuts ({dx}, {dy})");
+                for y in 0..192 {
+                    for x in 0..256 {
+                        assert_eq!(fallback_weight(&tiles, 256, 192, x, y), 0.0, "pan ({dx}, {dy}) t={t} falls back at ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scenery_entering_with_estimated_flow_barely_falls_back() {
+        for (dx, dy, limit) in [(24, 0, 0.0f32), (0, -40, 0.005), (60, 0, 0.005)] {
+            let prev = noise(256, 192, 61);
+            let cur = shift(&prev, dx, dy);
+            let (pp, cp) = (pyramid(&prev), pyramid(&cur));
+            let flow = estimate_flow(&pp, &cp);
+            let f = PackedFormat::Rgba8;
+            for t in [1.0 / 3.0, 2.0 / 3.0] {
+                let (_, _, tiles) = battery_blend_packed_with_tiles(f, &to_packed(f, &prev), &to_packed(f, &cur), &flow, &pp[0], &cp[0], t);
+                let (mut n, mut strongest) = (0u32, 0.0f32);
+                for y in 0..192 {
+                    for x in 0..256 {
+                        let w = fallback_weight(&tiles, 256, 192, x, y);
+                        n += (w > 0.0) as u32;
+                        strongest = strongest.max(w);
+                    }
+                }
+                let share = n as f32 / (256.0 * 192.0);
+                assert!(share <= limit, "pan ({dx}, {dy}) t={t}: {share:.4} of the frame falls back");
+                assert!(limit > 0.0 || strongest == 0.0, "pan ({dx}, {dy}) t={t}: weight {strongest}");
             }
         }
     }

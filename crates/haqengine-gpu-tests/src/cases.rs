@@ -1498,6 +1498,40 @@ fn battery_fallback_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(CaseResult { report: merge(&reports), gpu_us: m.blend_us, tolerance: 255.0 })
 }
 
+/// Pans with estimated flow: scenery entering and leaving at the frame edges must not fall back
+/// (24 px/frame: none; 40 and 60 px/frame: at most 0.5% of the frame).
+fn battery_edge_scenery_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let tile = haqengine_core::blend::TILE;
+    let mut reports = Vec::new();
+    for (dx, dy, limit) in [(24i32, 0i32, 0u32), (0, -40, 1280 * 800 / 200), (60, 0, 1280 * 800 / 200)] {
+        let frames = pan_frames(1280, 800, dx, dy, 1, 331);
+        let m = battery_multi(gpu, BF, &frames[0], &frames[1], &THIRDS)?;
+        let band = 800u32.div_ceil(tile);
+        for k in 0..THIRDS.len() {
+            let mut own = Image::new(1280u32.div_ceil(tile), band, 0u32);
+            for ty in 0..band {
+                for tx in 0..own.width {
+                    own.set(tx, ty, m.tiles.get(tx, ty + k as u32 * band));
+                }
+            }
+            let (mut falling, mut strongest) = (0u32, 0.0f32);
+            for y in 0..800 {
+                for x in 0..1280 {
+                    let w = haqengine_core::blend::fallback_weight(&own, 1280, 800, x, y);
+                    falling += (w > 0.0) as u32;
+                    strongest = strongest.max(w);
+                }
+            }
+            println!("      pan ({dx}, {dy}) output {k}: {falling} pixels fall back, strongest {strongest:.2}");
+            if falling > limit {
+                return Err(format!("pan ({dx}, {dy}) output {k}: {falling} pixels fall back (limit {limit}), strongest {strongest:.2}"));
+            }
+            reports.push(packed::compare_packed(BF, &m.outputs[k].0, &m.outputs[k].0, 0.0));
+        }
+    }
+    Ok(CaseResult { report: merge(&reports), gpu_us: 0.0, tolerance: 0.0 })
+}
+
 /// GPU output and tile counts equal the CPU reference on the flash scene, at 2x and 3x and at an
 /// odd size whose edge tiles are partial.
 fn battery_fallback_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
@@ -1994,6 +2028,7 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("battery blend matches CPU where motion size decides", battery_rule_parity_case),
         case("battery fallback takes the nearer frame", battery_fallback_case),
         case("battery fallback matches CPU", battery_fallback_parity_case),
+        case("battery fallback leaves entering scenery alone", battery_edge_scenery_case),
         case("battery blend no ghosts", battery_ghost_case),
         case("battery blend menu fade", battery_menu_case),
         case("battery blend pipeline total", battery_total_case),
@@ -2100,6 +2135,7 @@ mod tests {
             "battery blend matches CPU where motion size decides",
             "battery fallback takes the nearer frame",
             "battery fallback matches CPU",
+            "battery fallback leaves entering scenery alone",
             "battery blend no ghosts",
             "battery blend menu fade",
             "battery blend pipeline total",

@@ -106,6 +106,7 @@ float size_of(vec2 v) {
 shared int win_prev[6][8][8];
 shared int win_cur[6][8][8];
 shared uint group_disagree;
+shared uint group_tile;
 shared uint group_still;
 
 uint shape12(int i, ivec2 ca, ivec2 cb) {
@@ -139,6 +140,7 @@ void main() {
     }
     if (gl_LocalInvocationIndex == 0u) {
         group_disagree = 0u;
+        group_tile = 0u;
         group_still = 0u;
     }
     ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8;
@@ -216,6 +218,18 @@ void main() {
     imageStore(dst, p, uvec4(pack_pixel(vec4(c, 1.0)), 0u, 0u, 0u));
     if (best_cost > DISAGREE8) {
         atomicAdd(group_disagree, 1u);
+        vec2 last = vec2(float(pc.w - 1u), float(pc.h - 1u));
+        bool edge = false;
+        for (int i = 1; i < n; i++) {
+            vec2 sa = prev_at(pf, cands[i]);
+            vec2 sb = cur_at(pf, cands[i]);
+            bool inside_a = all(greaterThanEqual(sa, vec2(0.0))) && all(lessThanEqual(sa, last));
+            bool inside_b = all(greaterThanEqual(sb, vec2(0.0))) && all(lessThanEqual(sb, last));
+            edge = edge || !(inside_a && inside_b);
+        }
+        if (!edge) {
+            atomicAdd(group_tile, 1u);
+        }
     }
     if (best_cost == 0u && best == vec2(0.0)) {
         atomicAdd(group_still, 1u);
@@ -225,8 +239,10 @@ void main() {
     if (gl_LocalInvocationIndex == 0u) {
         if (group_disagree > 0u) {
             imageAtomicAdd(counters, ivec2(0, int(pc.row)), group_disagree);
+        }
+        if (group_tile > 0u) {
             int tiles_h = int((pc.h + 15u) / 16u);
-            imageAtomicAdd(tiles, ivec2(origin.x / 16, origin.y / 16 + int(pc.row) * tiles_h), group_disagree);
+            imageAtomicAdd(tiles, ivec2(origin.x / 16, origin.y / 16 + int(pc.row) * tiles_h), group_tile);
         }
         if (group_still > 0u) {
             imageAtomicAdd(counters, ivec2(1, int(pc.row)), group_still);
