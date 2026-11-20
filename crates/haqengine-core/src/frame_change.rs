@@ -1,14 +1,15 @@
 //! How much changed between two real frames, and the decisions taken from it: a scene cut (show
-//! the new frame) and a mostly still screen (skip generation).
+//! the new frame) and a still screen (skip generation).
 
 use std::fmt;
 
 pub const CUT_FRACTION: f32 = 0.45;
-/// Still pixels needed to enter still mode: a menu with a small animated part still qualifies.
-pub const STILL_FRACTION: f32 = 0.85;
+/// Still pixels needed to enter still mode. Menus measured in game are either below 50% or above
+/// 99.5% still, while gameplay often sits between, so the line stays high.
+pub const STILL_FRACTION: f32 = 0.995;
 /// Still pixels needed to stay in still mode once in it, so a cursor or a small effect does not
 /// flip generation on and off.
-pub const STILL_KEEP_FRACTION: f32 = 0.75;
+pub const STILL_KEEP_FRACTION: f32 = 0.99;
 pub const STILL_FRAMES: u32 = 2;
 
 /// Per-frame pixel counts from the blend: pixels whose best candidate still disagrees, pixels that
@@ -123,10 +124,10 @@ mod tests {
     fn cut_and_still_thresholds() {
         assert!(!is_cut(&counts(450, 0)));
         assert!(is_cut(&counts(451, 0)));
-        assert!(!is_still(&counts(0, 849)));
-        assert!(is_still(&counts(0, 850)));
-        assert!(!stays_still(&counts(0, 749)));
-        assert!(stays_still(&counts(0, 750)));
+        assert!(!is_still(&counts(0, 994)));
+        assert!(is_still(&counts(0, 995)));
+        assert!(!stays_still(&counts(0, 989)));
+        assert!(stays_still(&counts(0, 990)));
         assert!(!is_cut(&ChangeCounts::default()) && !is_still(&ChangeCounts::default()));
     }
 
@@ -152,15 +153,15 @@ mod tests {
     }
 
     #[test]
-    fn mostly_still_enters_and_keeps_with_hysteresis() {
+    fn still_enters_and_keeps_with_hysteresis() {
         let mut d = StillDetector::new();
-        assert!(!d.observe(Some(counts(0, 849))));
-        assert!(!d.observe(Some(counts(0, 849))), "below the enter line never enters");
-        assert!(!d.observe(Some(counts(0, 850))));
-        assert!(d.observe(Some(counts(0, 850))), "two mostly-still frames enter");
-        assert!(d.observe(Some(counts(0, 750))), "a small moving part keeps still mode");
-        assert!(!d.observe(Some(counts(0, 749))), "more motion leaves at once");
-        assert!(!d.observe(Some(counts(0, 800))), "re-entering needs the enter line again");
+        assert!(!d.observe(Some(counts(0, 994))));
+        assert!(!d.observe(Some(counts(0, 994))), "below the enter line never enters");
+        assert!(!d.observe(Some(counts(0, 995))));
+        assert!(d.observe(Some(counts(0, 995))), "two still frames enter");
+        assert!(d.observe(Some(counts(0, 990))), "a cursor keeps still mode");
+        assert!(!d.observe(Some(counts(0, 989))), "more motion leaves at once");
+        assert!(!d.observe(Some(counts(0, 992))), "re-entering needs the enter line again");
     }
 
     #[test]
