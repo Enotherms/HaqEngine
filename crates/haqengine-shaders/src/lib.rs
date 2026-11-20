@@ -308,8 +308,9 @@ pub const FI_PASSES: [&Fsr3Pass; 11] = [
 
 /// HaqEngine's zero-first blend on Battery's flow at time `t`, packed: bindings 0 = prev `r32ui`,
 /// 1 = cur `r32ui`, 2 = level-0 flow `rg32f`, 3 = output `r32ui`, 4/5 = prev/cur level-0 luma
-/// `r32f`, 6 = change counters `r32ui` 2×1 (0 = disagreeing pixels, 1 = still pixels, added with
-/// atomics; cleared before the dispatch); push `{ w, h, flow_w, flow_h, t: f32, format }`.
+/// `r32f`, 6 = change counters `r32ui` 2 wide, one row per output (column 0 = disagreeing pixels,
+/// 1 = still pixels, added with atomics; cleared before the first blend); push
+/// `{ w, h, flow_w, flow_h, t: f32, format, row }`.
 pub const BATTERY_BLEND_PACKED: Shader = Shader {
     name: "battery_blend_packed",
     spirv: include_bytes!(concat!(env!("OUT_DIR"), "/battery_blend_packed.spv")),
@@ -317,8 +318,8 @@ pub const BATTERY_BLEND_PACKED: Shader = Shader {
 };
 
 /// Shows the current frame on a scene cut: bindings 0 = change counters `r32ui`, 1 = current
-/// frame `r32ui`, 2 = output `r32ui`; push `{ w, h, cut_threshold }` (pixels; more disagreeing
-/// pixels than that is a cut).
+/// frame `r32ui`, 2 = output `r32ui`; push `{ w, h, cut_threshold, row }` (pixels; more
+/// disagreeing pixels than that in counter row `row` is a cut).
 pub const CUT_FIXUP: Shader = Shader {
     name: "cut_fixup",
     spirv: include_bytes!(concat!(env!("OUT_DIR"), "/cut_fixup.spv")),

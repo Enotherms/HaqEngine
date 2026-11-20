@@ -10,6 +10,7 @@ layout(push_constant) uniform Push {
     uint w;
     uint h;
     uint cut_threshold;
+    uint row;
 } pc;
 
 void main() {
@@ -17,7 +18,7 @@ void main() {
     if (p.x >= int(pc.w) || p.y >= int(pc.h)) {
         return;
     }
-    if (imageLoad(counters, ivec2(0, 0)).r <= pc.cut_threshold) {
+    if (imageLoad(counters, ivec2(0, int(pc.row))).r <= pc.cut_threshold) {
         return;
     }
     imageStore(dst, p, uvec4(imageLoad(cur_frame, p).r, 0u, 0u, 0u));

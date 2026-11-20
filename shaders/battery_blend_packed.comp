@@ -17,6 +17,7 @@ layout(push_constant) uniform Push {
     uint flow_h;
     float t;
     uint format;
+    uint row;
 } pc;
 
 const int BLOCK = 16;
@@ -79,6 +80,19 @@ vec4 bilinear(bool previous, vec2 p) {
     return mix(mix(a, b, f.x), mix(c0, d, f.x), f.y);
 }
 
+vec2 prev_at(vec2 p, vec2 v) {
+    precise vec2 s = pc.t * v;
+    precise vec2 r = p - s;
+    return r;
+}
+
+vec2 cur_at(vec2 p, vec2 v) {
+    precise float u = 1.0 - pc.t;
+    precise vec2 s = u * v;
+    precise vec2 r = p + s;
+    return r;
+}
+
 vec2 vector_at(ivec2 block) {
     return imageLoad(flow, block).xy * 2.0;
 }
@@ -127,8 +141,8 @@ void main() {
     ivec2 base_prev[6];
     ivec2 base_cur[6];
     for (int i = 0; i < n; i++) {
-        base_prev[i] = ivec2(floor((vec2(origin) - pc.t * cands[i]) / 2.0)) - ivec2(1);
-        base_cur[i] = ivec2(floor((vec2(origin) + (1.0 - pc.t) * cands[i]) / 2.0)) - ivec2(1);
+        base_prev[i] = ivec2(floor(prev_at(vec2(origin), cands[i]) / 2.0)) - ivec2(1);
+        base_cur[i] = ivec2(floor(cur_at(vec2(origin), cands[i]) / 2.0)) - ivec2(1);
         win_prev[i][l.y][l.x] = luma_at(true, base_prev[i] + l);
         win_cur[i][l.y][l.x] = luma_at(false, base_cur[i] + l);
     }
@@ -138,8 +152,8 @@ void main() {
     uint best_cost = 0xFFFFFFFFu;
     vec2 best = vec2(0.0);
     for (int i = 0; i < n; i++) {
-        ivec2 ca = clamp(ivec2(floor((pf - pc.t * cands[i]) / 2.0)) - base_prev[i], ivec2(1), ivec2(6));
-        ivec2 cb = clamp(ivec2(floor((pf + (1.0 - pc.t) * cands[i]) / 2.0)) - base_cur[i], ivec2(1), ivec2(6));
+        ivec2 ca = clamp(ivec2(floor(prev_at(pf, cands[i]) / 2.0)) - base_prev[i], ivec2(1), ivec2(6));
+        ivec2 cb = clamp(ivec2(floor(cur_at(pf, cands[i]) / 2.0)) - base_cur[i], ivec2(1), ivec2(6));
         uint cost = 0u;
         for (int dy = -1; dy <= 1; dy++) {
             for (int dx = -1; dx <= 1; dx++) {
@@ -155,8 +169,8 @@ void main() {
             break;
         }
     }
-    vec4 a = bilinear(true, pf - pc.t * best);
-    vec4 b = bilinear(false, pf + (1.0 - pc.t) * best);
+    vec4 a = bilinear(true, prev_at(pf, best));
+    vec4 b = bilinear(false, cur_at(pf, best));
     vec3 c = best_cost > DISAGREE8 ? (pc.t >= 0.5 ? b.rgb : a.rgb) : a.rgb * (1.0 - pc.t) + b.rgb * pc.t;
     imageStore(dst, p, uvec4(pack_pixel(vec4(c, 1.0)), 0u, 0u, 0u));
     if (best_cost > DISAGREE8) {
@@ -169,10 +183,10 @@ void main() {
     barrier();
     if (gl_LocalInvocationIndex == 0u) {
         if (group_disagree > 0u) {
-            imageAtomicAdd(counters, ivec2(0, 0), group_disagree);
+            imageAtomicAdd(counters, ivec2(0, int(pc.row)), group_disagree);
         }
         if (group_still > 0u) {
-            imageAtomicAdd(counters, ivec2(1, 0), group_still);
+            imageAtomicAdd(counters, ivec2(1, int(pc.row)), group_still);
         }
     }
 }
