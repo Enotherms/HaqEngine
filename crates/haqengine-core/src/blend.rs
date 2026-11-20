@@ -18,7 +18,7 @@ pub const NEAR_BEST8: u32 = 96;
 /// A smaller candidate must also match in shape: its 3×3 differences, with their weighted mean
 /// removed, may sum to at most this. A brightness change (an ear turning) passes; texture that
 /// only lines up badly (a dim pan seen as still) does not.
-pub const SHAPE8: u32 = 16;
+pub const SHAPE8: u32 = 8;
 
 /// The per-pixel choice: the winning candidate's cost and its vector (full-resolution pixels): the
 /// smallest motion among the candidates within `NEAR_BEST8` of the best cost whose shape matches

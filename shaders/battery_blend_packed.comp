@@ -22,6 +22,8 @@ layout(push_constant) uniform Push {
 
 const int BLOCK = 16;
 const uint DISAGREE8 = 288u;
+const uint NEAR_BEST8 = 96u;
+const uint SHAPE8 = 8u;
 
 vec4 unpack_pixel(uint w) {
     if (pc.format == 2u) {
@@ -97,11 +99,32 @@ vec2 vector_at(ivec2 block) {
     return imageLoad(flow, block).xy * 2.0;
 }
 
+float size_of(vec2 v) {
+    return abs(v.x) + abs(v.y);
+}
 shared int win_prev[6][8][8];
 shared int win_cur[6][8][8];
 shared uint group_disagree;
 shared uint group_still;
 
+uint shape12(int i, ivec2 ca, ivec2 cb) {
+    int signed_sum = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int weight = (dx == 0 && dy == 0) ? 4 : 1;
+            signed_sum += weight * (win_prev[i][ca.y + dy][ca.x + dx] - win_cur[i][cb.y + dy][cb.x + dx]);
+        }
+    }
+    uint shape = 0u;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int weight = (dx == 0 && dy == 0) ? 4 : 1;
+            int d = win_prev[i][ca.y + dy][ca.x + dx] - win_cur[i][cb.y + dy][cb.x + dx];
+            shape += uint(weight) * uint(abs(12 * d - signed_sum));
+        }
+    }
+    return shape;
+}
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
@@ -149,9 +172,14 @@ void main() {
     barrier();
     if (inside) {
     vec2 pf = vec2(p);
-    uint best_cost = 0xFFFFFFFFu;
-    vec2 best = vec2(0.0);
+    uint costs[6];
+    uint lowest = 0xFFFFFFFFu;
+    int pick = 0;
     for (int i = 0; i < n; i++) {
+        costs[i] = 0xFFFFFFFFu;
+        if (lowest == 0u && size_of(cands[i]) >= size_of(cands[pick])) {
+            continue;
+        }
         ivec2 ca = clamp(ivec2(floor(prev_at(pf, cands[i]) / 2.0)) - base_prev[i], ivec2(1), ivec2(6));
         ivec2 cb = clamp(ivec2(floor(cur_at(pf, cands[i]) / 2.0)) - base_cur[i], ivec2(1), ivec2(6));
         uint cost = 0u;
@@ -161,14 +189,26 @@ void main() {
                 cost += weight * uint(abs(win_prev[i][ca.y + dy][ca.x + dx] - win_cur[i][cb.y + dy][cb.x + dx]));
             }
         }
-        if (cost < best_cost) {
-            best_cost = cost;
-            best = cands[i];
-        }
-        if (best_cost == 0u) {
-            break;
+        costs[i] = cost;
+        if (cost < lowest) {
+            lowest = cost;
+            pick = i;
         }
     }
+    if (lowest <= DISAGREE8) {
+        uint limit = min(lowest + NEAR_BEST8, DISAGREE8);
+        for (int i = 0; i < n; i++) {
+            if (costs[i] <= limit && size_of(cands[i]) < size_of(cands[pick])) {
+                ivec2 ca = clamp(ivec2(floor(prev_at(pf, cands[i]) / 2.0)) - base_prev[i], ivec2(1), ivec2(6));
+                ivec2 cb = clamp(ivec2(floor(cur_at(pf, cands[i]) / 2.0)) - base_cur[i], ivec2(1), ivec2(6));
+                if (shape12(i, ca, cb) <= 12u * SHAPE8) {
+                    pick = i;
+                }
+            }
+        }
+    }
+    uint best_cost = costs[pick];
+    vec2 best = cands[pick];
     vec4 a = bilinear(true, prev_at(pf, best));
     vec4 b = bilinear(false, cur_at(pf, best));
     vec3 c = best_cost > DISAGREE8 ? (pc.t >= 0.5 ? b.rgb : a.rgb) : a.rgb * (1.0 - pc.t) + b.rgb * pc.t;
