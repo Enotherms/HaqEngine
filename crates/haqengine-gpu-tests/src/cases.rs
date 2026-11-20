@@ -1223,11 +1223,17 @@ fn run_battery_blends(
     prev_luma: &StorageImage,
     cur_luma: &StorageImage,
     times: &[f32],
-) -> Result<(Vec<BlendOutput>, f64), String> {
+) -> Result<(Vec<BlendOutput>, f64, Image<u32>), String> {
     if times.is_empty() || times.len() > haqengine_core::MAX_GENERATED {
         return Err(format!("{} blend times", times.len()));
     }
     let counters = gpu.create_storage_image(vk::Format::R32_UINT, 2, haqengine_core::MAX_GENERATED as u32)?;
+    let tile = haqengine_core::blend::TILE;
+    let tiles = gpu.create_storage_image(
+        vk::Format::R32_UINT,
+        prev.width.div_ceil(tile),
+        prev.height.div_ceil(tile) * haqengine_core::MAX_GENERATED as u32,
+    )?;
     let mut dsts: Vec<StorageImage> = Vec::with_capacity(times.len());
     let result = (|| {
         for _ in times {
@@ -1236,6 +1242,7 @@ fn run_battery_blends(
             dsts.push(dst);
         }
         gpu.clear_u32(&counters, 0)?;
+        gpu.clear_u32(&tiles, 0)?;
         let pixels = prev.width * prev.height;
         let threshold = haqengine_core::frame_change::cut_threshold_pixels(pixels);
         let mut us = 0.0;
@@ -1252,12 +1259,19 @@ fn run_battery_blends(
             ]);
             us += gpu.run(
                 &haqengine_shaders::BATTERY_BLEND_PACKED,
-                &[prev, cur, flow_img, dst, prev_luma, cur_luma, &counters],
+                &[prev, cur, flow_img, dst, prev_luma, cur_luma, &counters, &tiles],
                 &push,
                 groups(prev.width, prev.height),
             )?;
-            let fix_push = push_bytes(&[prev.width.to_le_bytes(), prev.height.to_le_bytes(), threshold.to_le_bytes(), row.to_le_bytes()]);
-            us += gpu.run(&haqengine_shaders::CUT_FIXUP, &[&counters, cur, dst], &fix_push, groups(prev.width, prev.height))?;
+            let fix_push = push_bytes(&[
+                prev.width.to_le_bytes(),
+                prev.height.to_le_bytes(),
+                threshold.to_le_bytes(),
+                row.to_le_bytes(),
+                t.to_le_bytes(),
+                f.code().to_le_bytes(),
+            ]);
+            us += gpu.run(&haqengine_shaders::CUT_FIXUP, &[&counters, cur, dst, prev, &tiles], &fix_push, groups(prev.width, prev.height))?;
         }
         let c = gpu.read_u32(&counters)?;
         let mut outputs = Vec::with_capacity(times.len());
@@ -1265,12 +1279,13 @@ fn run_battery_blends(
             let counts = haqengine_core::frame_change::ChangeCounts { disagree: c.data[2 * k], still: c.data[2 * k + 1], pixels };
             outputs.push((gpu.read_u32(dst)?, counts));
         }
-        Ok((outputs, us))
+        Ok((outputs, us, gpu.read_u32(&tiles)?))
     })();
     for dst in dsts {
         gpu.destroy_image(dst);
     }
     gpu.destroy_image(counters);
+    gpu.destroy_image(tiles);
     result
 }
 
@@ -1286,7 +1301,7 @@ fn run_battery_blend(
     cur_luma: &StorageImage,
     t: f32,
 ) -> Result<(Image<u32>, haqengine_core::frame_change::ChangeCounts, f64), String> {
-    let (mut outputs, us) = run_battery_blends(gpu, f, prev, cur, flow_img, prev_luma, cur_luma, &[t])?;
+    let (mut outputs, us, _) = run_battery_blends(gpu, f, prev, cur, flow_img, prev_luma, cur_luma, &[t])?;
     let (out, counts) = outputs.remove(0);
     Ok((out, counts, us))
 }
@@ -1331,6 +1346,8 @@ fn with_battery_flow<R>(
 /// Several blends of one frame pair on one flow, as 3x/4x does.
 struct BatteryMulti {
     outputs: Vec<BlendOutput>,
+    /// The tile map, one band of `height.div_ceil(TILE)` rows per output.
+    tiles: Image<u32>,
     flow: Flow,
     prev_luma: Image<f32>,
     cur_luma: Image<f32>,
@@ -1339,11 +1356,11 @@ struct BatteryMulti {
 }
 
 fn battery_multi(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgba8>, times: &[f32]) -> Result<BatteryMulti, String> {
-    let ((outputs, blend_us, flow, prev_luma, cur_luma), flow_us, _) = with_battery_flow(gpu, f, prev, cur, |fp, fc, flows| {
-        let (outputs, us) = run_battery_blends(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], times)?;
-        Ok((outputs, us, gpu.read_rg32f(&flows.images[0])?, gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?))
+    let ((outputs, blend_us, tiles, flow, prev_luma, cur_luma), flow_us, _) = with_battery_flow(gpu, f, prev, cur, |fp, fc, flows| {
+        let (outputs, us, tiles) = run_battery_blends(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], times)?;
+        Ok((outputs, us, tiles, gpu.read_rg32f(&flows.images[0])?, gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?))
     })?;
-    Ok(BatteryMulti { outputs, flow, prev_luma, cur_luma, flow_us, blend_us })
+    Ok(BatteryMulti { outputs, tiles, flow, prev_luma, cur_luma, flow_us, blend_us })
 }
 
 /// One frame pair through Battery on the GPU: its flow, then M3c's warp and the new blend.
@@ -1451,6 +1468,98 @@ fn battery_3x_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
                 return Err(format!("{w}x{h} output {k}: counts GPU {counts:?}, CPU {want:?}"));
             }
             reports.push(packed::compare_packed(f, &expected, out, 1.0));
+        }
+    }
+    Ok(CaseResult { report: merge(&reports), gpu_us: 0.0, tolerance: 1.0 })
+}
+
+/// A pan with a 192×192 white flash in the new frame (an ultimate's burst at 1280×800 scale).
+fn flash_frames(width: u32, height: u32) -> Vec<Image<Rgba8>> {
+    let mut frames = pan_frames(width, height, 8, 0, 1, 321);
+    paste(&mut frames[1], &Image::new(192, 192, [255u8, 255, 255, 255]), (544, 304));
+    frames
+}
+
+/// Inside a region without matching motion each generated frame shows the nearer real frame.
+fn battery_fallback_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let frames = flash_frames(1280, 800);
+    let m = battery_multi(gpu, BF, &frames[0], &frames[1], &THIRDS)?;
+    let inside = |x: u32, y: u32| (568..712).contains(&x) && (328..472).contains(&y);
+    let mut reports = Vec::new();
+    for (k, nearer) in [&frames[0], &frames[1]].into_iter().enumerate() {
+        let got = unpack_image(BF, &m.outputs[k].0);
+        let err = mean_err(&got, nearer, inside);
+        println!("      output {k}: mean error to the nearer real frame {err:.3}");
+        if err > 1.0 {
+            return Err(format!("output {k}: {err:.3} from the nearer real frame inside the flash"));
+        }
+        reports.push(packed::compare_packed(BF, &packed::to_packed(BF, nearer), &m.outputs[k].0, 255.0));
+    }
+    Ok(CaseResult { report: merge(&reports), gpu_us: m.blend_us, tolerance: 255.0 })
+}
+
+/// Pans with estimated flow: scenery entering and leaving at the frame edges must not fall back
+/// (24 px/frame: none; 40 and 60 px/frame: at most 0.5% of the frame).
+fn battery_edge_scenery_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let tile = haqengine_core::blend::TILE;
+    let mut reports = Vec::new();
+    for (dx, dy, limit) in [(24i32, 0i32, 0u32), (0, -40, 1280 * 800 / 200), (60, 0, 1280 * 800 / 200)] {
+        let frames = pan_frames(1280, 800, dx, dy, 1, 331);
+        let m = battery_multi(gpu, BF, &frames[0], &frames[1], &THIRDS)?;
+        let band = 800u32.div_ceil(tile);
+        for k in 0..THIRDS.len() {
+            let mut own = Image::new(1280u32.div_ceil(tile), band, 0u32);
+            for ty in 0..band {
+                for tx in 0..own.width {
+                    own.set(tx, ty, m.tiles.get(tx, ty + k as u32 * band));
+                }
+            }
+            let (mut falling, mut strongest) = (0u32, 0.0f32);
+            for y in 0..800 {
+                for x in 0..1280 {
+                    let w = haqengine_core::blend::fallback_weight(&own, 1280, 800, x, y);
+                    falling += (w > 0.0) as u32;
+                    strongest = strongest.max(w);
+                }
+            }
+            println!("      pan ({dx}, {dy}) output {k}: {falling} pixels fall back, strongest {strongest:.2}");
+            if falling > limit {
+                return Err(format!("pan ({dx}, {dy}) output {k}: {falling} pixels fall back (limit {limit}), strongest {strongest:.2}"));
+            }
+            reports.push(packed::compare_packed(BF, &m.outputs[k].0, &m.outputs[k].0, 0.0));
+        }
+    }
+    Ok(CaseResult { report: merge(&reports), gpu_us: 0.0, tolerance: 0.0 })
+}
+
+/// GPU output and tile counts equal the CPU reference on the flash scene, at 2x and 3x and at an
+/// odd size whose edge tiles are partial.
+fn battery_fallback_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let f = BF;
+    let tile = haqengine_core::blend::TILE;
+    let mut reports = Vec::new();
+    for (w, h) in [(1280u32, 800u32), (1283, 797)] {
+        let frames = flash_frames(w, h);
+        let (pp, cp) = (packed::to_packed(f, &frames[0]), packed::to_packed(f, &frames[1]));
+        for times in [&[0.5f32][..], &THIRDS[..]] {
+            let m = battery_multi(gpu, f, &frames[0], &frames[1], times)?;
+            let band = h.div_ceil(tile);
+            for (k, (out, counts)) in m.outputs.iter().enumerate() {
+                let (expected, want, tiles) =
+                    haqengine_core::blend::battery_blend_packed_with_tiles(f, &pp, &cp, &m.flow, &m.prev_luma, &m.cur_luma, times[k]);
+                if *counts != want {
+                    return Err(format!("{w}x{h} t={} counts GPU {counts:?}, CPU {want:?}", times[k]));
+                }
+                for ty in 0..band {
+                    for tx in 0..tiles.width {
+                        let (gpu_n, cpu_n) = (m.tiles.get(tx, ty + k as u32 * band), tiles.get(tx, ty));
+                        if gpu_n != cpu_n {
+                            return Err(format!("{w}x{h} t={} tile ({tx}, {ty}): GPU {gpu_n}, CPU {cpu_n}", times[k]));
+                        }
+                    }
+                }
+                reports.push(packed::compare_packed(f, &expected, out, 1.0));
+            }
         }
     }
     Ok(CaseResult { report: merge(&reports), gpu_us: 0.0, tolerance: 1.0 })
@@ -1917,6 +2026,9 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("battery blend thin bar over a pan", battery_thin_bar_case),
         case("battery blend dim pan", battery_dim_pan_case),
         case("battery blend matches CPU where motion size decides", battery_rule_parity_case),
+        case("battery fallback takes the nearer frame", battery_fallback_case),
+        case("battery fallback matches CPU", battery_fallback_parity_case),
+        case("battery fallback leaves entering scenery alone", battery_edge_scenery_case),
         case("battery blend no ghosts", battery_ghost_case),
         case("battery blend menu fade", battery_menu_case),
         case("battery blend pipeline total", battery_total_case),
@@ -2021,6 +2133,9 @@ mod tests {
             "battery blend thin bar over a pan",
             "battery blend dim pan",
             "battery blend matches CPU where motion size decides",
+            "battery fallback takes the nearer frame",
+            "battery fallback matches CPU",
+            "battery fallback leaves entering scenery alone",
             "battery blend no ghosts",
             "battery blend menu fade",
             "battery blend pipeline total",

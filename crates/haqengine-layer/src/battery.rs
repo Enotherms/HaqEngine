@@ -67,7 +67,9 @@ const FLOW_BASE: usize = PYR_BASE + 2 * LEVELS;
 const MEDIAN_BASE: usize = FLOW_BASE + LEVELS;
 const DUMMY: usize = MEDIAN_BASE + LEVELS - 1;
 const COUNTERS: usize = DUMMY + 1;
-const IMAGE_COUNT: usize = COUNTERS + 1;
+/// No-match pixels per 16×16 tile, one band of rows per output (read by the fixup's fallback).
+const TILES: usize = COUNTERS + 1;
+const IMAGE_COUNT: usize = TILES + 1;
 /// Outputs after the first live past the fixed images: output `k >= 1` is `IMAGE_COUNT + k - 1`.
 fn out_image(k: usize) -> usize {
     if k == 0 { RAW_OUT } else { IMAGE_COUNT + k - 1 }
@@ -315,6 +317,8 @@ impl BatteryResources {
         }
         specs.push((vk::Format::R32G32_SFLOAT, 1, 1));
         specs.push((vk::Format::R32_UINT, 2, haqengine_core::MAX_GENERATED as u32));
+        let tile = haqengine_core::blend::TILE;
+        specs.push((vk::Format::R32_UINT, extent.width.div_ceil(tile), extent.height.div_ceil(tile) * haqengine_core::MAX_GENERATED as u32));
         for _ in 1..outputs {
             specs.push((vk::Format::R32_UINT, extent.width, extent.height));
         }
@@ -330,7 +334,7 @@ impl BatteryResources {
                 }
             }
         }
-        let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(128)];
+        let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(160)];
         let pool = match d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(32).pool_sizes(&sizes), None) {
             Ok(p) => p,
             Err(e) => {
@@ -442,8 +446,8 @@ impl BatteryResources {
             }
             for k in 0..self.outputs {
                 let out = v(out_image(k));
-                write_set(d, self.warp_sets[p][k], &[v(q), v(p), v(FLOW_BASE), out, v(pyr(q, 0)), v(pyr(p, 0)), v(COUNTERS)]);
-                write_set(d, self.fixup_sets[p][k], &[v(COUNTERS), v(p), out]);
+                write_set(d, self.warp_sets[p][k], &[v(q), v(p), v(FLOW_BASE), out, v(pyr(q, 0)), v(pyr(p, 0)), v(COUNTERS), v(TILES)]);
+                write_set(d, self.fixup_sets[p][k], &[v(COUNTERS), v(p), out, v(q), v(TILES)]);
             }
         }
         for l in 1..LEVELS {
@@ -556,7 +560,9 @@ impl BatteryResources {
                 }
             }
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
-            d.cmd_clear_color_image(cmd, self.images[COUNTERS].image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
+            for image in [COUNTERS, TILES] {
+                d.cmd_clear_color_image(cmd, self.images[image].image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
+            }
             memory_barrier(d, cmd, S::TRANSFER, S::COMPUTE_SHADER);
             let threshold = haqengine_core::frame_change::cut_threshold_pixels(w * h);
             let blends = spares.len().max(1);
@@ -575,8 +581,8 @@ impl BatteryResources {
                 dispatch(d, cmd, &p.warp, self.warp_sets[cur][k], push.as_flattened(), groups(w, h));
             }
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
-            for (k, &set) in self.fixup_sets[cur][..blends].iter().enumerate() {
-                let fix = [w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes(), (k as u32).to_le_bytes()];
+            for ((k, &set), t) in self.fixup_sets[cur][..blends].iter().enumerate().zip(haqengine_core::blend_times(m)) {
+                let fix = [w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes(), (k as u32).to_le_bytes(), t.to_le_bytes(), fmt.to_le_bytes()];
                 dispatch(d, cmd, &p.fixup, set, fix.as_flattened(), groups(w, h));
             }
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
