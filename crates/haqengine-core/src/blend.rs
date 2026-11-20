@@ -10,8 +10,19 @@ use crate::packed::PackedFormat;
 /// different things, and the pixel takes the nearer real frame.
 pub const DISAGREE8: u32 = 288;
 
-/// The per-pixel choice: the winning candidate's cost and its vector (full-resolution pixels); the
-/// samples disagree when the cost is above `DISAGREE8`. `vector_at` gives the vector of a 16×16 block of a `blocks_w × blocks_h` grid;
+/// A candidate whose cost is within this of the best (and not above `DISAGREE8`) explains the
+/// pixel nearly as well; among those the smallest motion wins, so a near-static foreground (an ear
+/// over a fast background) is not painted over by the background passing behind it.
+pub const NEAR_BEST8: u32 = 96;
+
+/// A smaller candidate must also match in shape: its 3×3 differences, with their weighted mean
+/// removed, may sum to at most this. A brightness change (an ear turning) passes; texture that
+/// only lines up badly (a dim pan seen as still) does not.
+pub const SHAPE8: u32 = 8;
+
+/// The per-pixel choice: the winning candidate's cost and its vector (full-resolution pixels): the
+/// smallest motion among the candidates within `NEAR_BEST8` of the best cost whose shape matches
+/// (`SHAPE8`), else the best one; above `DISAGREE8` the samples disagree. `vector_at` gives the vector of a 16×16 block of a `blocks_w × blocks_h` grid;
 /// the luma closures read 8-bit half-resolution luma, clamping coordinates.
 #[allow(clippy::too_many_arguments)]
 pub fn choose_vector(
@@ -25,14 +36,21 @@ pub fn choose_vector(
 ) -> (u32, [f32; 2]) {
     let window = |ax: f32, ay: f32, bx: f32, by: f32| {
         let (pa, pb) = (((ax / 2.0).floor() as i64, (ay / 2.0).floor() as i64), ((bx / 2.0).floor() as i64, (by / 2.0).floor() as i64));
-        let mut sum = 0u32;
+        let (mut sum, mut signed) = (0u32, 0i32);
+        let mut diffs = [(0i32, 0i32); 9];
+        let mut k = 0;
         for dy in -1..=1 {
             for dx in -1..=1 {
                 let weight = if dx == 0 && dy == 0 { 4 } else { 1 };
-                sum += weight * luma_prev(pa.0 + dx, pa.1 + dy).abs_diff(luma_cur(pb.0 + dx, pb.1 + dy));
+                let d = luma_prev(pa.0 + dx, pa.1 + dy) - luma_cur(pb.0 + dx, pb.1 + dy);
+                sum += weight as u32 * d.unsigned_abs();
+                signed += weight * d;
+                diffs[k] = (weight, d);
+                k += 1;
             }
         }
-        sum
+        let shape12: u32 = diffs.iter().map(|&(w, d)| w as u32 * (12 * d - signed).unsigned_abs()).sum();
+        (sum, shape12)
     };
     let (bx, by) = ((x / 16).min(blocks.0 - 1) as i64, (y / 16).min(blocks.1 - 1) as i64);
     let mut cands = [[0.0f32; 2]; 6];
@@ -48,14 +66,26 @@ pub fn choose_vector(
         }
     }
     let (px, py) = (x as f32, y as f32);
-    let mut best = (u32::MAX, [0.0f32; 2]);
-    for v in &cands[..n] {
-        let cost = window(px - t * v[0], py - t * v[1], px + (1.0 - t) * v[0], py + (1.0 - t) * v[1]);
-        if cost < best.0 {
-            best = (cost, *v);
+    let mut costs = [0u32; 6];
+    let mut shapes = [0u32; 6];
+    for i in 0..n {
+        let v = cands[i];
+        (costs[i], shapes[i]) = window(px - t * v[0], py - t * v[1], px + (1.0 - t) * v[0], py + (1.0 - t) * v[1]);
+    }
+    let best_cost = *costs[..n].iter().min().expect("the zero candidate");
+    let first_best = costs[..n].iter().position(|&c| c == best_cost).expect("present");
+    if best_cost > DISAGREE8 {
+        return (best_cost, cands[first_best]);
+    }
+    let limit = (best_cost + NEAR_BEST8).min(DISAGREE8);
+    let size = |v: &[f32; 2]| v[0].abs() + v[1].abs();
+    let mut pick = first_best;
+    for i in 0..n {
+        if costs[i] <= limit && shapes[i] <= 12 * SHAPE8 && size(&cands[i]) < size(&cands[pick]) {
+            pick = i;
         }
     }
-    best
+    (costs[pick], cands[pick])
 }
 
 fn luma8(img: &Image<f32>) -> impl Fn(i64, i64) -> i32 + '_ {
@@ -173,6 +203,67 @@ mod tests {
     fn battery(prev: &Image<Rgba8>, cur: &Image<Rgba8>) -> (Image<Rgba8>, crate::frame_change::ChangeCounts) {
         let (pp, cp) = (pyramid(prev), pyramid(cur));
         battery_blend_reference(prev, cur, &estimate_flow(&pp, &cp), &pp[0], &cp[0], 0.5)
+    }
+
+    fn grey(v: u8) -> Rgba8 {
+        [v, v, v, 255]
+    }
+
+    #[test]
+    fn thin_static_bar_survives_a_pan() {
+        let mut prev = noise(256, 128, 41);
+        let mut cur = shift(&prev, 24, 0);
+        for y in 40..88 {
+            for x in 100..112 {
+                prev.set(x, y, grey(204));
+                cur.set(x, y, grey(210));
+            }
+        }
+        let (lp, lc) = (luma_downsample(&prev), luma_downsample(&cur));
+        let (out, _) = battery_blend_reference(&prev, &cur, &uniform(256, 128, [12.0, 0.0]), &lp, &lc, 1.0 / 3.0);
+        for y in 46..82 {
+            for x in 103..109 {
+                let p = out.get(x, y);
+                assert!((0..3).all(|i| p[i].abs_diff(206) <= 8), "bar ({x}, {y}) is {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dim_pan_keeps_moving() {
+        let mut prev = noise(256, 128, 43);
+        for y in 0..128 {
+            for x in 0..256 {
+                let n = prev.get(x, y)[0];
+                prev.set(x, y, grey(124 + n % 9));
+            }
+        }
+        let cur = shift(&prev, 12, 0);
+        let (lp, lc) = (luma_downsample(&prev), luma_downsample(&cur));
+        let (out, _) = battery_blend_reference(&prev, &cur, &uniform(256, 128, [6.0, 0.0]), &lp, &lc, 0.5);
+        let truth = shift(&prev, 6, 0);
+        let (mut sum, mut n) = (0u64, 0u64);
+        for y in 16..112 {
+            for x in 32..224 {
+                sum += out.get(x, y)[0].abs_diff(truth.get(x, y)[0]) as u64;
+                n += 1;
+            }
+        }
+        let mean = sum as f64 / n as f64;
+        assert!(mean <= 2.0, "dim pan mean error {mean:.3}");
+    }
+
+    #[test]
+    fn smallest_acceptable_vector_wins_and_reports_its_cost() {
+        let blocks = (4, 4);
+        let vector_at = |_, _| [20.0f32, 0.0];
+        let pick = |zero_cost: i32| {
+            let prev = |_x: i64, _y: i64| 100;
+            let cur = move |x: i64, y: i64| if (14..=16).contains(&x) && (14..=16).contains(&y) { 100 + zero_cost / 12 } else { 100 };
+            choose_vector(30, 30, blocks, vector_at, prev, cur, 0.5)
+        };
+        assert_eq!(pick(60), (60, [0.0, 0.0]));
+        assert_eq!(pick(120), (0, [20.0, 0.0]));
     }
 
     #[test]

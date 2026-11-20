@@ -1607,6 +1607,64 @@ fn battery_slow_object_case(gpu: &Gpu) -> Result<CaseResult, String> {
     Ok(battery_result(pair.blend_us))
 }
 
+/// A 12×48 bar standing still over a 24 px/frame pan, a little brighter in the new frame (an ear
+/// turning in front of a fast background): it must stay a bar, not take the background's motion.
+fn thin_bar_frames() -> Vec<Image<Rgba8>> {
+    let mut frames = pan_frames(1280, 800, 24, 0, 1, 251);
+    for (k, f) in frames.iter_mut().enumerate() {
+        let v = 204 + 6 * k as u8;
+        paste(f, &Image::new(12, 48, [v, v, v, 255]), (600, 380));
+    }
+    frames
+}
+
+fn dim(img: &Image<Rgba8>) -> Image<Rgba8> {
+    let mut out = img.clone();
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let v = 124 + img.get(x, y)[0] % 9;
+            out.set(x, y, [v, v, v, 255]);
+        }
+    }
+    out
+}
+
+fn battery_thin_bar_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let at = (600u32, 380u32);
+    let frames = thin_bar_frames();
+    let mut truth = pan_at(1280, 800, 24, 0, 1, 251, 1);
+    paste(&mut truth, &Image::new(12, 48, [207u8, 207, 207, 255]), at);
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let on_bar = |x: u32, y: u32| (at.0 + 3..at.0 + 9).contains(&x) && (at.1 + 6..at.1 + 42).contains(&y);
+    battery_compare("thin bar", mean_err(&pair.new_rgba, &truth, on_bar), mean_err(&pair.old, &truth, on_bar), 8.0, 0.5)?;
+    Ok(battery_result(pair.blend_us))
+}
+
+/// A low-contrast pan (luma 124..132, 12 px/frame): every candidate costs little, and the blend
+/// must still move it rather than treat it as still.
+fn battery_dim_pan_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let frames: Vec<Image<Rgba8>> = pan_frames(1280, 800, 12, 0, 1, 261).iter().map(dim).collect();
+    let truth = dim(&pan_at(1280, 800, 12, 0, 1, 261, 1));
+    let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
+    let keep = |x: u32, y: u32| x >= 48 && y >= 48 && x + 48 < 1280 && y + 48 < 800;
+    battery_compare("dim pan", mean_err(&pair.new_rgba, &truth, keep), mean_err(&pair.old, &truth, keep), 2.0, 0.5)?;
+    Ok(battery_result(pair.blend_us))
+}
+
+/// GPU output equals the CPU reference on scenes where the smallest-motion rule decides pixels.
+fn battery_rule_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
+    let bar = thin_bar_frames();
+    let dim_pan: Vec<Image<Rgba8>> = pan_frames(1280, 800, 12, 0, 1, 261).iter().map(dim).collect();
+    let mut reports = Vec::new();
+    for (frames, t) in [(&bar, 0.5f32), (&bar, 1.0 / 3.0), (&dim_pan, 0.5)] {
+        let pair = battery_pair_at(gpu, BF, &frames[0], &frames[1], t)?;
+        let (pp, cp) = (packed::to_packed(BF, &frames[0]), packed::to_packed(BF, &frames[1]));
+        let (expected, _) = haqengine_core::blend::battery_blend_packed_reference(BF, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, t);
+        reports.push(packed::compare_packed(BF, &expected, &pair.new, 1.0));
+    }
+    Ok(CaseResult { report: merge(&reports), gpu_us: 0.0, tolerance: 1.0 })
+}
+
 fn battery_ghost_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let bg = Image::new(1280, 800, [200u8, 200, 200, 255]);
     let square = checker(200, 200, 10);
@@ -1856,6 +1914,9 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("battery blend static overlay", battery_overlay_case),
         case("battery blend still square", battery_square_case),
         case("battery blend small slow object", battery_slow_object_case),
+        case("battery blend thin bar over a pan", battery_thin_bar_case),
+        case("battery blend dim pan", battery_dim_pan_case),
+        case("battery blend matches CPU where motion size decides", battery_rule_parity_case),
         case("battery blend no ghosts", battery_ghost_case),
         case("battery blend menu fade", battery_menu_case),
         case("battery blend pipeline total", battery_total_case),
@@ -1957,6 +2018,9 @@ mod tests {
             "battery blend static overlay",
             "battery blend still square",
             "battery blend small slow object",
+            "battery blend thin bar over a pan",
+            "battery blend dim pan",
+            "battery blend matches CPU where motion size decides",
             "battery blend no ghosts",
             "battery blend menu fade",
             "battery blend pipeline total",
