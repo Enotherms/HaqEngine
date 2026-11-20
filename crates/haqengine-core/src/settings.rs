@@ -30,6 +30,11 @@ pub struct Settings {
     /// Whether generated presents wait for the screen so at most one frame queues ahead
     /// (`HAQENGINE_PACING=0` or `off` turns it off; presents are still watched and timed).
     pub pacing: bool,
+    /// Measure-only mode (`HAQENGINE_MEASURE=1`): every present passes through untouched and the
+    /// real frame rate is logged, so a game can be measured while another engine generates.
+    pub measure: bool,
+    /// Set when measure-only mode overrides a requested multiplier.
+    pub measure_note: Option<String>,
 }
 
 impl Settings {
@@ -58,7 +63,9 @@ impl Settings {
             Some(other) => (Mode::Battery, Some(format!("unknown HAQENGINE_MODE {other:?}; using battery"))),
         };
         let pacing = !matches!(get("HAQENGINE_PACING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0") | Some("off"));
-        Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new(), pacing }
+        let measure = matches!(get("HAQENGINE_MEASURE").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
+        let measure_note = (measure && multiplier >= 2).then(|| "HAQENGINE_MEASURE set: generation off, measuring only".to_string());
+        Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new(), pacing, measure, measure_note }
     }
 }
 
@@ -83,7 +90,7 @@ impl Settings {
 impl Settings {
     /// Warnings about the environment, to log once when HaqEngine loads.
     pub fn notes(&self) -> Vec<String> {
-        self.mode_note.iter().chain(self.multiplier_note.iter()).chain(self.config_notes.iter()).cloned().collect()
+        self.mode_note.iter().chain(self.multiplier_note.iter()).chain(self.measure_note.iter()).chain(self.config_notes.iter()).cloned().collect()
     }
 }
 
@@ -155,6 +162,25 @@ mod tests {
         for v in ["0", "9", "x", "", "-2"] {
             assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", v)])).multiplier, 1, "{v}");
         }
+    }
+
+    #[test]
+    fn measure_flag_parses() {
+        for v in ["1", "on", "true", " ON "] {
+            assert!(Settings::from_lookup(env(&[("HAQENGINE_MEASURE", v)])).measure, "{v}");
+        }
+        for v in ["0", "", "off"] {
+            assert!(!Settings::from_lookup(env(&[("HAQENGINE_MEASURE", v)])).measure, "{v}");
+        }
+        assert!(!Settings::from_lookup(env(&[])).measure);
+    }
+
+    #[test]
+    fn measure_mode_wins_over_multiplier() {
+        let s = Settings::from_lookup(env(&[("HAQENGINE_MEASURE", "1"), ("HAQENGINE_MULTIPLIER", "2")]));
+        assert!(s.measure);
+        assert!(s.notes().iter().any(|n| n.contains("measuring only")), "{:?}", s.notes());
+        assert!(Settings::from_lookup(env(&[("HAQENGINE_MEASURE", "1")])).notes().is_empty());
     }
 
     #[test]
