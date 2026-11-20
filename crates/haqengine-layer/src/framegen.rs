@@ -371,19 +371,14 @@ impl FrameGen {
     }
 
     /// Whether this present's frames are tagged and watched (and paced, unless `HAQENGINE_PACING`
-    /// is off): the device has present waits, the game does not tag its own presents, and the
-    /// watch thread runs (started here on first use).
-    unsafe fn pacing_ready(&self, st: &mut GenState, id: u64, device: &DeviceData, swapchain: vk::SwapchainKHR, pi: &vk::PresentInfoKHR) -> bool {
+    /// is off): the device has present waits and the watch thread runs (started here on first use).
+    unsafe fn pacing_ready(&self, st: &mut GenState, id: u64, device: &DeviceData, swapchain: vk::SwapchainKHR) -> bool {
         let Some(wait) = device.wait_for_present else { return false };
         if st.watch_off {
             return false;
         }
-        let off = if has_present_id(pi.p_next) {
-            Some("the game sets present ids".to_string())
-        } else {
-            st.watch.as_ref().and_then(|w| w.failed()).map(|e| format!("waiting for presents failed {e:?}"))
-        };
-        if let Some(why) = off {
+        if let Some(e) = st.watch.as_ref().and_then(|w| w.failed()) {
+            let why = format!("waiting for presents failed {e:?}");
             st.watch_off = true;
             st.watch = None;
             LOG.log(&format!("swapchain {id}: pacing off: {why}"));
@@ -434,6 +429,11 @@ impl FrameGen {
             record(st, id, start, 0, skipped);
             r
         };
+        let game_id = game_present_id(pi);
+        let last_used = st.next_present_id;
+        if let Some(g) = game_id {
+            st.next_present_id = st.next_present_id.max(g);
+        }
         crate::state::poll_config(start);
         let (generation, live) = crate::state::live();
         if generation != st.seen_generation {
@@ -479,7 +479,7 @@ impl FrameGen {
             return self.present_still(&mut st, id, device, queue, pi, slot, slot_index, game_index, start);
         }
         let count = self.generated_now(&st);
-        let tag = self.pacing_ready(&mut st, id, device, swapchain, pi);
+        let tag = self.pacing_ready(&mut st, id, device, swapchain);
         if tag && crate::state::SETTINGS.pacing {
             if let (Some(target), Some(w)) = (pace_target(st.last_present_id), st.watch.as_ref()) {
                 let waited = w.wait_shown(target, PACE_TIMEOUT);
@@ -593,9 +593,21 @@ impl FrameGen {
         let swapchains = [swapchain];
         let mut ids = [0u64; MAX_GENERATED + 1];
         if tag {
-            for slot_id in ids.iter_mut().take(count + 1) {
-                st.next_present_id += 1;
-                *slot_id = st.next_present_id;
+            match game_id {
+                Some(g) => {
+                    ids[count] = g;
+                    if let Some(first) = haqengine_core::pacing::ids_before(g, count, last_used) {
+                        for (k, slot_id) in ids.iter_mut().take(count).enumerate() {
+                            *slot_id = first + k as u64;
+                        }
+                    }
+                }
+                None => {
+                    for slot_id in ids.iter_mut().take(count + 1) {
+                        st.next_present_id += 1;
+                        *slot_id = st.next_present_id;
+                    }
+                }
             }
         }
         let mut result = vk::Result::SUCCESS;
@@ -604,11 +616,11 @@ impl FrameGen {
             let index = [spares[k]];
             let mut present_id = vk::PresentIdKHR::default().present_ids(&ids[k..=k]);
             let mut present = vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&index);
-            if tag {
+            if ids[k] > 0 {
                 present = present.push_next(&mut present_id);
             }
             let r = next_present(queue, &present);
-            if tag {
+            if ids[k] > 0 {
                 note_queued(&mut st, r, ids[k], None);
             }
             result = combine_present_results(result, r);
@@ -619,7 +631,7 @@ impl FrameGen {
         let mut real_present = *pi;
         real_present.wait_semaphore_count = 1;
         real_present.p_wait_semaphores = real_wait.as_ptr();
-        if tag {
+        if tag && game_id.is_none() {
             real_present.p_next = &real_id as *const vk::PresentIdKHR as *const std::ffi::c_void;
         }
         let r_real = next_present(queue, &real_present);
@@ -1021,19 +1033,31 @@ pub fn newest_ready_counts(slots: impl Iterator<Item = (bool, u64, Option<Change
     slots.filter(|s| s.0 && s.1 > 0).max_by_key(|s| s.1).and_then(|s| s.2)
 }
 
-/// Whether a present's `pNext` chain carries the game's own `VkPresentIdKHR`.
+/// The game's own `VkPresentIdKHR` in a present's `pNext` chain, if any.
 ///
 /// # Safety
 /// `p_next` must be null or a valid structure chain.
-pub unsafe fn has_present_id(p_next: *const std::ffi::c_void) -> bool {
+pub unsafe fn find_present_id(p_next: *const std::ffi::c_void) -> Option<*const vk::BaseInStructure<'static>> {
     let mut cur = p_next as *const vk::BaseInStructure;
     while !cur.is_null() {
         if (*cur).s_type == vk::StructureType::PRESENT_ID_KHR {
-            return true;
+            return Some(cur);
         }
         cur = (*cur).p_next;
     }
-    false
+    None
+}
+
+/// The game's (nonzero) present id for the first swapchain of a present.
+///
+/// # Safety
+/// `pi` must be a valid present info.
+pub unsafe fn game_present_id(pi: &vk::PresentInfoKHR) -> Option<u64> {
+    let s = find_present_id(pi.p_next)? as *const vk::PresentIdKHR;
+    if (*s).swapchain_count == 0 || (*s).p_present_ids.is_null() {
+        return None;
+    }
+    Some(*(*s).p_present_ids).filter(|&id| id > 0)
 }
 
 /// Frames shown per second in a log window with `real` real and `generated` generated presents.
@@ -1144,11 +1168,16 @@ mod tests {
         let mut id = vk::PresentIdKHR::default().present_ids(&ids);
         let mut regions = vk::PresentRegionsKHR::default();
         let with = vk::PresentInfoKHR::default().push_next(&mut regions).push_next(&mut id);
-        assert!(unsafe { has_present_id(with.p_next) });
+        assert_eq!(unsafe { game_present_id(&with) }, Some(7));
+        let zero = [0u64];
+        let mut id = vk::PresentIdKHR::default().present_ids(&zero);
+        let unset = vk::PresentInfoKHR::default().push_next(&mut id);
+        assert!(unsafe { find_present_id(unset.p_next) }.is_some());
+        assert_eq!(unsafe { game_present_id(&unset) }, None);
         let mut regions = vk::PresentRegionsKHR::default();
         let without = vk::PresentInfoKHR::default().push_next(&mut regions);
-        assert!(!unsafe { has_present_id(without.p_next) });
-        assert!(!unsafe { has_present_id(std::ptr::null()) });
+        assert_eq!(unsafe { game_present_id(&without) }, None);
+        assert!(unsafe { find_present_id(std::ptr::null()) }.is_none());
     }
 
     #[test]

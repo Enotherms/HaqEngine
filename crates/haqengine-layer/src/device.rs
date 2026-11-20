@@ -264,6 +264,7 @@ pub fn extension_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCreateSwapchainKHR" => crate::erase(crate::swapchain::create_swapchain as *const ()),
         b"vkDestroySwapchainKHR" => crate::erase(crate::swapchain::destroy_swapchain as *const ()),
         b"vkQueuePresentKHR" => crate::erase(crate::swapchain::queue_present as *const ()),
+        b"vkWaitForPresentKHR" => crate::erase(crate::swapchain::wait_for_present as *const ()),
         _ => None,
     }
 }

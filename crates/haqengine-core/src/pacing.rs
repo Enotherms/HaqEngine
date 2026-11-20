@@ -22,6 +22,25 @@ pub fn pace_target(last_id: u64) -> Option<u64> {
     last_id.checked_sub(1).filter(|&t| t > 0)
 }
 
+/// How far apart a game's present ids are spread, so the generated presents before each real one
+/// get ids of their own between them.
+pub const ID_SCALE: u64 = MAX_MULTIPLIER as u64;
+
+/// The id presented for the game's present id `game` (0, "no id", stays 0). `None` on overflow.
+pub fn scaled_id(game: u64) -> Option<u64> {
+    game.checked_mul(ID_SCALE)
+}
+
+/// The first id for `count` generated presents queued before a real present with id `real`: the
+/// ids just below it. `None` when there are none or they would not rise above `last`, the newest
+/// id used so far.
+pub fn ids_before(real: u64, count: usize, last: u64) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    real.checked_sub(count as u64).filter(|&first| first > last)
+}
+
 /// Most presents [`ShownQueue`] remembers; older ones are forgotten.
 pub const SHOWN_QUEUE_MAX: usize = 64;
 
@@ -69,6 +88,23 @@ impl ShownQueue {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn game_ids_scale_to_leave_room_for_generated_ones() {
+        assert_eq!(scaled_id(0), Some(0));
+        assert_eq!(scaled_id(5), Some(5 * MAX_MULTIPLIER as u64));
+        assert_eq!(scaled_id(u64::MAX), None);
+        assert!(ID_SCALE > MAX_GENERATED as u64);
+    }
+
+    #[test]
+    fn generated_ids_sit_just_below_the_real_one() {
+        assert_eq!(ids_before(20, 3, 16), Some(17));
+        assert_eq!(ids_before(20, 1, 16), Some(19));
+        assert_eq!(ids_before(20, 3, 17), None, "must rise above the last id used");
+        assert_eq!(ids_before(2, 3, 0), None);
+        assert_eq!(ids_before(20, 0, 16), None);
+    }
 
     #[test]
     fn pace_waits_for_all_but_the_newest_present() {

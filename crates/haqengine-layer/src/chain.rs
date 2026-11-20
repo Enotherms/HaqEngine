@@ -14,6 +14,8 @@ pub struct ChainCopy {
     used: usize,
     /// Per-swapchain present modes for a rewritten `VkSwapchainPresentModeInfoEXT`.
     pub modes: [vk::PresentModeKHR; 16],
+    /// Per-swapchain ids for a rewritten `VkPresentIdKHR`.
+    pub present_ids: [u64; 16],
 }
 
 impl Default for ChainCopy {
@@ -70,7 +72,7 @@ pub fn present_ext_size(s: vk::StructureType) -> Option<usize> {
 
 impl ChainCopy {
     pub fn new() -> Self {
-        ChainCopy { buf: [0; CHAIN_BUF_WORDS], used: 0, modes: [vk::PresentModeKHR::FIFO; 16] }
+        ChainCopy { buf: [0; CHAIN_BUF_WORDS], used: 0, modes: [vk::PresentModeKHR::FIFO; 16], present_ids: [0; 16] }
     }
 
     /// Copies the chain from `head` up to and including the first struct of type `target`.

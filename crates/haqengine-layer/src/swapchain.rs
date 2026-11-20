@@ -25,6 +25,9 @@ pub struct SwapchainInfo {
     pub gen: Option<crate::framegen::FrameGen>,
     /// Created with the game's present-mode list rewritten to `[FIFO]`; presents must stay FIFO.
     pub fifo_only_modes: bool,
+    /// The game's present ids are multiplied by `ID_SCALE` (in presents and in its waits), so
+    /// generated presents get ids between them.
+    pub scaled_ids: bool,
 }
 
 /// Live swapchains, keyed by raw handle.
@@ -252,6 +255,7 @@ unsafe fn create_swapchain_inner(
                         FrameGen::new(images, ci.image_extent, battery_format, data.quality.is_ok(), mode, plan.map_or(1, |p| p.multiplier))
                     }),
                     fifo_only_modes,
+                    scaled_ids: generate && data.wait_for_present.is_some(),
                 },
             );
         });
@@ -326,6 +330,14 @@ unsafe fn queue_present_inner(queue: vk::Queue, present_info: *const vk::Present
                 Some(pi) => pi,
                 None => present_info,
             };
+            let mut id_chain = ChainCopy::new();
+            let scaled = scale_present_ids(&*present_info, &mut id_chain, |sc| {
+                SWAPCHAINS.get(sc.as_raw()).is_some_and(|s| s.scaled_ids)
+            });
+            let present_info: *const vk::PresentInfoKHR = match scaled.as_ref() {
+                Some(pi) => pi,
+                None => present_info,
+            };
             let pi = &*present_info;
             if crate::framegen::present_shape_ok(pi) {
                 if let Some(info) = SWAPCHAINS.get((*pi.p_swapchains).as_raw()) {
@@ -381,6 +393,63 @@ pub unsafe fn fifo_present_info<'a>(pi: &vk::PresentInfoKHR<'a>, chain: &'a mut 
     }
 }
 
+/// `pi` with its `VkPresentIdKHR` copied and each id multiplied by `ID_SCALE` for the swapchains
+/// `scaled` names, or `None` when it has no ids, names none of them, or the chain cannot be copied
+/// (logged once).
+///
+/// # Safety
+/// `pi` must be a valid present info.
+pub unsafe fn scale_present_ids<'a>(
+    pi: &vk::PresentInfoKHR<'a>,
+    chain: &'a mut ChainCopy,
+    scaled: impl Fn(vk::SwapchainKHR) -> bool,
+) -> Option<vk::PresentInfoKHR<'a>> {
+    if pi.p_swapchains.is_null() || crate::framegen::find_present_id(pi.p_next).is_none() {
+        return None;
+    }
+    let swapchains = std::slice::from_raw_parts(pi.p_swapchains, pi.swapchain_count as usize);
+    if !swapchains.iter().any(|&sc| scaled(sc)) {
+        return None;
+    }
+    match chain.copy_prefix(pi.p_next, vk::StructureType::PRESENT_ID_KHR, present_ext_size) {
+        PrefixCopy::Copied { head, target } => {
+            let info = &mut *(target as *mut vk::PresentIdKHR);
+            let n = info.swapchain_count as usize;
+            if n > chain.present_ids.len() || n != swapchains.len() || info.p_present_ids.is_null() {
+                return None;
+            }
+            let game = std::slice::from_raw_parts(info.p_present_ids, n);
+            for (i, (&sc, &id)) in swapchains.iter().zip(game).enumerate() {
+                chain.present_ids[i] = if scaled(sc) { haqengine_core::pacing::scaled_id(id).unwrap_or(0) } else { id };
+            }
+            info.p_present_ids = chain.present_ids.as_ptr();
+            let mut out = *pi;
+            out.p_next = head;
+            Some(out)
+        }
+        PrefixCopy::NotFound | PrefixCopy::Unsupported => {
+            PRESENT_ID_UNREWRITTEN.call_once(|| LOG.log("warning: could not rewrite the game's present ids"));
+            None
+        }
+    }
+}
+
+static PRESENT_ID_UNREWRITTEN: Once = Once::new();
+
+/// The game's `vkWaitForPresentKHR`: on a swapchain whose ids HaqEngine scales, waits for the
+/// scaled id.
+pub unsafe extern "system" fn wait_for_present(device: vk::Device, swapchain: vk::SwapchainKHR, present_id: u64, timeout: u64) -> vk::Result {
+    let scaled = SWAPCHAINS.get(swapchain.as_raw()).is_some_and(|s| s.scaled_ids);
+    let id = if scaled { haqengine_core::pacing::scaled_id(present_id).unwrap_or(u64::MAX) } else { present_id };
+    let next = DEVICES.get(dispatch_key(device)).and_then(|d| {
+        d.wait_for_present.or_else(|| (d.next_gdpa)(device, c"vkWaitForPresentKHR".as_ptr()).map(|f| std::mem::transmute(f)))
+    });
+    match next {
+        Some(f) => f(device, swapchain, id, timeout),
+        None => vk::Result::ERROR_DEVICE_LOST,
+    }
+}
+
 impl Default for SwapchainRegistry {
     fn default() -> Self {
         Self::new()
@@ -403,6 +472,7 @@ mod tests {
             device: None,
             gen: None,
             fifo_only_modes: false,
+            scaled_ids: false,
         }
     }
 
@@ -658,6 +728,54 @@ mod tests {
         assert_eq!(game_modes, [vk::PresentModeKHR::IMMEDIATE], "the game's struct must not change");
         let seen = PRESENTED_MODES.lock().unwrap();
         seen.iter().rev().find(|(sc, _)| *sc == handle).map(|(_, m)| m.clone()).expect("presented")
+    }
+
+    #[test]
+    fn game_present_ids_scale_only_for_scaled_swapchains() {
+        let (a, b) = (vk::SwapchainKHR::from_raw(0x10), vk::SwapchainKHR::from_raw(0x20));
+        let swapchains = [a, b];
+        let game_ids = [5u64, 7];
+        let mut id = vk::PresentIdKHR::default().present_ids(&game_ids);
+        let mut regions = vk::PresentRegionsKHR::default();
+        let pi = vk::PresentInfoKHR::default().swapchains(&swapchains).push_next(&mut id).push_next(&mut regions);
+        let mut chain = ChainCopy::new();
+        let out = unsafe { scale_present_ids(&pi, &mut chain, |sc| sc == a) }.expect("rewritten");
+        let copied = unsafe { &*(crate::framegen::find_present_id(out.p_next).expect("id struct") as *const vk::PresentIdKHR) };
+        let ids = unsafe { std::slice::from_raw_parts(copied.p_present_ids, 2) };
+        assert_eq!(ids, [5 * haqengine_core::pacing::ID_SCALE, 7]);
+        assert_eq!(game_ids, [5, 7], "the game's ids must not change");
+        let mut chain = ChainCopy::new();
+        assert!(unsafe { scale_present_ids(&pi, &mut chain, |_| false) }.is_none());
+        let plain = vk::PresentInfoKHR::default().swapchains(&swapchains);
+        let mut chain = ChainCopy::new();
+        assert!(unsafe { scale_present_ids(&plain, &mut chain, |_| true) }.is_none());
+    }
+
+    static WAITED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "system" fn capture_wait(_: vk::Device, _: vk::SwapchainKHR, id: u64, _: u64) -> vk::Result {
+        WAITED.lock().unwrap().push(id);
+        vk::Result::SUCCESS
+    }
+
+    #[test]
+    fn game_waits_use_the_scaled_ids() {
+        let (device, data) = crate::state::test_support::fake_device(|_| std::ptr::null(), vec![]);
+        DEVICES.remove(dispatch_key(device));
+        let data = Arc::new(DeviceData { wait_for_present: Some(capture_wait), ..Arc::try_unwrap(data).ok().expect("sole owner") });
+        DEVICES.insert(dispatch_key(device), Arc::clone(&data));
+        let (a, b) = (0x5c_9001u64, 0x5c_9002u64);
+        SWAPCHAINS.created(a, SwapchainInfo { scaled_ids: true, device: Some(Arc::clone(&data)), ..info(a) });
+        SWAPCHAINS.created(b, SwapchainInfo { device: Some(Arc::clone(&data)), ..info(b) });
+        unsafe {
+            assert_eq!(wait_for_present(device, vk::SwapchainKHR::from_raw(a), 3, 0), vk::Result::SUCCESS);
+            assert_eq!(wait_for_present(device, vk::SwapchainKHR::from_raw(b), 3, 0), vk::Result::SUCCESS);
+        }
+        SWAPCHAINS.destroyed(a);
+        SWAPCHAINS.destroyed(b);
+        DEVICES.remove(dispatch_key(device));
+        let seen = WAITED.lock().unwrap();
+        assert!(seen.ends_with(&[3 * haqengine_core::pacing::ID_SCALE, 3]), "{seen:?}");
     }
 
     #[test]
