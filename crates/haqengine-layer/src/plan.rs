@@ -41,6 +41,17 @@ pub fn plan_swapchain_with(
     plan_swapchain(ci, caps, multiplier, queue_can_transfer)
 }
 
+/// The multiplier a swapchain asks for: the setting for Battery (also when Quality is unavailable
+/// and Battery runs instead), at most 2 for Quality and copy mode, which present one generated frame.
+pub fn engine_multiplier(mode: haqengine_core::Mode, battery_format: bool, quality_ok: bool, multiplier: u32) -> u32 {
+    use haqengine_core::Mode;
+    match mode {
+        Mode::Battery if battery_format => multiplier,
+        Mode::Quality if battery_format && !quality_ok => multiplier,
+        _ => multiplier.min(2),
+    }
+}
+
 /// Plans a swapchain from the game's create info and the surface capabilities.
 pub fn plan_swapchain(
     ci: &vk::SwapchainCreateInfoKHR,
@@ -121,6 +132,17 @@ mod tests {
         assert_eq!(p.min_image_count, c.min_image_count);
         assert_eq!(p.image_usage, c.image_usage);
         assert_eq!(p.present_mode, c.present_mode);
+    }
+
+    #[test]
+    fn only_battery_asks_for_more_than_two() {
+        use haqengine_core::Mode;
+        assert_eq!(engine_multiplier(Mode::Battery, true, true, 3), 3);
+        assert_eq!(engine_multiplier(Mode::Quality, true, true, 3), 2);
+        assert_eq!(engine_multiplier(Mode::Quality, true, false, 4), 4, "quality unavailable runs battery");
+        assert_eq!(engine_multiplier(Mode::Copy, true, true, 3), 2);
+        assert_eq!(engine_multiplier(Mode::Battery, false, true, 3), 2, "unsupported format copies");
+        assert_eq!(engine_multiplier(Mode::Battery, true, true, 1), 1);
     }
 
     #[test]

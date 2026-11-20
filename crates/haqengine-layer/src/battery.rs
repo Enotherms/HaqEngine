@@ -68,6 +68,15 @@ const MEDIAN_BASE: usize = FLOW_BASE + LEVELS;
 const DUMMY: usize = MEDIAN_BASE + LEVELS - 1;
 const COUNTERS: usize = DUMMY + 1;
 const IMAGE_COUNT: usize = COUNTERS + 1;
+/// Outputs after the first live past the fixed images: output `k >= 1` is `IMAGE_COUNT + k - 1`.
+fn out_image(k: usize) -> usize {
+    if k == 0 { RAW_OUT } else { IMAGE_COUNT + k - 1 }
+}
+
+/// Generated frames per real frame that Battery prepares output images for at multiplier `m`.
+pub fn outputs_for_multiplier(m: u32) -> usize {
+    (m.saturating_sub(1) as usize).clamp(1, haqengine_core::MAX_GENERATED)
+}
 /// Bytes per frame slot of the change-count readback.
 const READBACK_STRIDE: usize = 16;
 
@@ -96,8 +105,9 @@ pub struct BatteryResources {
     reduce_sets: [[vk::DescriptorSet; LEVELS - 1]; 2],
     match_sets: [[vk::DescriptorSet; LEVELS]; 2],
     median_sets: [vk::DescriptorSet; LEVELS - 1],
-    warp_sets: [vk::DescriptorSet; 2],
-    fixup_sets: [vk::DescriptorSet; 2],
+    warp_sets: [[vk::DescriptorSet; haqengine_core::MAX_GENERATED]; 2],
+    fixup_sets: [[vk::DescriptorSet; haqengine_core::MAX_GENERATED]; 2],
+    outputs: usize,
     readback: vk::Buffer,
     readback_memory: vk::DeviceMemory,
     mapped: Mapped,
@@ -281,7 +291,9 @@ impl BatteryResources {
         extent: vk::Extent2D,
         format: PackedFormat,
         slots: usize,
+        outputs: usize,
     ) -> Result<BatteryResources, vk::Result> {
+        let outputs = outputs.clamp(1, haqengine_core::MAX_GENERATED);
         let d = &device.device;
         let memory = device.instance.instance.get_physical_device_memory_properties(device.physical_device);
         let levels = level_sizes(extent.width, extent.height);
@@ -303,7 +315,10 @@ impl BatteryResources {
         }
         specs.push((vk::Format::R32G32_SFLOAT, 1, 1));
         specs.push((vk::Format::R32_UINT, 2, haqengine_core::MAX_GENERATED as u32));
-        let mut images: Vec<BatImage> = Vec::with_capacity(IMAGE_COUNT);
+        for _ in 1..outputs {
+            specs.push((vk::Format::R32_UINT, extent.width, extent.height));
+        }
+        let mut images: Vec<BatImage> = Vec::with_capacity(IMAGE_COUNT + outputs - 1);
         for (f, w, h) in specs {
             match create_image(d, &memory, f, w, h) {
                 Ok(img) => images.push(img),
@@ -315,8 +330,8 @@ impl BatteryResources {
                 }
             }
         }
-        let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(80)];
-        let pool = match d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(24).pool_sizes(&sizes), None) {
+        let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(128)];
+        let pool = match d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(32).pool_sizes(&sizes), None) {
             Ok(p) => p,
             Err(e) => {
                 for img in &images {
@@ -330,8 +345,8 @@ impl BatteryResources {
             let reduce = allocate(d, pool, &pipelines.reduce, 2 * (LEVELS - 1))?;
             let matching = allocate(d, pool, &pipelines.block_match, 2 * LEVELS)?;
             let median = allocate(d, pool, &pipelines.median, LEVELS - 1)?;
-            let warp = allocate(d, pool, &pipelines.warp, 2)?;
-            let fixup = allocate(d, pool, &pipelines.fixup, 2)?;
+            let warp = allocate(d, pool, &pipelines.warp, 2 * outputs)?;
+            let fixup = allocate(d, pool, &pipelines.fixup, 2 * outputs)?;
             Ok((luma, reduce, matching, median, warp, fixup))
         })();
         let (luma, reduce, matching, median, warp, fixup) = match sets {
@@ -351,8 +366,9 @@ impl BatteryResources {
             reduce_sets: [[vk::DescriptorSet::null(); LEVELS - 1]; 2],
             match_sets: [[vk::DescriptorSet::null(); LEVELS]; 2],
             median_sets: [vk::DescriptorSet::null(); LEVELS - 1],
-            warp_sets: [warp[0], warp[1]],
-            fixup_sets: [fixup[0], fixup[1]],
+            warp_sets: [[vk::DescriptorSet::null(); haqengine_core::MAX_GENERATED]; 2],
+            fixup_sets: [[vk::DescriptorSet::null(); haqengine_core::MAX_GENERATED]; 2],
+            outputs,
             readback: vk::Buffer::null(),
             readback_memory: vk::DeviceMemory::null(),
             mapped: Mapped(std::ptr::null_mut()),
@@ -369,6 +385,10 @@ impl BatteryResources {
             }
             for l in 0..LEVELS {
                 res.match_sets[p][l] = matching[p * LEVELS + l];
+            }
+            for k in 0..outputs {
+                res.warp_sets[p][k] = warp[p * outputs + k];
+                res.fixup_sets[p][k] = fixup[p * outputs + k];
             }
         }
         res.median_sets.copy_from_slice(&median[..LEVELS - 1]);
@@ -420,8 +440,11 @@ impl BatteryResources {
                 let coarse = if l + 1 < LEVELS { v(MEDIAN_BASE + l) } else { v(DUMMY) };
                 write_set(d, set, &[v(pyr(q, l)), v(pyr(p, l)), coarse, v(FLOW_BASE + l)]);
             }
-            write_set(d, self.warp_sets[p], &[v(q), v(p), v(FLOW_BASE), v(RAW_OUT), v(pyr(q, 0)), v(pyr(p, 0)), v(COUNTERS)]);
-            write_set(d, self.fixup_sets[p], &[v(COUNTERS), v(p), v(RAW_OUT)]);
+            for k in 0..self.outputs {
+                let out = v(out_image(k));
+                write_set(d, self.warp_sets[p][k], &[v(q), v(p), v(FLOW_BASE), out, v(pyr(q, 0)), v(pyr(p, 0)), v(COUNTERS)]);
+                write_set(d, self.fixup_sets[p][k], &[v(COUNTERS), v(p), out]);
+            }
         }
         for l in 1..LEVELS {
             write_set(d, self.median_sets[l - 1], &[v(FLOW_BASE + l), v(MEDIAN_BASE + l - 1)]);
@@ -447,20 +470,24 @@ impl BatteryResources {
     }
 
     /// Records the battery pass into `cmd` (already begun): copies the game image in, builds its
-    /// pyramid, and writes the spare image (interpolated, or a copy when there is no previous
-    /// frame). Leaves both swapchain images in `PRESENT_SRC_KHR`.
+    /// pyramid and flow, and writes each spare image `k` (interpolated at `t = (k + 1) / (n + 1)`
+    /// for `n` spares, or a copy when there is no previous frame). With no spares (a still screen)
+    /// it still blends once at the first output's time so the change counts stay current. Leaves the
+    /// swapchain images in `PRESENT_SRC_KHR`.
     ///
     /// # Safety
-    /// `cmd` must be recording; `game` and `spare` must be images of this swapchain.
+    /// `cmd` must be recording; `game` and `spares` must be images of this swapchain, at most
+    /// `outputs` spares.
     pub unsafe fn record(
         &mut self,
         d: &ash::Device,
         cmd: vk::CommandBuffer,
         p: &Pipelines,
         game: vk::Image,
-        spare: Option<vk::Image>,
+        spares: &[vk::Image],
         slot: usize,
     ) -> BatteryStep {
+        let spares = &spares[..spares.len().min(self.outputs)];
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as S};
         if !self.initialized {
             let barriers: Vec<vk::ImageMemoryBarrier> = self
@@ -503,7 +530,7 @@ impl BatteryResources {
             dispatch(d, cmd, &p.reduce, self.reduce_sets[cur][l - 1], &push2(iw.to_le_bytes(), ih.to_le_bytes()), groups(levels[l].0, levels[l].1));
         }
 
-        if let Some(spare) = spare {
+        for &spare in spares {
             image_barrier(d, cmd, spare, L::UNDEFINED, L::TRANSFER_DST_OPTIMAL, A::empty(), A::TRANSFER_WRITE, S::TRANSFER, S::TRANSFER);
         }
         if step == BatteryStep::Interpolate {
@@ -531,21 +558,27 @@ impl BatteryResources {
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
             d.cmd_clear_color_image(cmd, self.images[COUNTERS].image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
             memory_barrier(d, cmd, S::TRANSFER, S::COMPUTE_SHADER);
-            let row = 0u32;
-            let push = [
-                w.to_le_bytes(),
-                h.to_le_bytes(),
-                flows[0].0.to_le_bytes(),
-                flows[0].1.to_le_bytes(),
-                0.5f32.to_le_bytes(),
-                fmt.to_le_bytes(),
-                row.to_le_bytes(),
-            ];
-            dispatch(d, cmd, &p.warp, self.warp_sets[cur], push.as_flattened(), groups(w, h));
-            memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
             let threshold = haqengine_core::frame_change::cut_threshold_pixels(w * h);
-            let fix = [w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes(), row.to_le_bytes()];
-            dispatch(d, cmd, &p.fixup, self.fixup_sets[cur], fix.as_flattened(), groups(w, h));
+            let blends = spares.len().max(1);
+            let m = blends as u32 + 1;
+            for (k, t) in haqengine_core::blend_times(m).enumerate() {
+                let row = k as u32;
+                let push = [
+                    w.to_le_bytes(),
+                    h.to_le_bytes(),
+                    flows[0].0.to_le_bytes(),
+                    flows[0].1.to_le_bytes(),
+                    t.to_le_bytes(),
+                    fmt.to_le_bytes(),
+                    row.to_le_bytes(),
+                ];
+                dispatch(d, cmd, &p.warp, self.warp_sets[cur][k], push.as_flattened(), groups(w, h));
+            }
+            memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
+            for (k, &set) in self.fixup_sets[cur][..blends].iter().enumerate() {
+                let fix = [w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes(), (k as u32).to_le_bytes()];
+                dispatch(d, cmd, &p.fixup, set, fix.as_flattened(), groups(w, h));
+            }
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
             if slot < self.readback_valid.len() {
                 let region = vk::BufferImageCopy::default()
@@ -557,18 +590,18 @@ impl BatteryResources {
                 d.cmd_pipeline_barrier(cmd, S::TRANSFER, S::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
                 self.readback_valid[slot] = true;
             }
-            if let Some(spare) = spare {
-                d.cmd_copy_image(cmd, self.images[RAW_OUT].image, L::GENERAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
+            for (k, &spare) in spares.iter().enumerate() {
+                d.cmd_copy_image(cmd, self.images[out_image(k)].image, L::GENERAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
             }
         } else {
             if slot < self.readback_valid.len() {
                 self.readback_valid[slot] = false;
             }
-            if let Some(spare) = spare {
+            for &spare in spares {
                 d.cmd_copy_image(cmd, game, L::TRANSFER_SRC_OPTIMAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
             }
         }
-        if let Some(spare) = spare {
+        for &spare in spares {
             image_barrier(d, cmd, spare, L::TRANSFER_DST_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_WRITE, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
         }
         image_barrier(d, cmd, game, L::TRANSFER_SRC_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_READ, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);

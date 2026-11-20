@@ -9,7 +9,7 @@ use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
 use ash::vk;
 use ash::vk::Handle;
-use haqengine_core::{should_log, FrameStats, PackedFormat};
+use haqengine_core::{should_log, FrameStats, PackedFormat, MAX_GENERATED};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -41,7 +41,9 @@ static DUMP_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
 pub struct Slot {
     pub cmd: vk::CommandBuffer,
     pub fence: vk::Fence,
-    pub acquired: vk::Semaphore,
+    /// One acquire semaphore per spare image a present may use (null beyond the swapchain's
+    /// multiplier).
+    pub acquired: [vk::Semaphore; MAX_GENERATED],
 }
 
 /// Command pool and slots, created on the first generating present (the queue family is only known then).
@@ -210,9 +212,11 @@ impl FrameGen {
             for cmd in cmds {
                 let fence = d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?;
                 let sem = || d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None);
-                ready.slots.push(Slot { cmd, fence, acquired: vk::Semaphore::null() });
+                ready.slots.push(Slot { cmd, fence, acquired: [vk::Semaphore::null(); MAX_GENERATED] });
                 let last = ready.slots.last_mut().expect("just pushed");
-                last.acquired = sem()?;
+                for a in last.acquired.iter_mut().take(self.max_generated()) {
+                    *a = sem()?;
+                }
             }
             for _ in 0..self.images.len() {
                 let s = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
@@ -258,8 +262,8 @@ unsafe fn destroy_ready(device: &DeviceData, ready: &Ready) {
         let _ = d.wait_for_fences(&fences, true, 1_000_000_000);
     }
     for s in &ready.slots {
-        if s.acquired != vk::Semaphore::null() {
-            d.destroy_semaphore(s.acquired, None);
+        for &a in s.acquired.iter().filter(|a| **a != vk::Semaphore::null()) {
+            d.destroy_semaphore(a, None);
         }
         if s.fence != vk::Fence::null() {
             d.destroy_fence(s.fence, None);
@@ -275,6 +279,18 @@ unsafe fn destroy_ready(device: &DeviceData, ready: &Ready) {
 }
 
 impl FrameGen {
+    /// Generated frames per real frame the swapchain has images for.
+    fn max_generated(&self) -> usize {
+        crate::battery::outputs_for_multiplier(self.multiplier)
+    }
+
+    /// Generated frames this present makes: the swapchain's count for Battery, one for Quality and
+    /// copy mode.
+    fn generated_now(&self, st: &GenState) -> usize {
+        let battery = self.battery_format.is_some() && !st.battery_failed && !(self.quality && !st.quality_failed);
+        if battery { self.max_generated() } else { 1 }
+    }
+
     /// Turns generation off for this swapchain and logs it once.
     fn disable(&self, id: u64, step: &str, result: vk::Result) {
         if !self.disabled.swap(true, Ordering::Relaxed) {
@@ -305,7 +321,7 @@ impl FrameGen {
                 q.forget_previous();
             }
             let r = next_present(queue, pi);
-            record(st, id, start, false, skipped);
+            record(st, id, start, 0, skipped);
             r
         };
         if pi.wait_semaphore_count as usize > MAX_WAITS {
@@ -344,65 +360,86 @@ impl FrameGen {
         if self.still_screen(&mut st, d, slot_index) {
             return self.present_still(&mut st, id, device, queue, pi, slot, slot_index, game_index, start);
         }
-        let mut spare = 0u32;
-        let r = (device.swapchain.acquire_next_image_khr)(
-            d.handle(),
-            swapchain,
-            ACQUIRE_TIMEOUT_NS,
-            slot.acquired,
-            vk::Fence::null(),
-            &mut spare,
-        );
-        let spare = match acquire_outcome(r, spare) {
-            AcquireAction::Generate(i) => i,
-            AcquireAction::SkipThisFrame => return pass(&mut st, true),
-            AcquireAction::Disable => {
-                self.disable(id, "acquiring a spare image", r);
-                return pass(&mut st, false);
+        let count = self.generated_now(&st);
+        let mut spares = [0u32; MAX_GENERATED];
+        for k in 0..count {
+            let r = (device.swapchain.acquire_next_image_khr)(
+                d.handle(),
+                swapchain,
+                ACQUIRE_TIMEOUT_NS,
+                slot.acquired[k],
+                vk::Fence::null(),
+                &mut spares[k],
+            );
+            match acquire_outcome(r, spares[k]) {
+                AcquireAction::Generate(i) => spares[k] = i,
+                AcquireAction::SkipThisFrame if k == 0 => return pass(&mut st, true),
+                AcquireAction::Disable if k == 0 => {
+                    self.disable(id, "acquiring a spare image", r);
+                    return pass(&mut st, false);
+                }
+                AcquireAction::SkipThisFrame => {
+                    return self.give_back(&mut st, device, queue, pi, swapchain, &spares[..k], &slot.acquired[..k], id, start, true);
+                }
+                AcquireAction::Disable => {
+                    self.disable(id, "acquiring a spare image", r);
+                    return self.give_back(&mut st, device, queue, pi, swapchain, &spares[..k], &slot.acquired[..k], id, start, false);
+                }
             }
-        };
-        let (Some(&game_image), Some(&spare_image)) =
-            (self.images.get(game_index as usize), self.images.get(spare as usize))
-        else {
+        }
+        let spares = &spares[..count];
+        let acquired = &slot.acquired[..count];
+        let mut spare_images = [vk::Image::null(); MAX_GENERATED];
+        let mut in_range = true;
+        for (k, &i) in spares.iter().enumerate() {
+            match self.images.get(i as usize) {
+                Some(&img) => spare_images[k] = img,
+                None => in_range = false,
+            }
+        }
+        let Some(&game_image) = self.images.get(game_index as usize).filter(|_| in_range) else {
             self.disable(id, "image index out of range", vk::Result::ERROR_UNKNOWN);
-            return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
+            return self.give_back(&mut st, device, queue, pi, swapchain, spares, acquired, id, start, false);
         };
-        let recorded = match self.record_frame(&mut st, id, device, slot.cmd, slot_index, game_image, Some(spare_image)) {
+        let recorded = match self.record_frame(&mut st, id, device, slot.cmd, slot_index, game_image, &spare_images[..count]) {
             Ok(b) => b,
             Err(e) => {
                 self.disable(id, "recording the frame", e);
-                return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
+                return self.give_back(&mut st, device, queue, pi, swapchain, spares, acquired, id, start, false);
             }
         };
-        let mut waits = [vk::Semaphore::null(); MAX_WAITS + 1];
+        let mut waits = [vk::Semaphore::null(); MAX_WAITS + MAX_GENERATED];
         let n = pi.wait_semaphore_count as usize;
         if n > 0 {
             waits[..n].copy_from_slice(std::slice::from_raw_parts(pi.p_wait_semaphores, n));
         }
-        waits[n] = slot.acquired;
-        let stages = [vk::PipelineStageFlags::TRANSFER; MAX_WAITS + 1];
-        let ready_sems = st.ready.as_ref().map(|r| (r.image_ready.len(), r.image_ready.as_slice()));
-        let Some((copy_ready, real_ready)) = ready_sems
-            .and_then(|(n, sems)| present_semaphore_indices(n, spare, game_index).map(|(c, r)| (sems[c], sems[r])))
+        waits[n..n + count].copy_from_slice(acquired);
+        let stages = [vk::PipelineStageFlags::TRANSFER; MAX_WAITS + MAX_GENERATED];
+        let ready_sems = st.ready.as_ref().map(|r| r.image_ready.as_slice());
+        let Some((indices, sems)) =
+            ready_sems.and_then(|sems| present_semaphore_indices(sems.len(), spares, game_index).map(|i| (i, sems)))
         else {
             self.disable(id, "present semaphores for the images", vk::Result::ERROR_UNKNOWN);
-            return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
+            return self.give_back(&mut st, device, queue, pi, swapchain, spares, acquired, id, start, false);
         };
-        let signals = [copy_ready, real_ready];
+        let mut signals = [vk::Semaphore::null(); MAX_GENERATED + 1];
+        for k in 0..=count {
+            signals[k] = sems[indices[k]];
+        }
         let cmds = [slot.cmd];
         let submit = vk::SubmitInfo::default()
-            .wait_semaphores(&waits[..=n])
-            .wait_dst_stage_mask(&stages[..=n])
+            .wait_semaphores(&waits[..n + count])
+            .wait_dst_stage_mask(&stages[..n + count])
             .command_buffers(&cmds)
-            .signal_semaphores(&signals);
+            .signal_semaphores(&signals[..=count]);
         if let Err(e) = d.reset_fences(&[slot.fence]) {
             self.disable(id, "resetting a fence", e);
-            return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
+            return self.give_back(&mut st, device, queue, pi, swapchain, spares, acquired, id, start, false);
         }
         if let Err(e) = d.queue_submit(queue, &[submit], slot.fence) {
             let _ = d.queue_submit(queue, &[], slot.fence);
             self.disable(id, "submitting the copy", e);
-            return self.give_back(&mut st, device, queue, pi, swapchain, spare, slot.acquired, id, start);
+            return self.give_back(&mut st, device, queue, pi, swapchain, spares, acquired, id, start, false);
         }
         if let Some(ready) = st.ready.as_mut() {
             ready.stamped[slot_index] = ready.queries != vk::QueryPool::null();
@@ -428,21 +465,21 @@ impl FrameGen {
                 b.submitted();
             }
         }
-        let copy_wait = [copy_ready];
-        let copy_indices = [spare];
         let swapchains = [swapchain];
-        let copy_present = vk::PresentInfoKHR::default()
-            .wait_semaphores(&copy_wait)
-            .swapchains(&swapchains)
-            .image_indices(&copy_indices);
-        let r_copy = next_present(queue, &copy_present);
-        let real_wait = [real_ready];
+        let mut result = vk::Result::SUCCESS;
+        for k in 0..count {
+            let wait = [signals[k]];
+            let index = [spares[k]];
+            let present = vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&index);
+            result = combine_present_results(result, next_present(queue, &present));
+        }
+        let real_wait = [signals[count]];
         let mut real_present = *pi;
         real_present.wait_semaphore_count = 1;
         real_present.p_wait_semaphores = real_wait.as_ptr();
         let r_real = next_present(queue, &real_present);
-        record(&mut st, id, start, true, false);
-        combine_present_results(r_copy, r_real)
+        record(&mut st, id, start, count as u64, false);
+        combine_present_results(result, r_real)
     }
 
     /// Whether this present should skip generation because the screen has been still. Also counts
@@ -487,7 +524,7 @@ impl FrameGen {
         let next_present = device.swapchain.queue_present_khr;
         let plain = |st: &mut GenState| {
             let r = next_present(queue, pi);
-            record(st, id, start, false, false);
+            record(st, id, start, 0, false);
             r
         };
         let Some(&game_image) = self.images.get(game_index as usize) else {
@@ -497,7 +534,7 @@ impl FrameGen {
             Some(s) => s,
             None => return plain(st),
         };
-        if let Err(e) = self.record_frame(st, id, device, slot.cmd, slot_index, game_image, None) {
+        if let Err(e) = self.record_frame(st, id, device, slot.cmd, slot_index, game_image, &[]) {
             self.disable(id, "recording a still frame", e);
             return plain(st);
         }
@@ -536,7 +573,7 @@ impl FrameGen {
         real_present.wait_semaphore_count = 1;
         real_present.p_wait_semaphores = real_wait.as_ptr();
         let r = next_present(queue, &real_present);
-        record(st, id, start, false, false);
+        record(st, id, start, 0, false);
         r
     }
 
@@ -551,8 +588,9 @@ impl FrameGen {
         cmd: vk::CommandBuffer,
         slot_index: usize,
         game: vk::Image,
-        spare: Option<vk::Image>,
+        spares: &[vk::Image],
     ) -> Result<Recorded, vk::Result> {
+        let spare = spares.first().copied();
         let d = &device.device;
         d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -569,7 +607,7 @@ impl FrameGen {
         } else {
             match (self.battery_pipelines(st, id, device), st.battery.as_mut()) {
                 (Some(p), Some(b)) => {
-                    b.record(d, cmd, &p, game, spare, slot_index);
+                    b.record(d, cmd, &p, game, spares, slot_index);
                     Recorded::Battery
                 }
                 _ => {
@@ -636,7 +674,7 @@ impl FrameGen {
         };
         if st.battery.is_none() {
             let slots = st.ready.as_ref().map_or(0, |r| r.slots.len());
-            match BatteryResources::create(device, &pipelines, self.extent, format, slots) {
+            match BatteryResources::create(device, &pipelines, self.extent, format, slots, self.max_generated()) {
                 Ok(b) => st.battery = Some(b),
                 Err(e) => {
                     st.battery_failed = true;
@@ -683,8 +721,8 @@ impl FrameGen {
         d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &to_present);
     }
 
-    /// Error path after a spare image was acquired: present it as-is (waiting on its acquire
-    /// semaphore) so the swapchain does not lose an image, then present the game's frame unchanged.
+    /// Error path after spare images were acquired: present each as-is (waiting on its acquire
+    /// semaphore) so the swapchain does not lose images, then present the game's frame unchanged.
     #[allow(clippy::too_many_arguments)]
     unsafe fn give_back(
         &self,
@@ -693,19 +731,23 @@ impl FrameGen {
         queue: vk::Queue,
         pi: &vk::PresentInfoKHR,
         swapchain: vk::SwapchainKHR,
-        spare: u32,
-        acquired: vk::Semaphore,
+        spares: &[u32],
+        acquired: &[vk::Semaphore],
         id: u64,
         start: Instant,
+        skipped: bool,
     ) -> vk::Result {
-        let waits = [acquired];
         let swapchains = [swapchain];
-        let indices = [spare];
-        let spare_present = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&swapchains).image_indices(&indices);
-        let r_spare = (device.swapchain.queue_present_khr)(queue, &spare_present);
+        let mut result = vk::Result::SUCCESS;
+        for (&spare, &sem) in spares.iter().zip(acquired) {
+            let waits = [sem];
+            let indices = [spare];
+            let spare_present = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&swapchains).image_indices(&indices);
+            result = combine_present_results(result, (device.swapchain.queue_present_khr)(queue, &spare_present));
+        }
         let r_real = (device.swapchain.queue_present_khr)(queue, pi);
-        record(st, id, start, false, false);
-        combine_present_results(r_spare, r_real)
+        record(st, id, start, 0, skipped);
+        combine_present_results(result, r_real)
     }
 
     /// The destroy line's counts.
@@ -731,13 +773,11 @@ unsafe fn read_gpu_time(st: &mut GenState, d: &ash::Device, slot_index: usize) {
 }
 
 /// Updates counters and timing windows after one real present, logging every 10 seconds.
-fn record(st: &mut GenState, id: u64, start: Instant, generated: bool, skipped: bool) {
+fn record(st: &mut GenState, id: u64, start: Instant, generated: u64, skipped: bool) {
     let now = Instant::now();
     let GenState { stats: s, quality: q, battery: bat, window_cuts, window_still, window_buckets, .. } = st;
     s.real += 1;
-    if generated {
-        s.generated += 1;
-    }
+    s.generated += generated;
     if skipped {
         s.skipped += 1;
     }
@@ -816,11 +856,22 @@ pub fn change_suffix(cuts: u64, still: u64, buckets: &StillBuckets) -> String {
     format!(", cuts {cuts}, still {still}, {buckets}")
 }
 
-/// The image semaphores a generated present signals: the spare image's (shown first) and the game
-/// image's. `None` when an index is out of range or both name the same image.
-pub fn present_semaphore_indices(images: usize, spare: u32, game: u32) -> Option<(usize, usize)> {
-    let (s, g) = (spare as usize, game as usize);
-    (s < images && g < images && s != g).then_some((s, g))
+/// The image semaphores a generated present signals, in present order: each spare image's, then
+/// the game image's (the entries after those are unused). `None` when there are no spares or more
+/// than `MAX_GENERATED`, or when an index is out of range or two are the same image.
+pub fn present_semaphore_indices(images: usize, spares: &[u32], game: u32) -> Option<[usize; MAX_GENERATED + 1]> {
+    if spares.is_empty() || spares.len() > MAX_GENERATED {
+        return None;
+    }
+    let mut out = [0usize; MAX_GENERATED + 1];
+    for (k, &i) in spares.iter().chain(std::iter::once(&game)).enumerate() {
+        let i = i as usize;
+        if i >= images || out[..k].contains(&i) {
+            return None;
+        }
+        out[k] = i;
+    }
+    Some(out)
 }
 
 pub fn combine_present_results(copy: vk::Result, real: vk::Result) -> vk::Result {
@@ -892,11 +943,29 @@ mod tests {
     }
 
     #[test]
-    fn present_semaphores_follow_images() {
-        assert_eq!(present_semaphore_indices(4, 2, 3), Some((2, 3)));
-        assert_eq!(present_semaphore_indices(4, 0, 0), None);
-        assert_eq!(present_semaphore_indices(4, 4, 1), None);
-        assert_eq!(present_semaphore_indices(4, 1, 7), None);
+    fn present_semaphore_indices_orders_spares_then_game() {
+        assert_eq!(present_semaphore_indices(4, &[2], 3), Some([2, 3, 0, 0]));
+        assert_eq!(present_semaphore_indices(6, &[4, 1], 0), Some([4, 1, 0, 0]));
+        assert_eq!(present_semaphore_indices(6, &[4, 1, 5], 2), Some([4, 1, 5, 2]));
+    }
+
+    #[test]
+    fn present_semaphore_indices_rejects_duplicates_and_out_of_range() {
+        assert_eq!(present_semaphore_indices(4, &[0], 0), None);
+        assert_eq!(present_semaphore_indices(4, &[4], 1), None);
+        assert_eq!(present_semaphore_indices(4, &[1], 7), None);
+        assert_eq!(present_semaphore_indices(6, &[2, 2], 1), None);
+        assert_eq!(present_semaphore_indices(6, &[], 1), None);
+        assert_eq!(present_semaphore_indices(9, &[1, 2, 3, 4], 0), None);
+    }
+
+    #[test]
+    fn battery_outputs_for_multiplier() {
+        assert_eq!(crate::battery::outputs_for_multiplier(1), 1);
+        assert_eq!(crate::battery::outputs_for_multiplier(2), 1);
+        assert_eq!(crate::battery::outputs_for_multiplier(3), 2);
+        assert_eq!(crate::battery::outputs_for_multiplier(4), 3);
+        assert_eq!(crate::battery::outputs_for_multiplier(9), 3);
     }
 
     #[test]

@@ -175,7 +175,15 @@ unsafe fn create_swapchain_inner(
         );
         let game_modes = if rewritten_head.is_some() { Some(&FIFO_MODES[..1]) } else { game_present_modes(ci.p_next) };
         (r == vk::Result::SUCCESS)
-            .then(|| plan_swapchain_with(ci, &caps, multiplier(), device_can_transfer(&data), game_modes))
+            .then(|| {
+                let m = crate::plan::engine_multiplier(
+                    crate::state::SETTINGS.mode,
+                    packed_format(ci.image_format).is_some(),
+                    data.quality.is_ok(),
+                    multiplier(),
+                );
+                plan_swapchain_with(ci, &caps, m, device_can_transfer(&data), game_modes)
+            })
     });
     let mut planned = *ci;
     let generating = plan.is_some_and(|p| p.generate);
