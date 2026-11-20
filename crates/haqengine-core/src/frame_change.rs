@@ -10,7 +10,9 @@ pub const STILL_FRACTION: f32 = 0.995;
 /// Still pixels needed to stay in still mode once in it, so a cursor or a small effect does not
 /// flip generation on and off.
 pub const STILL_KEEP_FRACTION: f32 = 0.99;
-pub const STILL_FRAMES: u32 = 2;
+/// Still frames in a row before generation pauses (0.2 s at 30 fps), so a game hitch that
+/// repeats a frame or two during play does not switch generation off and on.
+pub const STILL_FRAMES: u32 = 6;
 
 /// Per-frame pixel counts from the blend: pixels whose best candidate still disagrees, pixels that
 /// are exactly still, and the frame's pixel count.
@@ -141,24 +143,41 @@ mod tests {
         }
     }
 
+    fn enter(d: &mut StillDetector, still: u32) {
+        for _ in 1..STILL_FRAMES {
+            assert!(!d.observe(Some(counts(0, still))), "entered before {STILL_FRAMES} still frames");
+        }
+        assert!(d.observe(Some(counts(0, still))));
+    }
+
     #[test]
-    fn still_detector_enters_after_two_and_leaves_immediately() {
+    fn still_detector_waits_for_a_run_and_leaves_immediately() {
+        assert_eq!(STILL_FRAMES, 6);
         let mut d = StillDetector::new();
-        assert!(!d.observe(Some(counts(0, 1000))));
-        assert!(d.observe(Some(counts(0, 1000))));
+        enter(&mut d, 1000);
         assert!(d.observe(Some(counts(0, 999))));
         assert!(!d.observe(Some(counts(3, 600))), "one moving frame resumes generation");
-        assert!(!d.observe(Some(counts(0, 1000))));
-        assert!(d.observe(Some(counts(0, 1000))));
+        enter(&mut d, 1000);
+    }
+
+    #[test]
+    fn short_pauses_in_motion_do_not_enter() {
+        let mut d = StillDetector::new();
+        for _ in 0..10 {
+            for _ in 0..STILL_FRAMES - 1 {
+                assert!(!d.observe(Some(counts(0, 1000))));
+            }
+            assert!(!d.observe(Some(counts(0, 300))));
+        }
     }
 
     #[test]
     fn still_enters_and_keeps_with_hysteresis() {
         let mut d = StillDetector::new();
-        assert!(!d.observe(Some(counts(0, 994))));
-        assert!(!d.observe(Some(counts(0, 994))), "below the enter line never enters");
-        assert!(!d.observe(Some(counts(0, 995))));
-        assert!(d.observe(Some(counts(0, 995))), "two still frames enter");
+        for _ in 0..2 * STILL_FRAMES {
+            assert!(!d.observe(Some(counts(0, 994))), "below the enter line never enters");
+        }
+        enter(&mut d, 995);
         assert!(d.observe(Some(counts(0, 990))), "a cursor keeps still mode");
         assert!(!d.observe(Some(counts(0, 989))), "more motion leaves at once");
         assert!(!d.observe(Some(counts(0, 992))), "re-entering needs the enter line again");
@@ -181,9 +200,10 @@ mod tests {
     fn still_detector_needs_counts() {
         let mut d = StillDetector::new();
         assert!(!d.observe(None));
-        assert!(!d.observe(Some(counts(0, 1000))));
+        for _ in 1..STILL_FRAMES {
+            assert!(!d.observe(Some(counts(0, 1000))));
+        }
         assert!(!d.observe(None), "a missing count resets the run");
-        assert!(!d.observe(Some(counts(0, 1000))));
-        assert!(d.observe(Some(counts(0, 1000))));
+        enter(&mut d, 1000);
     }
 }
