@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 const SLICE_NS: u64 = 20_000_000;
 /// A present not on screen after this long is forgotten (it was dropped or never shown).
 const LOST_AFTER: Duration = Duration::from_millis(200);
+/// RADV can report `ERROR_DEVICE_LOST` for a wait that starts before the driver submitted the
+/// present while the GPU is busy; the wait is retried until the error lasts this long.
+const DEVICE_LOST_FOR: Duration = Duration::from_secs(1);
+/// Pause before retrying a wait that reported `ERROR_DEVICE_LOST`.
+const RETRY_PAUSE: Duration = Duration::from_millis(5);
 
 struct Watched {
     queue: ShownQueue,
@@ -110,6 +115,7 @@ fn watch(shared: &Shared, device: vk::Device, swapchain: vk::SwapchainKHR, wait:
             w.queue.oldest().expect("not empty")
         };
         let began = Instant::now();
+        let mut lost_since: Option<Instant> = None;
         loop {
             let r = unsafe { wait(device, swapchain, id, SLICE_NS) };
             let mut w = shared.lock();
@@ -124,6 +130,11 @@ fn watch(shared: &Shared, device: vk::Device, swapchain: vk::SwapchainKHR, wait:
                 vk::Result::TIMEOUT => {
                     w.queue.drop_oldest();
                     w.shown_id = w.shown_id.max(id);
+                }
+                vk::Result::ERROR_DEVICE_LOST if !w.stop && lost_since.get_or_insert_with(Instant::now).elapsed() < DEVICE_LOST_FOR => {
+                    drop(w);
+                    std::thread::sleep(RETRY_PAUSE);
+                    continue;
                 }
                 e => {
                     w.failed = Some(e);
@@ -170,6 +181,37 @@ mod tests {
         assert_eq!(w.take_shown().map(|s| s.count), Some(1));
         assert!(w.take_shown().is_none());
         assert!(w.failed().is_none());
+    }
+
+    static FLAKY_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    unsafe extern "system" fn lost_three_times(_: vk::Device, _: vk::SwapchainKHR, _: u64, _: u64) -> vk::Result {
+        if FLAKY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
+            vk::Result::ERROR_DEVICE_LOST
+        } else {
+            vk::Result::SUCCESS
+        }
+    }
+
+    unsafe extern "system" fn always_lost(_: vk::Device, _: vk::SwapchainKHR, _: u64, _: u64) -> vk::Result {
+        vk::Result::ERROR_DEVICE_LOST
+    }
+
+    #[test]
+    fn a_passing_device_lost_is_retried() {
+        let w = start(lost_three_times);
+        w.queued(1, Some(Instant::now()));
+        assert!(w.wait_shown(1, Duration::from_secs(2)) < Duration::from_secs(1));
+        assert!(w.failed().is_none());
+        assert_eq!(w.take_shown().map(|s| s.count), Some(1));
+    }
+
+    #[test]
+    fn a_lasting_device_lost_stops_watching() {
+        let w = start(always_lost);
+        w.queued(1, None);
+        w.wait_shown(1, Duration::from_secs(5));
+        assert_eq!(w.failed(), Some(vk::Result::ERROR_DEVICE_LOST));
     }
 
     #[test]
