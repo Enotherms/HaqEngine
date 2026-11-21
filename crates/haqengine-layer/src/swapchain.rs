@@ -37,7 +37,10 @@ const MEASURE_LOG_MS: u64 = 10_000;
 /// Real-frame timing of one swapchain in measure-only mode: a fixed ring, nothing allocated per
 /// present.
 pub struct MeasureStats {
+    /// The window's last `STATS_CAPACITY` intervals (for mean, deviation and p99).
     pub intervals: haqengine_core::FrameStats,
+    /// Every present in the window (for the frame rate, which the ring would cap).
+    window_presents: u32,
     last: Option<std::time::Instant>,
     started: std::time::Instant,
     last_log_ms: u64,
@@ -45,31 +48,34 @@ pub struct MeasureStats {
 
 impl MeasureStats {
     pub fn new() -> MeasureStats {
-        MeasureStats { intervals: haqengine_core::FrameStats::new(), last: None, started: std::time::Instant::now(), last_log_ms: 0 }
+        MeasureStats { intervals: haqengine_core::FrameStats::new(), window_presents: 0, last: None, started: std::time::Instant::now(), last_log_ms: 0 }
     }
 
-    /// Notes one present at `now`, logging the window every `MEASURE_LOG_MS`.
-    pub fn present(&mut self, id: u64, now: std::time::Instant) {
+    /// Notes one present at `now`; every `MEASURE_LOG_MS` returns the window's log line.
+    pub fn present(&mut self, id: u64, now: std::time::Instant) -> Option<String> {
         if let Some(last) = self.last {
             self.intervals.push(now.duration_since(last).as_micros().min(u32::MAX as u128) as u32);
+            self.window_presents += 1;
         }
         self.last = Some(now);
         let now_ms = now.duration_since(self.started).as_millis() as u64;
         if !haqengine_core::should_log(now_ms, self.last_log_ms, MEASURE_LOG_MS) {
-            return;
+            return None;
         }
         let secs = (now_ms - self.last_log_ms) as f32 / 1000.0;
-        if let Some(s) = self.intervals.summary() {
-            LOG.log(&format!(
+        let line = self.intervals.summary().map(|s| {
+            format!(
                 "swapchain {id}: measured real {:.1} fps, interval mean {:.2} ms sd {:.2} p99 {:.2}",
-                s.count as f32 / secs,
+                self.window_presents as f32 / secs,
                 s.mean_ms,
                 s.stddev_ms,
                 s.p99_ms
-            ));
-        }
+            )
+        });
         self.intervals.clear();
+        self.window_presents = 0;
         self.last_log_ms = now_ms;
+        line
     }
 }
 
@@ -96,7 +102,10 @@ impl SwapchainRegistry {
         if let Some(info) = self.map.get(handle as usize) {
             info.presents.fetch_add(1, Ordering::Relaxed);
             if let Some(m) = info.measure.as_ref() {
-                m.lock().unwrap_or_else(|e| e.into_inner()).present(info.id, std::time::Instant::now());
+                let line = m.lock().unwrap_or_else(|e| e.into_inner()).present(info.id, std::time::Instant::now());
+                if let Some(line) = line {
+                    LOG.log(&line);
+                }
             }
         }
     }
@@ -777,6 +786,21 @@ mod tests {
         DEVICES.remove(dispatch_key(device));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(now, 3, "a present on a swapchain that does not generate still reads conf.toml");
+    }
+
+    #[test]
+    fn measured_fps_counts_past_the_ring() {
+        let mut m = MeasureStats::new();
+        let t0 = m.started;
+        let mut line = None;
+        for i in 1..=1500u32 {
+            if let Some(l) = m.present(7, t0 + std::time::Duration::from_micros(i as u64 * 6_700)) {
+                line = Some(l);
+            }
+        }
+        let line = line.expect("a window was logged");
+        let fps: f32 = line.split("measured real ").nth(1).and_then(|r| r.split(' ').next()).and_then(|v| v.parse().ok()).expect("fps");
+        assert!((fps - 149.0).abs() < 2.0, "{line}");
     }
 
     #[test]

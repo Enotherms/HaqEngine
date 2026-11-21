@@ -64,7 +64,7 @@ impl Settings {
         };
         let pacing = !matches!(get("HAQENGINE_PACING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0") | Some("off"));
         let measure = matches!(get("HAQENGINE_MEASURE").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
-        let measure_note = (measure && multiplier >= 2).then(|| "HAQENGINE_MEASURE set: generation off, measuring only".to_string());
+        let measure_note = measure_note(measure, multiplier);
         Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new(), pacing, measure, measure_note }
     }
 }
@@ -83,6 +83,7 @@ impl Settings {
         if !multiplier_set {
             s.multiplier = profile.multiplier.unwrap_or(1);
         }
+        s.measure_note = measure_note(s.measure, s.multiplier);
         s
     }
 }
@@ -92,6 +93,10 @@ impl Settings {
     pub fn notes(&self) -> Vec<String> {
         self.mode_note.iter().chain(self.multiplier_note.iter()).chain(self.measure_note.iter()).chain(self.config_notes.iter()).cloned().collect()
     }
+}
+
+fn measure_note(measure: bool, multiplier: u32) -> Option<String> {
+    (measure && multiplier >= 2).then(|| "HAQENGINE_MEASURE set: generation off, measuring only".to_string())
 }
 
 /// Turns the contents of `/proc/self/comm` into a process name.
@@ -173,6 +178,16 @@ mod tests {
             assert!(!Settings::from_lookup(env(&[("HAQENGINE_MEASURE", v)])).measure, "{v}");
         }
         assert!(!Settings::from_lookup(env(&[])).measure);
+    }
+
+    #[test]
+    fn measure_note_covers_a_multiplier_from_the_file() {
+        let file = crate::config::FileConfig {
+            default: crate::config::Profile { multiplier: Some(2), ..Default::default() },
+            games: Vec::new(),
+        };
+        let s = Settings::from_lookup_and_file(env(&[("HAQENGINE_MEASURE", "1")]), Some(&file), "game");
+        assert!(s.notes().iter().any(|n| n.contains("measuring only")), "{:?}", s.notes());
     }
 
     #[test]
