@@ -133,8 +133,33 @@ pub fn set_test_multiplier(m: u32) {
     TEST_MULTIPLIER.store(m, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// The multiplier this process runs with.
+#[cfg(test)]
+static TEST_MEASURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test-only: overrides measure-only mode (`None` restores the environment's value).
+#[cfg(test)]
+pub fn set_test_measure(on: Option<bool>) {
+    TEST_MEASURE.store(match on { None => 0, Some(true) => 1, Some(false) => 2 }, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether HaqEngine only measures (passes every present through and logs the real frame rate).
+pub fn measuring() -> bool {
+    #[cfg(test)]
+    {
+        match TEST_MEASURE.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+    }
+    SETTINGS.measure
+}
+
+/// The multiplier this process runs with (always 1 while measuring).
 pub fn multiplier() -> u32 {
+    if measuring() {
+        return 1;
+    }
     #[cfg(test)]
     {
         let m = TEST_MULTIPLIER.load(std::sync::atomic::Ordering::SeqCst);
