@@ -109,6 +109,10 @@ BUILD="cargo zigbuild" TARGET=x86_64-unknown-linux-gnu.2.28 sh scripts/package.s
 
 The GPU tests need a Vulkan device, so they run on the Deck: build `haqengine-gpu-tests`, copy it over and run it (`--filter <name>` selects cases).
 
+## About this project
+
+HaqEngine is a personal hobby project, built in my spare time to improve my own gaming on the Steam Deck. It has no commercial purpose: it is free, has no paid features and is not sold or monetised in any way. It is shared openly in case it helps other players. Support and updates are provided on a best-effort basis.
+
 ## Licence
 
 BSD 3-Clause, see `LICENSE`. The FidelityFX shaders in `third_party/fidelityfx` are MIT-licensed by AMD, see `THIRD_PARTY_NOTICES.txt`.
