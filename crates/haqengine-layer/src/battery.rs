@@ -220,6 +220,11 @@ fn groups(w: u32, h: u32) -> (u32, u32) {
     (w.div_ceil(8), h.div_ceil(8))
 }
 
+/// Workgroups for the blend, whose 8×8 threads each handle a 2×2 pixel quad.
+fn blend_groups(w: u32, h: u32) -> (u32, u32) {
+    (w.div_ceil(16), h.div_ceil(16))
+}
+
 /// Push-constant bytes for 2 words, without allocating.
 pub fn push2(a: [u8; 4], b: [u8; 4]) -> [u8; 8] {
     let mut out = [0u8; 8];
@@ -482,6 +487,7 @@ impl BatteryResources {
     /// # Safety
     /// `cmd` must be recording; `game` and `spares` must be images of this swapchain, at most
     /// `outputs` spares.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn record(
         &mut self,
         d: &ash::Device,
@@ -490,7 +496,13 @@ impl BatteryResources {
         game: vk::Image,
         spares: &[vk::Image],
         slot: usize,
+        stamps: Option<(vk::QueryPool, u32)>,
     ) -> BatteryStep {
+        let stamp = |i: u32| {
+            if let Some((pool, base)) = stamps {
+                d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, base + i);
+            }
+        };
         let spares = &spares[..spares.len().min(self.outputs)];
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as S};
         if !self.initialized {
@@ -534,6 +546,7 @@ impl BatteryResources {
             dispatch(d, cmd, &p.reduce, self.reduce_sets[cur][l - 1], &push2(iw.to_le_bytes(), ih.to_le_bytes()), groups(levels[l].0, levels[l].1));
         }
 
+        stamp(1);
         for &spare in spares {
             image_barrier(d, cmd, spare, L::UNDEFINED, L::TRANSFER_DST_OPTIMAL, A::empty(), A::TRANSFER_WRITE, S::TRANSFER, S::TRANSFER);
         }
@@ -559,6 +572,7 @@ impl BatteryResources {
                     dispatch(d, cmd, &p.median, self.median_sets[l - 1], &push2(bw.to_le_bytes(), bh.to_le_bytes()), groups(bw, bh));
                 }
             }
+            stamp(2);
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
             for image in [COUNTERS, TILES] {
                 d.cmd_clear_color_image(cmd, self.images[image].image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
@@ -578,13 +592,15 @@ impl BatteryResources {
                     fmt.to_le_bytes(),
                     row.to_le_bytes(),
                 ];
-                dispatch(d, cmd, &p.warp, self.warp_sets[cur][k], push.as_flattened(), groups(w, h));
+                dispatch(d, cmd, &p.warp, self.warp_sets[cur][k], push.as_flattened(), blend_groups(w, h));
             }
+            stamp(3);
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
             for ((k, &set), t) in self.fixup_sets[cur][..blends].iter().enumerate().zip(haqengine_core::blend_times(m)) {
                 let fix = [w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes(), (k as u32).to_le_bytes(), t.to_le_bytes(), fmt.to_le_bytes()];
                 dispatch(d, cmd, &p.fixup, set, fix.as_flattened(), groups(w, h));
             }
+            stamp(4);
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
             if slot < self.readback_valid.len() {
                 let region = vk::BufferImageCopy::default()

@@ -60,6 +60,10 @@ pub struct Ready {
     pub timestamp_period_ns: f32,
     /// Whether a slot's timestamps were written and can be read.
     pub stamped: Vec<bool>,
+    /// Timestamps per slot: 2 (start and end) or, with `HAQENGINE_TIMING`, one per phase boundary.
+    pub stride: u32,
+    /// Which of a slot's timestamps its last recording wrote (bit per stamp).
+    pub stamp_mask: Vec<u8>,
     /// One "ready to present" semaphore per swapchain image. A present may still hold its
     /// semaphore until that image is acquired again, so it is reused only for the same image.
     pub image_ready: Vec<vk::Semaphore>,
@@ -72,6 +76,8 @@ pub struct GenStats {
     pub intervals: FrameStats,
     pub present_cost: FrameStats,
     pub gpu_cost: FrameStats,
+    /// Battery's GPU time per phase (with `HAQENGINE_TIMING`).
+    pub phases: Box<haqengine_core::phases::PhaseStats>,
     pub last_present: Option<Instant>,
     pub last_log_ms: u64,
     /// Real and generated presents since the last log line.
@@ -162,6 +168,7 @@ impl FrameGen {
                     intervals: FrameStats::new(),
                     present_cost: FrameStats::new(),
                     gpu_cost: FrameStats::new(),
+                    phases: Box::new(haqengine_core::phases::PhaseStats::new()),
                     last_present: None,
                     last_log_ms: 0,
                     window_real: 0,
@@ -206,12 +213,11 @@ impl FrameGen {
         )?;
         let slot_count = self.images.len() + 2;
         let family_props = device.queue_families.get(family as usize).copied().unwrap_or_default();
-        let queries = if family_props.timestamp_valid_bits > 0 {
-            d.create_query_pool(
-                &vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2 * slot_count as u32),
-                None,
-            )
-            .unwrap_or(vk::QueryPool::null())
+        let query_count = timing_queries(crate::state::SETTINGS.timing, family_props.timestamp_valid_bits, slot_count);
+        let stride = if query_count == 0 { 2 } else { query_count / slot_count as u32 };
+        let queries = if query_count > 0 {
+            d.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(query_count), None)
+                .unwrap_or(vk::QueryPool::null())
         } else {
             vk::QueryPool::null()
         };
@@ -224,6 +230,8 @@ impl FrameGen {
             queries,
             timestamp_period_ns,
             stamped: vec![false; slot_count],
+            stride,
+            stamp_mask: vec![0; slot_count],
             image_ready: Vec::with_capacity(self.images.len()),
         };
         let result = (|| -> Result<(), vk::Result> {
@@ -756,11 +764,14 @@ impl FrameGen {
         d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         let queries = st.ready.as_ref().map_or(vk::QueryPool::null(), |r| r.queries);
-        let first = 2 * slot_index as u32;
+        let stride = st.ready.as_ref().map_or(2, |r| r.stride);
+        let first = stride * slot_index as u32;
         if queries != vk::QueryPool::null() {
-            d.cmd_reset_query_pool(cmd, queries, first, 2);
+            d.cmd_reset_query_pool(cmd, queries, first, stride);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, first);
         }
+        let inner = (queries != vk::QueryPool::null() && stride as usize == haqengine_core::phases::STAMPS).then_some((queries, first));
+        let mut mask: u8 = 1 | (1 << (stride - 1));
         let quality = self.quality_pipelines(st, id, device);
         let recorded = if let (Some(p), Some(q), Some(spare)) = (quality, st.quality.as_mut(), spare) {
             q.record(d, cmd, &p, game, spare, slot_index);
@@ -768,7 +779,10 @@ impl FrameGen {
         } else {
             match (self.battery_pipelines(st, id, device), st.battery.as_mut()) {
                 (Some(p), Some(b)) => {
-                    b.record(d, cmd, &p, game, spares, slot_index);
+                    let step = b.record(d, cmd, &p, game, spares, slot_index, inner);
+                    if inner.is_some() {
+                        mask |= if step == crate::battery::BatteryStep::Interpolate { 0b11_1111 } else { 0b10_0011 };
+                    }
                     Recorded::Battery
                 }
                 _ => {
@@ -780,7 +794,12 @@ impl FrameGen {
             }
         };
         if queries != vk::QueryPool::null() {
-            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, first + 1);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, first + stride - 1);
+        }
+        if let Some(ready) = st.ready.as_mut() {
+            if let Some(m) = ready.stamp_mask.get_mut(slot_index) {
+                *m = mask;
+            }
         }
         d.end_command_buffer(cmd)?;
         Ok(recorded)
@@ -924,12 +943,30 @@ unsafe fn read_gpu_time(st: &mut GenState, d: &ash::Device, slot_index: usize) {
     if ready.queries == vk::QueryPool::null() || !ready.stamped[slot_index] {
         return;
     }
-    let mut stamps = [0u64; 2];
-    let r = d.get_query_pool_results(ready.queries, 2 * slot_index as u32, &mut stamps, vk::QueryResultFlags::TYPE_64);
     ready.stamped[slot_index] = false;
-    if r.is_ok() && stamps[1] >= stamps[0] {
-        let us = (stamps[1] - stamps[0]) as f64 * ready.timestamp_period_ns as f64 / 1000.0;
+    let stride = ready.stride as usize;
+    let first = (stride * slot_index) as u32;
+    let mask = ready.stamp_mask.get(slot_index).copied().unwrap_or(0);
+    let mut stamps = [0u64; haqengine_core::phases::STAMPS];
+    let mut written = [false; haqengine_core::phases::STAMPS];
+    for i in 0..stride.min(haqengine_core::phases::STAMPS) {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let mut one = [0u64; 1];
+        if d.get_query_pool_results(ready.queries, first + i as u32, &mut one, vk::QueryResultFlags::TYPE_64).is_ok() {
+            stamps[i] = one[0];
+            written[i] = true;
+        }
+    }
+    let last = stride - 1;
+    if written[0] && written[last] && stamps[last] >= stamps[0] {
+        let us = (stamps[last] - stamps[0]) as f64 * ready.timestamp_period_ns as f64 / 1000.0;
         st.stats.gpu_cost.push(us.min(u32::MAX as f64) as u32);
+    }
+    if stride == haqengine_core::phases::STAMPS {
+        let period = ready.timestamp_period_ns;
+        st.stats.phases.push(&haqengine_core::phases::phase_durations(&stamps, written, period));
     }
 }
 
@@ -1006,6 +1043,10 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: u64, skipped: b
         s.intervals.clear();
         s.present_cost.clear();
         s.gpu_cost.clear();
+        if let Some(line) = s.phases.report() {
+            LOG.log(&format!("swapchain {id}: {line}"));
+        }
+        s.phases.clear();
         s.pace_wait.clear();
         s.window_real = 0;
         s.window_generated = 0;
@@ -1046,6 +1087,16 @@ pub unsafe fn has_present_id(p_next: *const std::ffi::c_void) -> bool {
         cur = (*cur).p_next;
     }
     false
+}
+
+/// Timestamp queries for `slots` slots: none without timestamp support, two per slot, or one per
+/// phase boundary with `HAQENGINE_TIMING`.
+pub fn timing_queries(timing: bool, valid_bits: u32, slots: usize) -> u32 {
+    match (valid_bits, timing) {
+        (0, _) => 0,
+        (_, false) => 2 * slots as u32,
+        (_, true) => (haqengine_core::phases::STAMPS * slots) as u32,
+    }
 }
 
 /// Frames shown per second in a log window with `real` real and `generated` generated presents.
@@ -1161,6 +1212,14 @@ mod tests {
         let without = vk::PresentInfoKHR::default().push_next(&mut regions);
         assert!(!unsafe { has_present_id(without.p_next) });
         assert!(!unsafe { has_present_id(std::ptr::null()) });
+    }
+
+    #[test]
+    fn timing_needs_timestamp_bits() {
+        assert_eq!(timing_queries(true, 0, 7), 0);
+        assert_eq!(timing_queries(false, 0, 7), 0);
+        assert_eq!(timing_queries(false, 64, 7), 14);
+        assert_eq!(timing_queries(true, 64, 7), 42);
     }
 
     #[test]

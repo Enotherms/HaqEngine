@@ -1261,7 +1261,7 @@ fn run_battery_blends(
                 &haqengine_shaders::BATTERY_BLEND_PACKED,
                 &[prev, cur, flow_img, dst, prev_luma, cur_luma, &counters, &tiles],
                 &push,
-                groups(prev.width, prev.height),
+                [prev.width.div_ceil(16), prev.height.div_ceil(16)],
             )?;
             let fix_push = push_bytes(&[
                 prev.width.to_le_bytes(),
