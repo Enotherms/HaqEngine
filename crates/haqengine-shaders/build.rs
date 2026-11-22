@@ -40,7 +40,7 @@ fn compiler() -> PathBuf {
 }
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shaders");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let glslang = compiler();
     for name in SHADERS {
