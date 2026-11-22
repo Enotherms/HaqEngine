@@ -101,9 +101,7 @@ impl Gpu {
                 layers.push(VALIDATION.as_ptr());
                 extensions.push(ash::ext::debug_utils::NAME.as_ptr());
             }
-            let app = vk::ApplicationInfo::default()
-                .application_name(c"haqengine-gpu-tests")
-                .api_version(vk::API_VERSION_1_1);
+            let app = vk::ApplicationInfo::default().application_name(c"haqengine-gpu-tests").api_version(vk::API_VERSION_1_1);
             let instance = entry
                 .create_instance(
                     &vk::InstanceCreateInfo::default()
@@ -118,12 +116,8 @@ impl Gpu {
                 let messenger = utils
                     .create_debug_utils_messenger(
                         &vk::DebugUtilsMessengerCreateInfoEXT::default()
-                            .message_severity(
-                                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
-                            )
-                            .message_type(
-                                vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                            )
+                            .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING)
+                            .message_type(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE)
                             .pfn_user_callback(Some(on_debug_message)),
                         None,
                     )
@@ -144,19 +138,16 @@ impl Gpu {
                         .map(|(i, f)| (p, i as u32, f.timestamp_valid_bits))
                 })
                 .collect();
-            let types: Vec<vk::PhysicalDeviceType> = candidates
-                .iter()
-                .map(|(p, _, _)| instance.get_physical_device_properties(*p).device_type)
-                .collect();
-            let (physical, family, valid_bits) =
-                pick_device(&types).map(|i| candidates[i]).ok_or("no GPU with a compute queue")?;
+            let types: Vec<vk::PhysicalDeviceType> =
+                candidates.iter().map(|(p, _, _)| instance.get_physical_device_properties(*p).device_type).collect();
+            let (physical, family, valid_bits) = pick_device(&types).map(|i| candidates[i]).ok_or("no GPU with a compute queue")?;
             let props = instance.get_physical_device_properties(physical);
             let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
             instance.get_physical_device_properties2(physical, &mut props2);
             let needed = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::QUAD;
-            let subgroup_ok = subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
-                && subgroup.supported_operations.contains(needed);
+            let subgroup_ok =
+                subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE) && subgroup.supported_operations.contains(needed);
             let subgroup_size = subgroup.subgroup_size;
             let supported = instance.get_physical_device_features(physical);
             let extended_formats = supported.shader_storage_image_extended_formats == vk::TRUE;
@@ -195,10 +186,7 @@ impl Gpu {
                 )
                 .map_err(|e| err("creating the command pool", e))?;
             let query_pool = device
-                .create_query_pool(
-                    &vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2),
-                    None,
-                )
+                .create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2), None)
                 .map_err(|e| err("creating the query pool", e))?;
             let memory = instance.get_physical_device_memory_properties(physical);
             let sampler = device
@@ -254,9 +242,8 @@ impl Gpu {
 
     unsafe fn host_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
         let d = &self.device;
-        let buffer = d
-            .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None)
-            .map_err(|e| err("creating a buffer", e))?;
+        let buffer =
+            d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None).map_err(|e| err("creating a buffer", e))?;
         let req = d.get_buffer_memory_requirements(buffer);
         let memory = self
             .memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
@@ -310,9 +297,7 @@ impl Gpu {
                 vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ)],
                 &[],
                 &[],
             );
@@ -423,9 +408,8 @@ impl Gpu {
                 )
             };
             let mut views = Vec::with_capacity(mips as usize + 1);
-            let levels = std::iter::once(color_range()).chain(
-                (0..if mips > 1 { mips } else { 0 }).map(|m| color_range().base_mip_level(m).level_count(1)),
-            );
+            let levels = std::iter::once(color_range())
+                .chain((0..if mips > 1 { mips } else { 0 }).map(|m| color_range().base_mip_level(m).level_count(1)));
             for range in levels {
                 match make_view(range) {
                     Ok(v) => views.push(v),
@@ -478,9 +462,7 @@ impl Gpu {
         let d = &self.device;
         let (buffer, memory) = self.host_buffer(bytes.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
         let result = (|| {
-            let ptr = d
-                .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
-                .map_err(|e| err("mapping memory", e))?;
+            let ptr = d.map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty()).map_err(|e| err("mapping memory", e))?;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
             d.unmap_memory(memory);
             self.submit(|cmd| {
@@ -503,9 +485,7 @@ impl Gpu {
                 d.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[copy_region(img)]);
                 self.transition(cmd, img.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::GENERAL);
             })?;
-            let ptr = d
-                .map_memory(memory, 0, len as u64, vk::MemoryMapFlags::empty())
-                .map_err(|e| err("mapping memory", e))?;
+            let ptr = d.map_memory(memory, 0, len as u64, vk::MemoryMapFlags::empty()).map_err(|e| err("mapping memory", e))?;
             let mut out = vec![0u8; len];
             std::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), len);
             d.unmap_memory(memory);
@@ -543,10 +523,7 @@ impl Gpu {
     pub fn read_rg16i(&self, img: &StorageImage) -> Result<Image<[i16; 2]>, String> {
         let n = (img.width * img.height) as usize;
         let bytes = unsafe { self.copy_out(img, n * 4)? };
-        let data = bytes
-            .chunks_exact(4)
-            .map(|c| [i16::from_le_bytes([c[0], c[1]]), i16::from_le_bytes([c[2], c[3]])])
-            .collect();
+        let data = bytes.chunks_exact(4).map(|c| [i16::from_le_bytes([c[0], c[1]]), i16::from_le_bytes([c[2], c[3]])]).collect();
         Ok(Image { width: img.width, height: img.height, data })
     }
 
@@ -634,9 +611,7 @@ impl Gpu {
             let set_layout = d
                 .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)
                 .map_err(|e| err("creating the set layout", e))?;
-            let ranges = [vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .size(push.len() as u32)];
+            let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(push.len() as u32)];
             let set_layouts = [set_layout];
             let layout = d
                 .create_pipeline_layout(
@@ -644,10 +619,7 @@ impl Gpu {
                     None,
                 )
                 .map_err(|e| err("creating the pipeline layout", e))?;
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main");
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let pipeline = d
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
@@ -655,9 +627,7 @@ impl Gpu {
                     None,
                 )
                 .map_err(|(_, e)| err("creating the pipeline", e))?[0];
-            let sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(images.len() as u32)];
+            let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(images.len() as u32)];
             let desc_pool = d
                 .create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)
                 .map_err(|e| err("creating the descriptor pool", e))?;
@@ -729,8 +699,7 @@ impl Gpu {
             BindingKind::Sampler => vk::DescriptorType::SAMPLER,
             BindingKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
         };
-        let mut cb_bindings: Vec<u32> =
-            pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).map(|b| b.0).collect();
+        let mut cb_bindings: Vec<u32> = pass.bindings.iter().filter(|b| b.1 == BindingKind::UniformBuffer).map(|b| b.0).collect();
         cb_bindings.sort_unstable();
         if cb_bindings.len() != constants.len() {
             return Err(format!("{} needs {} constant blocks, got {}", pass.name, cb_bindings.len(), constants.len()));
@@ -773,9 +742,7 @@ impl Gpu {
         for bytes in constants {
             let (buffer, memory) = self.host_buffer(bytes.len() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
             owned.buffers.push((buffer, memory));
-            let ptr = d
-                .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
-                .map_err(|e| err("mapping memory", e))?;
+            let ptr = d.map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty()).map_err(|e| err("mapping memory", e))?;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
             d.unmap_memory(memory);
         }
@@ -805,10 +772,7 @@ impl Gpu {
         let layout_info = if pass.push_size > 0 { layout_info.push_constant_ranges(&ranges) } else { layout_info };
         let layout = d.create_pipeline_layout(&layout_info, None).map_err(|e| err("creating the pipeline layout", e))?;
         owned.layout = layout;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(c"main");
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
         let pipeline = d
             .create_compute_pipelines(
                 vk::PipelineCache::null(),
@@ -824,9 +788,9 @@ impl Gpu {
             vk::DescriptorType::SAMPLER,
             vk::DescriptorType::STORAGE_BUFFER,
         ]
-            .into_iter()
-            .map(|ty| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(pass.bindings.len() as u32))
-            .collect();
+        .into_iter()
+        .map(|ty| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(pass.bindings.len() as u32))
+        .collect();
         let desc_pool = d
             .create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)
             .map_err(|e| err("creating the descriptor pool", e))?;
@@ -840,7 +804,9 @@ impl Gpu {
             .filter_map(|(b, k)| {
                 let bound = binds.iter().find(|(n, _)| n == b).map(|(_, x)| *x);
                 let view = match (k, bound) {
-                    (BindingKind::Sampler, _) => return Some((*b, kind_of(*k), [vk::DescriptorImageInfo::default().sampler(self.sampler)])),
+                    (BindingKind::Sampler, _) => {
+                        return Some((*b, kind_of(*k), [vk::DescriptorImageInfo::default().sampler(self.sampler)]))
+                    }
                     (_, Some(Bind::Image(img))) => img.view,
                     _ => return None,
                 };
@@ -941,19 +907,12 @@ impl Drop for Gpu {
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .level_count(vk::REMAINING_MIP_LEVELS)
-        .layer_count(1)
+    vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(vk::REMAINING_MIP_LEVELS).layer_count(1)
 }
 
 fn copy_region(img: &StorageImage) -> vk::BufferImageCopy {
     vk::BufferImageCopy::default()
-        .image_subresource(
-            vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .layer_count(1),
-        )
+        .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
         .image_extent(vk::Extent3D { width: img.width, height: img.height, depth: 1 })
 }
 

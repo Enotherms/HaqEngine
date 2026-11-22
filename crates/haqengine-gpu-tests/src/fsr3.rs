@@ -4,8 +4,7 @@
 use crate::gpu::{Bind, Gpu, StorageImage};
 use ash::vk;
 use haqengine_core::fsr3_flow::{
-    ffx_to_haq, half_size, of_schedule, of_sizes, set_frame_index, OfDispatch, OfInput, OfRes, OF_LEVELS, PASS_SEARCH,
-    SCD_HISTOGRAM_WIDTH,
+    ffx_to_haq, half_size, of_schedule, of_sizes, set_frame_index, OfDispatch, OfInput, OfRes, OF_LEVELS, PASS_SEARCH, SCD_HISTOGRAM_WIDTH,
 };
 use haqengine_core::packed::PackedFormat;
 use haqengine_core::Image;

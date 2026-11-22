@@ -1,10 +1,12 @@
 //! Quality mode in the layer: FSR 3 optical flow at half resolution and HaqEngine's packed blend,
 //! with every image in one allocation and the per-frame constants in a ring of slot regions.
 
-use ash::vk;
-use haqengine_core::fsr3_flow::{half_size, of_schedule, of_sizes, set_frame_index, OfDispatch, OfInput, OfRes, OF_LEVELS, SCD_HISTOGRAM_WIDTH};
 use crate::pipelines::{descriptor_type, FsrPass, QualityPipelines};
 use crate::state::DeviceData;
+use ash::vk;
+use haqengine_core::fsr3_flow::{
+    half_size, of_schedule, of_sizes, set_frame_index, OfDispatch, OfInput, OfRes, OF_LEVELS, SCD_HISTOGRAM_WIDTH,
+};
 use haqengine_core::quality::{arena_layout, quality_step, ConstantRing, QualityStep};
 use haqengine_core::PackedFormat;
 use haqengine_shaders::BindingKind;
@@ -315,7 +317,12 @@ impl QualityResources {
         }
     }
 
-    unsafe fn build(&mut self, d: &ash::Device, props: &vk::PhysicalDeviceMemoryProperties, p: &QualityPipelines) -> Result<(), vk::Result> {
+    unsafe fn build(
+        &mut self,
+        d: &ash::Device,
+        props: &vk::PhysicalDeviceMemoryProperties,
+        p: &QualityPipelines,
+    ) -> Result<(), vk::Result> {
         let specs = image_specs(self.extent);
         let mut raw: Vec<(QRes, vk::Image, vk::Format)> = Vec::with_capacity(specs.len());
         let result = (|| {
@@ -377,7 +384,8 @@ impl QualityResources {
 
     unsafe fn build_ring(&mut self, d: &ash::Device, props: &vk::PhysicalDeviceMemoryProperties) -> Result<(), vk::Result> {
         let size = self.ring.size();
-        self.ring_buffer = d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::UNIFORM_BUFFER), None)?;
+        self.ring_buffer =
+            d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::UNIFORM_BUFFER), None)?;
         let req = d.get_buffer_memory_requirements(self.ring_buffer);
         let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let kind = memory_type(props, req.memory_type_bits, flags).ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
@@ -390,7 +398,8 @@ impl QualityResources {
         self.readback = d.create_buffer(&vk::BufferCreateInfo::default().size(rb_size).usage(vk::BufferUsageFlags::TRANSFER_DST), None)?;
         let req = d.get_buffer_memory_requirements(self.readback);
         let kind = memory_type(props, req.memory_type_bits, flags).ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
-        self.readback_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)?;
+        self.readback_memory =
+            d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)?;
         self.bytes += req.size;
         d.bind_buffer_memory(self.readback, self.readback_memory, 0)?;
         self.readback_mapped = Mapped(d.map_memory(self.readback_memory, 0, rb_size, vk::MemoryMapFlags::empty())? as *mut u8);
@@ -434,8 +443,9 @@ impl QualityResources {
         let max_sets = (layouts[0].len() + layouts[1].len()) as u32;
         self.pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(max_sets).pool_sizes(&sizes), None)?;
         for parity in 0..2 {
-            self.sets[parity] =
-                d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.pool).set_layouts(&layouts[parity]))?;
+            self.sets[parity] = d.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.pool).set_layouts(&layouts[parity]),
+            )?;
         }
         for parity in 0..2 {
             for (i, binds) in plan[parity].iter().enumerate() {
@@ -450,11 +460,17 @@ impl QualityResources {
                     }
                     let res = binds.iter().find(|(n, _)| n == b).map(|(_, r)| *r).ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
                     let view = self.image(res).view;
-                    image_infos.push((*b, descriptor_type(*k), [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL)]));
+                    image_infos.push((
+                        *b,
+                        descriptor_type(*k),
+                        [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL)],
+                    ));
                 }
                 let mut writes: Vec<vk::WriteDescriptorSet> = image_infos
                     .iter()
-                    .map(|(b, ty, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(*ty).image_info(info))
+                    .map(|(b, ty, info)| {
+                        vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(*ty).image_info(info)
+                    })
                     .collect();
                 writes.extend(buffer_infos.iter().map(|(b, info)| {
                     vk::WriteDescriptorSet::default()
@@ -476,7 +492,15 @@ impl QualityResources {
     /// # Safety
     /// `cmd` must be recording on the device these resources belong to, `slot` must be the frame
     /// slot whose fence was waited for, and `game`/`spare` images of this swapchain.
-    pub unsafe fn record(&mut self, d: &ash::Device, cmd: vk::CommandBuffer, p: &QualityPipelines, game: vk::Image, spare: vk::Image, slot: usize) -> QualityStep {
+    pub unsafe fn record(
+        &mut self,
+        d: &ash::Device,
+        cmd: vk::CommandBuffer,
+        p: &QualityPipelines,
+        game: vk::Image,
+        spare: vk::Image,
+        slot: usize,
+    ) -> QualityStep {
         use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as S};
         if !self.initialized {
             let barriers: Vec<vk::ImageMemoryBarrier> = self
@@ -570,8 +594,28 @@ impl QualityResources {
         } else {
             d.cmd_copy_image(cmd, game, L::TRANSFER_SRC_OPTIMAL, spare, L::TRANSFER_DST_OPTIMAL, &[full]);
         }
-        layout_barrier(d, cmd, spare, L::TRANSFER_DST_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_WRITE, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
-        layout_barrier(d, cmd, game, L::TRANSFER_SRC_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_READ, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
+        layout_barrier(
+            d,
+            cmd,
+            spare,
+            L::TRANSFER_DST_OPTIMAL,
+            L::PRESENT_SRC_KHR,
+            A::TRANSFER_WRITE,
+            A::empty(),
+            S::TRANSFER,
+            S::BOTTOM_OF_PIPE,
+        );
+        layout_barrier(
+            d,
+            cmd,
+            game,
+            L::TRANSFER_SRC_OPTIMAL,
+            L::PRESENT_SRC_KHR,
+            A::TRANSFER_READ,
+            A::empty(),
+            S::TRANSFER,
+            S::BOTTOM_OF_PIPE,
+        );
         step
     }
 

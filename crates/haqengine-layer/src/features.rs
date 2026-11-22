@@ -186,7 +186,8 @@ pub unsafe fn patch_create_info(ci: &vk::DeviceCreateInfo, supported: &Supported
     if modified != targets.len() {
         return Err("a device feature struct appears twice in the chain".into());
     }
-    let mut features = Box::new(if ci.p_enabled_features.is_null() { vk::PhysicalDeviceFeatures::default() } else { *ci.p_enabled_features });
+    let mut features =
+        Box::new(if ci.p_enabled_features.is_null() { vk::PhysicalDeviceFeatures::default() } else { *ci.p_enabled_features });
     let use_features = !ext_on && !ext_in_features2;
     if use_features {
         features.shader_storage_image_extended_formats = vk::TRUE;
@@ -237,7 +238,9 @@ pub unsafe fn present_wait_state(ci: &vk::DeviceCreateInfo) -> PresentWaitState 
     }
     let (mut id, mut wait) = (None, None);
     each(ci.p_next, |c| match (*c).s_type {
-        S::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR => id = Some((*(c as *const vk::PhysicalDevicePresentIdFeaturesKHR)).present_id == vk::TRUE),
+        S::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR => {
+            id = Some((*(c as *const vk::PhysicalDevicePresentIdFeaturesKHR)).present_id == vk::TRUE)
+        }
         S::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR => {
             wait = Some((*(c as *const vk::PhysicalDevicePresentWaitFeaturesKHR)).present_wait == vk::TRUE)
         }
@@ -245,7 +248,9 @@ pub unsafe fn present_wait_state(ci: &vk::DeviceCreateInfo) -> PresentWaitState 
     });
     match (id, wait) {
         (None, None) => PresentWaitState::Absent,
-        (Some(true), Some(true)) if lists(ci, ash::khr::present_id::NAME) && lists(ci, ash::khr::present_wait::NAME) => PresentWaitState::Enabled,
+        (Some(true), Some(true)) if lists(ci, ash::khr::present_id::NAME) && lists(ci, ash::khr::present_wait::NAME) => {
+            PresentWaitState::Enabled
+        }
         _ => PresentWaitState::Unavailable,
     }
 }
@@ -271,7 +276,8 @@ pub unsafe fn present_patch(ci: &vk::DeviceCreateInfo) -> Option<PresentPatch> {
     wait.p_next = ci.p_next as *mut c_void;
     let mut id = Box::new(vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true));
     id.p_next = &mut *wait as *mut vk::PhysicalDevicePresentWaitFeaturesKHR as *mut c_void;
-    let mut extensions: Vec<*const c_char> = (0..ci.enabled_extension_count as usize).map(|i| *ci.pp_enabled_extension_names.add(i)).collect();
+    let mut extensions: Vec<*const c_char> =
+        (0..ci.enabled_extension_count as usize).map(|i| *ci.pp_enabled_extension_names.add(i)).collect();
     for name in [ash::khr::present_id::NAME, ash::khr::present_wait::NAME] {
         if !lists(ci, name) {
             extensions.push(name.as_ptr());
@@ -321,7 +327,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    const ALL: Supported = Supported { extended_formats: true, robust_image_access: true, image_robustness_ext: true, device_api_13: false };
+    const ALL: Supported =
+        Supported { extended_formats: true, robust_image_access: true, image_robustness_ext: true, device_api_13: false };
 
     unsafe fn find<T>(head: *const c_void, s: vk::StructureType) -> Option<*const T> {
         let mut cur = head as *const vk::BaseInStructure;
@@ -370,7 +377,11 @@ mod tests {
             let v13c: *const vk::PhysicalDeviceVulkan13Features =
                 find(patch.info.p_next, vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES).unwrap();
             assert_eq!((*v13c).robust_image_access, vk::TRUE);
-            assert!(find::<vk::PhysicalDeviceImageRobustnessFeatures>(patch.info.p_next, vk::StructureType::PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES).is_none());
+            assert!(find::<vk::PhysicalDeviceImageRobustnessFeatures>(
+                patch.info.p_next,
+                vk::StructureType::PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES
+            )
+            .is_none());
             assert!(patch.info.p_enabled_features.is_null());
             assert!(ext_names(&patch.info).is_empty());
         }
@@ -458,7 +469,8 @@ mod tests {
     }
 
     unsafe fn present_features(info: &vk::DeviceCreateInfo) -> (bool, bool) {
-        let id: Option<*const vk::PhysicalDevicePresentIdFeaturesKHR> = find(info.p_next, vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+        let id: Option<*const vk::PhysicalDevicePresentIdFeaturesKHR> =
+            find(info.p_next, vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
         let wait: Option<*const vk::PhysicalDevicePresentWaitFeaturesKHR> =
             find(info.p_next, vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
         (id.is_some_and(|p| (*p).present_id == vk::TRUE), wait.is_some_and(|p| (*p).present_wait == vk::TRUE))
@@ -475,7 +487,8 @@ mod tests {
             assert_eq!(present_features(&patch.info), (true, true));
             let names = ext_names(&patch.info);
             assert_eq!(names, ["VK_KHR_swapchain", "VK_KHR_present_id", "VK_KHR_present_wait"]);
-            assert!(find::<vk::PhysicalDeviceVulkan13Features>(patch.info.p_next, vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES).is_some());
+            assert!(find::<vk::PhysicalDeviceVulkan13Features>(patch.info.p_next, vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
+                .is_some());
             assert_eq!(present_wait_state(&patch.info), PresentWaitState::Enabled);
             assert_eq!(present_features(&ci), (false, false));
             assert_eq!(ci.enabled_extension_count, 1);
@@ -586,10 +599,12 @@ mod tests {
             let patch = patch_create_info(&ci, &ALL).unwrap().unwrap();
             let mut out = vk::Device::null();
             CALLS.store(0, Ordering::SeqCst);
-            let (r, patched) = create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, Some(&patch), &mut || {}, std::ptr::null(), &mut out);
+            let (r, patched) =
+                create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, Some(&patch), &mut || {}, std::ptr::null(), &mut out);
             assert_eq!((r, patched, CALLS.load(Ordering::SeqCst)), (vk::Result::SUCCESS, false, 2));
             assert_eq!(vk::Handle::as_raw(out), 0x1234);
-            let (r, patched) = create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, None, &mut || {}, std::ptr::null(), &mut out);
+            let (r, patched) =
+                create_with_fallback(fail_patched, vk::PhysicalDevice::null(), &ci, None, &mut || {}, std::ptr::null(), &mut out);
             assert_eq!((r, patched), (vk::Result::SUCCESS, false));
         }
     }

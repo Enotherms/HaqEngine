@@ -4,11 +4,10 @@ use crate::fsr3::run_sequence;
 use crate::gpu::{push_bytes, Bind, Gpu, StorageImage};
 use ash::vk;
 use haqengine_core::flow::{self, level_radius, Flow, BLOCK, LEVELS};
-use haqengine_core::{
-    blend, checker, compare_f32, compare_rg32f, compare_rgba8, gradient, luma_downsample, noise, shift, CompareReport,
-    Image, Rgba8,
-};
 use haqengine_core::packed::{self, PackedFormat};
+use haqengine_core::{
+    blend, checker, compare_f32, compare_rg32f, compare_rgba8, gradient, luma_downsample, noise, shift, CompareReport, Image, Rgba8,
+};
 use haqengine_shaders::{
     BLEND, BLOCK_MATCH, FLOW_MEDIAN, LUMA_DOWNSAMPLE, LUMA_DOWNSAMPLE_PACKED, LUMA_REDUCE, WARP_BLEND, WARP_BLEND_PACKED,
 };
@@ -205,12 +204,7 @@ fn run_warp_packed_with(
             t.to_le_bytes(),
             f.code().to_le_bytes(),
         ]);
-        let us = gpu.run(
-            shader,
-            &[prev, cur, flow_img, &dst, prev_luma, cur_luma],
-            &push,
-            groups(prev.width, prev.height),
-        )?;
+        let us = gpu.run(shader, &[prev, cur, flow_img, &dst, prev_luma, cur_luma], &push, groups(prev.width, prev.height))?;
         Ok((gpu.read_u32(&dst)?, us))
     })();
     gpu.destroy_image(dst);
@@ -748,13 +742,7 @@ fn fsr3_scene_cut_case(gpu: &Gpu) -> Result<CaseResult, String> {
     frames.push(gradient(1280, 800));
     let (_, cut, us, _) = fsr3_run(gpu, &frames)?;
     let value = |s: [u32; 3]| f32::from_bits(s[0]);
-    println!(
-        "      scene change value calm {:.3} history {:#x}, cut {:.3} history {:#x}",
-        value(calm),
-        calm[1],
-        value(cut),
-        cut[1]
-    );
+    println!("      scene change value calm {:.3} history {:#x}, cut {:.3} history {:#x}", value(calm), calm[1], value(cut), cut[1]);
     if calm[1] & 1 != 0 || cut[1] & 1 == 0 {
         return Err(format!("history bits calm {:#x} cut {:#x}: expected the cut only on the new frame", calm[1], cut[1]));
     }
@@ -788,7 +776,8 @@ fn fsr3_odd_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let (flow, _, us, _) = fsr3_run(gpu, &frames)?;
     let (prev, cur) = (&frames[frames.len() - 2], &frames[frames.len() - 1]);
     let battery = flow::estimate_flow(&flow::pyramid(prev), &flow::pyramid(cur));
-    let battery_px = Image { width: battery.width, height: battery.height, data: battery.data.iter().map(|v| [v[0] * 2.0, v[1] * 2.0]).collect() };
+    let battery_px =
+        Image { width: battery.width, height: battery.height, data: battery.data.iter().map(|v| [v[0] * 2.0, v[1] * 2.0]).collect() };
     let keep = |bx: u32, by: u32| seen_before(bx, by, 1280, 800, 7, -3);
     let (fh, ft) = fsr3_hits(&flow, [7.0, -3.0], keep);
     let (bh, bt) = fsr3_hits(&battery_px, [7.0, -3.0], keep);
@@ -1004,7 +993,11 @@ fn mean_err(a: &Image<Rgba8>, b: &Image<Rgba8>, keep: impl Fn(u32, u32) -> bool)
             }
         }
     }
-    if n == 0 { f64::NAN } else { sum as f64 / n as f64 }
+    if n == 0 {
+        f64::NAN
+    } else {
+        sum as f64 / n as f64
+    }
 }
 
 /// Battery's frame between the last two frames, computed exactly as its GPU passes do.
@@ -1125,7 +1118,11 @@ fn interp_revealed_case(gpu: &Gpu) -> Result<CaseResult, String> {
 /// double exposure of both scenes.
 fn interp_cut_case(gpu: &Gpu) -> Result<CaseResult, String> {
     fsr3_ready(gpu)?;
-    let dim = |img: Image<Rgba8>| Image { width: img.width, height: img.height, data: img.data.iter().map(|p| [p[0] / 8, p[1] / 8, p[2] / 8, 255]).collect() };
+    let dim = |img: Image<Rgba8>| Image {
+        width: img.width,
+        height: img.height,
+        data: img.data.iter().map(|p| [p[0] / 8, p[1] / 8, p[2] / 8, 255]).collect(),
+    };
     let mut frames: Vec<Image<Rgba8>> = pan_frames(1280, 800, 12, -8, QUALITY_STEPS, 161).into_iter().map(dim).collect();
     frames.push(dim(gradient(1280, 800)));
     let (out, us, _) = fsr3_mid(gpu, &frames)?;
@@ -1190,11 +1187,19 @@ fn interp_pipeline_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let frames = pan_frames(1280, 800, 12, -8, QUALITY_STEPS, 141);
     let (_, us, times) = interp_run(gpu, &frames, CANARIES[0])?;
     let names = [
-        "setup", "prepare", "prev depth", "game field", "game pyramid", "flow field", "disocclusion", "interpolation", "pyramid",
-        "inpainting", "blend",
+        "setup",
+        "prepare",
+        "prev depth",
+        "game field",
+        "game pyramid",
+        "flow field",
+        "disocclusion",
+        "interpolation",
+        "pyramid",
+        "inpainting",
+        "blend",
     ];
-    let detail: Vec<String> =
-        names.iter().zip(times.passes).filter(|(_, t)| *t > 0.0).map(|(n, t)| format!("{n} {t:.0}")).collect();
+    let detail: Vec<String> = names.iter().zip(times.passes).filter(|(_, t)| *t > 0.0).map(|(n, t)| format!("{n} {t:.0}")).collect();
     let interp: f64 = times.passes.iter().sum();
     println!(
         "      fsr3 quality pipeline total {us:.1} us (budget 3000 us): flow {:.0}, interpolation {interp:.0} ({})",
@@ -1271,7 +1276,8 @@ fn run_battery_blends(
                 t.to_le_bytes(),
                 f.code().to_le_bytes(),
             ]);
-            us += gpu.run(&haqengine_shaders::CUT_FIXUP, &[&counters, cur, dst, prev, &tiles], &fix_push, groups(prev.width, prev.height))?;
+            us +=
+                gpu.run(&haqengine_shaders::CUT_FIXUP, &[&counters, cur, dst, prev, &tiles], &fix_push, groups(prev.width, prev.height))?;
         }
         let c = gpu.read_u32(&counters)?;
         let mut outputs = Vec::with_capacity(times.len());
@@ -1394,13 +1400,34 @@ fn battery_pair(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgb
 }
 
 fn battery_pair_at(gpu: &Gpu, f: PackedFormat, prev: &Image<Rgba8>, cur: &Image<Rgba8>, t: f32) -> Result<BatteryPair, String> {
-    let ((old, new, counts, blend_us, flow, prev_luma, cur_luma), flow_us, mut pass_us) = with_battery_flow(gpu, f, prev, cur, |fp, fc, flows| {
-        let (old, _) = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
-        let (new, counts, blend_us) = run_battery_blend(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
-        Ok((old, new, counts, blend_us, gpu.read_rg32f(&flows.images[0])?, gpu.read_r32f(&fp.levels[0])?, gpu.read_r32f(&fc.levels[0])?))
-    })?;
+    let ((old, new, counts, blend_us, flow, prev_luma, cur_luma), flow_us, mut pass_us) =
+        with_battery_flow(gpu, f, prev, cur, |fp, fc, flows| {
+            let (old, _) = run_warp_packed(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
+            let (new, counts, blend_us) =
+                run_battery_blend(gpu, f, &fp.color, &fc.color, &flows.images[0], &fp.levels[0], &fc.levels[0], t)?;
+            Ok((
+                old,
+                new,
+                counts,
+                blend_us,
+                gpu.read_rg32f(&flows.images[0])?,
+                gpu.read_r32f(&fp.levels[0])?,
+                gpu.read_r32f(&fc.levels[0])?,
+            ))
+        })?;
     pass_us.push(("blend + fixup".to_string(), blend_us));
-    Ok(BatteryPair { old: unpack_image(f, &old), new_rgba: unpack_image(f, &new), new, flow, prev_luma, cur_luma, flow_us, blend_us, counts, pass_us })
+    Ok(BatteryPair {
+        old: unpack_image(f, &old),
+        new_rgba: unpack_image(f, &new),
+        new,
+        flow,
+        prev_luma,
+        cur_luma,
+        flow_us,
+        blend_us,
+        counts,
+        pass_us,
+    })
 }
 
 fn battery_parity_case(gpu: &Gpu, f: PackedFormat, width: u32, height: u32, t: f32) -> Result<CaseResult, String> {
@@ -1420,7 +1447,8 @@ fn battery_counts_parity(gpu: &Gpu, prev: &Image<Rgba8>, cur: &Image<Rgba8>) -> 
     let f = BF;
     let pair = battery_pair(gpu, f, prev, cur)?;
     let (pp, cp) = (packed::to_packed(f, prev), packed::to_packed(f, cur));
-    let (expected, counts) = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, 0.5);
+    let (expected, counts) =
+        haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, 0.5);
     if counts != pair.counts {
         return Err(format!("counts: GPU {:?}, CPU {counts:?}", pair.counts));
     }
@@ -1463,7 +1491,8 @@ fn battery_3x_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
         let m = battery_multi(gpu, f, &pan[0], &pan[1], &THIRDS)?;
         let (pp, cp) = (packed::to_packed(f, &pan[0]), packed::to_packed(f, &pan[1]));
         for (k, (out, counts)) in m.outputs.iter().enumerate() {
-            let (expected, want) = haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &m.flow, &m.prev_luma, &m.cur_luma, THIRDS[k]);
+            let (expected, want) =
+                haqengine_core::blend::battery_blend_packed_reference(f, &pp, &cp, &m.flow, &m.prev_luma, &m.cur_luma, THIRDS[k]);
             if *counts != want {
                 return Err(format!("{w}x{h} output {k}: counts GPU {counts:?}, CPU {want:?}"));
             }
@@ -1768,7 +1797,8 @@ fn battery_rule_parity_case(gpu: &Gpu) -> Result<CaseResult, String> {
     for (frames, t) in [(&bar, 0.5f32), (&bar, 1.0 / 3.0), (&dim_pan, 0.5)] {
         let pair = battery_pair_at(gpu, BF, &frames[0], &frames[1], t)?;
         let (pp, cp) = (packed::to_packed(BF, &frames[0]), packed::to_packed(BF, &frames[1]));
-        let (expected, _) = haqengine_core::blend::battery_blend_packed_reference(BF, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, t);
+        let (expected, _) =
+            haqengine_core::blend::battery_blend_packed_reference(BF, &pp, &cp, &pair.flow, &pair.prev_luma, &pair.cur_luma, t);
         reports.push(packed::compare_packed(BF, &expected, &pair.new, 1.0));
     }
     Ok(CaseResult { report: merge(&reports), gpu_us: 0.0, tolerance: 1.0 })
@@ -1849,7 +1879,10 @@ fn battery_total_case(gpu: &Gpu) -> Result<CaseResult, String> {
     let frames = pan_frames(1280, 800, 12, -8, 1, 251);
     let pair = battery_pair(gpu, BF, &frames[0], &frames[1])?;
     let total = pair.flow_us + pair.blend_us;
-    println!("      battery with the new blend: total {total:.1} us (budget 2500 us): flow {:.0}, blend {:.0}", pair.flow_us, pair.blend_us);
+    println!(
+        "      battery with the new blend: total {total:.1} us (budget 2500 us): flow {:.0}, blend {:.0}",
+        pair.flow_us, pair.blend_us
+    );
     let parts: Vec<String> = pair.pass_us.iter().map(|(n, t)| format!("{n} {t:.0}")).collect();
     println!("      battery passes: {}", parts.join(", "));
     Ok(battery_result(total))
@@ -1869,11 +1902,13 @@ fn luma_half_case(gpu: &Gpu, f: PackedFormat, img: &Image<Rgba8>) -> Result<Case
     let result = (|| {
         gpu.clear_u32(&dst, 0xAB)?;
         let push = push_bytes(&[img.width.to_le_bytes(), img.height.to_le_bytes(), f.code().to_le_bytes()]);
-        let us = gpu.run_fsr3(&haqengine_shaders::OF_LUMA_HALF, &[(0, Bind::Image(&src)), (1, Bind::Image(&dst))], &[], &push, [
-            expected.width.div_ceil(8),
-            expected.height.div_ceil(8),
-            1,
-        ])?;
+        let us = gpu.run_fsr3(
+            &haqengine_shaders::OF_LUMA_HALF,
+            &[(0, Bind::Image(&src)), (1, Bind::Image(&dst))],
+            &[],
+            &push,
+            [expected.width.div_ceil(8), expected.height.div_ceil(8), 1],
+        )?;
         let got = gpu.read_r8(&dst)?;
         let bad = expected.data.iter().zip(&got.data).filter(|(a, b)| a != b).count() as u32;
         let max = expected.data.iter().zip(&got.data).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
@@ -1894,9 +1929,7 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("luma_downsample 1280x800 noise", |g| luma_case(g, &noise(1280, 800, 1))),
         case("luma_downsample 1281x801 gradient", |g| luma_case(g, &gradient(1281, 801))),
         case("luma_downsample 8x8 checker", |g| luma_case(g, &checker(8, 8, 1))),
-        case("blend 1280x800 t=0.5 (noise, gradient)", |g| {
-            blend_case(g, &noise(1280, 800, 2), &gradient(1280, 800), 0.5, 0.5)
-        }),
+        case("blend 1280x800 t=0.5 (noise, gradient)", |g| blend_case(g, &noise(1280, 800, 2), &gradient(1280, 800), 0.5, 0.5)),
         case("blend 1280x800 t=0.25", |g| blend_case(g, &noise(1280, 800, 3), &gradient(1280, 800), 0.25, 0.25)),
     ];
     cases.extend([
@@ -2042,9 +2075,7 @@ pub fn all_cases(self_test_fail: bool) -> Vec<Case> {
         case("battery still counts on a 1 px pan", battery_still_pan_case),
     ]);
     if self_test_fail {
-        cases.push(case("blend self-test (must fail)", |g| {
-            blend_case(g, &noise(64, 64, 4), &gradient(64, 64), 0.5, 0.6)
-        }));
+        cases.push(case("blend self-test (must fail)", |g| blend_case(g, &noise(64, 64, 4), &gradient(64, 64), 0.5, 0.6)));
     }
     cases
 }

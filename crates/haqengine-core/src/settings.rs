@@ -65,9 +65,11 @@ impl Settings {
             Some(other) => (Mode::Battery, Some(format!("unknown HAQENGINE_MODE {other:?}; using battery"))),
         };
         let pacing = !matches!(get("HAQENGINE_PACING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0") | Some("off"));
-        let measure = matches!(get("HAQENGINE_MEASURE").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
+        let measure =
+            matches!(get("HAQENGINE_MEASURE").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
         let measure_note = measure_note(measure, multiplier);
-        let timing = matches!(get("HAQENGINE_TIMING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
+        let timing =
+            matches!(get("HAQENGINE_TIMING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
         Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new(), pacing, measure, measure_note, timing }
     }
 }
@@ -94,7 +96,13 @@ impl Settings {
 impl Settings {
     /// Warnings about the environment, to log once when HaqEngine loads.
     pub fn notes(&self) -> Vec<String> {
-        self.mode_note.iter().chain(self.multiplier_note.iter()).chain(self.measure_note.iter()).chain(self.config_notes.iter()).cloned().collect()
+        self.mode_note
+            .iter()
+            .chain(self.multiplier_note.iter())
+            .chain(self.measure_note.iter())
+            .chain(self.config_notes.iter())
+            .cloned()
+            .collect()
     }
 }
 
@@ -105,7 +113,11 @@ fn measure_note(measure: bool, multiplier: u32) -> Option<String> {
 /// Turns the contents of `/proc/self/comm` into a process name.
 pub fn process_name(comm: &str) -> String {
     let name = comm.trim();
-    if name.is_empty() { "unknown".to_string() } else { name.to_string() }
+    if name.is_empty() {
+        "unknown".to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -124,10 +136,7 @@ mod tests {
 
     #[test]
     fn settings_log_explicit_path() {
-        assert_eq!(
-            Settings::from_lookup(env(&[("HAQENGINE_LOG", "/tmp/x.log")])).log_path,
-            Some(PathBuf::from("/tmp/x.log"))
-        );
+        assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_LOG", "/tmp/x.log")])).log_path, Some(PathBuf::from("/tmp/x.log")));
     }
 
     #[test]
@@ -193,10 +202,8 @@ mod tests {
 
     #[test]
     fn measure_note_covers_a_multiplier_from_the_file() {
-        let file = crate::config::FileConfig {
-            default: crate::config::Profile { multiplier: Some(2), ..Default::default() },
-            games: Vec::new(),
-        };
+        let file =
+            crate::config::FileConfig { default: crate::config::Profile { multiplier: Some(2), ..Default::default() }, games: Vec::new() };
         let s = Settings::from_lookup_and_file(env(&[("HAQENGINE_MEASURE", "1")]), Some(&file), "game");
         assert!(s.notes().iter().any(|n| n.contains("measuring only")), "{:?}", s.notes());
     }

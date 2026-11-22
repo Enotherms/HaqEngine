@@ -386,7 +386,10 @@ mod tests {
         let prev = crate::noise(40, 24, 7);
         let cur = crate::noise(40, 24, 8);
         let out = fi_blend_reference(&prev, &cur, &raw_flow(40, 24, [-4, 2]), &luma8(&prev), &luma8(&cur), true);
-        assert_eq!(out.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>(), cur.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>());
+        assert_eq!(
+            out.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>(),
+            cur.data.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>()
+        );
     }
 
     #[test]

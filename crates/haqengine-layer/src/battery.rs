@@ -58,7 +58,11 @@ pub enum BatteryStep {
 }
 
 pub fn battery_step(has_prev: bool, extent_changed: bool) -> BatteryStep {
-    if has_prev && !extent_changed { BatteryStep::Interpolate } else { BatteryStep::CopyAndPrime }
+    if has_prev && !extent_changed {
+        BatteryStep::Interpolate
+    } else {
+        BatteryStep::CopyAndPrime
+    }
 }
 
 const RAW_OUT: usize = 2;
@@ -72,7 +76,11 @@ const TILES: usize = COUNTERS + 1;
 const IMAGE_COUNT: usize = TILES + 1;
 /// Outputs after the first live past the fixed images: output `k >= 1` is `IMAGE_COUNT + k - 1`.
 fn out_image(k: usize) -> usize {
-    if k == 0 { RAW_OUT } else { IMAGE_COUNT + k - 1 }
+    if k == 0 {
+        RAW_OUT
+    } else {
+        IMAGE_COUNT + k - 1
+    }
 }
 
 /// Generated frames per real frame that Battery prepares output images for at multiplier `m`.
@@ -186,17 +194,12 @@ unsafe fn destroy_image(d: &ash::Device, img: &BatImage) {
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .level_count(1)
-        .layer_count(1)
+    vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1)
 }
 
 unsafe fn write_set(d: &ash::Device, set: vk::DescriptorSet, views: &[vk::ImageView]) {
-    let infos: Vec<[vk::DescriptorImageInfo; 1]> = views
-        .iter()
-        .map(|v| [vk::DescriptorImageInfo::default().image_view(*v).image_layout(vk::ImageLayout::GENERAL)])
-        .collect();
+    let infos: Vec<[vk::DescriptorImageInfo; 1]> =
+        views.iter().map(|v| [vk::DescriptorImageInfo::default().image_view(*v).image_layout(vk::ImageLayout::GENERAL)]).collect();
     let writes: Vec<vk::WriteDescriptorSet> = infos
         .iter()
         .enumerate()
@@ -323,7 +326,11 @@ impl BatteryResources {
         specs.push((vk::Format::R32G32_SFLOAT, 1, 1));
         specs.push((vk::Format::R32_UINT, 2, haqengine_core::MAX_GENERATED as u32));
         let tile = haqengine_core::blend::TILE;
-        specs.push((vk::Format::R32_UINT, extent.width.div_ceil(tile), extent.height.div_ceil(tile) * haqengine_core::MAX_GENERATED as u32));
+        specs.push((
+            vk::Format::R32_UINT,
+            extent.width.div_ceil(tile),
+            extent.height.div_ceil(tile) * haqengine_core::MAX_GENERATED as u32,
+        ));
         for _ in 1..outputs {
             specs.push((vk::Format::R32_UINT, extent.width, extent.height));
         }
@@ -417,7 +424,8 @@ impl BatteryResources {
         let kind = (0..memory.memory_type_count)
             .find(|&i| req.memory_type_bits & (1 << i) != 0 && memory.memory_types[i as usize].property_flags.contains(flags))
             .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
-        self.readback_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)?;
+        self.readback_memory =
+            d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind), None)?;
         d.bind_buffer_memory(self.readback, self.readback_memory, 0)?;
         self.mapped = Mapped(d.map_memory(self.readback_memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u8);
         Ok(())
@@ -539,11 +547,25 @@ impl BatteryResources {
         let levels = level_sizes(w, h);
         let flows = flow_sizes(&levels);
         let fmt = self.format.code();
-        dispatch(d, cmd, &p.luma, self.luma_sets[cur], &push3(w.to_le_bytes(), h.to_le_bytes(), fmt.to_le_bytes()), groups(levels[0].0, levels[0].1));
+        dispatch(
+            d,
+            cmd,
+            &p.luma,
+            self.luma_sets[cur],
+            &push3(w.to_le_bytes(), h.to_le_bytes(), fmt.to_le_bytes()),
+            groups(levels[0].0, levels[0].1),
+        );
         for l in 1..LEVELS {
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
             let (iw, ih) = levels[l - 1];
-            dispatch(d, cmd, &p.reduce, self.reduce_sets[cur][l - 1], &push2(iw.to_le_bytes(), ih.to_le_bytes()), groups(levels[l].0, levels[l].1));
+            dispatch(
+                d,
+                cmd,
+                &p.reduce,
+                self.reduce_sets[cur][l - 1],
+                &push2(iw.to_le_bytes(), ih.to_le_bytes()),
+                groups(levels[l].0, levels[l].1),
+            );
         }
 
         stamp(1);
@@ -575,7 +597,13 @@ impl BatteryResources {
             stamp(2);
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::TRANSFER);
             for image in [COUNTERS, TILES] {
-                d.cmd_clear_color_image(cmd, self.images[image].image, L::GENERAL, &vk::ClearColorValue { uint32: [0; 4] }, &[color_range()]);
+                d.cmd_clear_color_image(
+                    cmd,
+                    self.images[image].image,
+                    L::GENERAL,
+                    &vk::ClearColorValue { uint32: [0; 4] },
+                    &[color_range()],
+                );
             }
             memory_barrier(d, cmd, S::TRANSFER, S::COMPUTE_SHADER);
             let threshold = haqengine_core::frame_change::cut_threshold_pixels(w * h);
@@ -597,7 +625,14 @@ impl BatteryResources {
             stamp(3);
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
             for ((k, &set), t) in self.fixup_sets[cur][..blends].iter().enumerate().zip(haqengine_core::blend_times(m)) {
-                let fix = [w.to_le_bytes(), h.to_le_bytes(), threshold.to_le_bytes(), (k as u32).to_le_bytes(), t.to_le_bytes(), fmt.to_le_bytes()];
+                let fix = [
+                    w.to_le_bytes(),
+                    h.to_le_bytes(),
+                    threshold.to_le_bytes(),
+                    (k as u32).to_le_bytes(),
+                    t.to_le_bytes(),
+                    fmt.to_le_bytes(),
+                ];
                 dispatch(d, cmd, &p.fixup, set, fix.as_flattened(), groups(w, h));
             }
             stamp(4);
@@ -624,9 +659,29 @@ impl BatteryResources {
             }
         }
         for &spare in spares {
-            image_barrier(d, cmd, spare, L::TRANSFER_DST_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_WRITE, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
+            image_barrier(
+                d,
+                cmd,
+                spare,
+                L::TRANSFER_DST_OPTIMAL,
+                L::PRESENT_SRC_KHR,
+                A::TRANSFER_WRITE,
+                A::empty(),
+                S::TRANSFER,
+                S::BOTTOM_OF_PIPE,
+            );
         }
-        image_barrier(d, cmd, game, L::TRANSFER_SRC_OPTIMAL, L::PRESENT_SRC_KHR, A::TRANSFER_READ, A::empty(), S::TRANSFER, S::BOTTOM_OF_PIPE);
+        image_barrier(
+            d,
+            cmd,
+            game,
+            L::TRANSFER_SRC_OPTIMAL,
+            L::PRESENT_SRC_KHR,
+            A::TRANSFER_READ,
+            A::empty(),
+            S::TRANSFER,
+            S::BOTTOM_OF_PIPE,
+        );
         step
     }
 
@@ -635,7 +690,13 @@ impl BatteryResources {
     ///
     /// # Safety
     /// Call after this frame's commands were submitted to `queue` and before `submitted()`.
-    pub unsafe fn dump(&self, device: &DeviceData, pool: vk::CommandPool, queue: vk::Queue, dir: &std::path::Path) -> Result<(), vk::Result> {
+    pub unsafe fn dump(
+        &self,
+        device: &DeviceData,
+        pool: vk::CommandPool,
+        queue: vk::Queue,
+        dir: &std::path::Path,
+    ) -> Result<(), vk::Result> {
         let d = &device.device;
         let memory = device.instance.instance.get_physical_device_memory_properties(device.physical_device);
         let flow0 = FLOW_BASE;
@@ -645,7 +706,8 @@ impl BatteryResources {
             for &(index, name, bpp) in &picks {
                 let img = &self.images[index];
                 let size = img.width as u64 * img.height as u64 * bpp;
-                let buffer = d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST), None)?;
+                let buffer =
+                    d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST), None)?;
                 let req = d.get_buffer_memory_requirements(buffer);
                 let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
                 let Some(kind) = (0..memory.memory_type_count)
@@ -673,8 +735,17 @@ impl BatteryResources {
                     .image_extent(vk::Extent3D { width: img.width, height: img.height, depth: 1 });
                 d.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::GENERAL, buffers[i].0, &[region]);
             }
-            let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
+            let to_host =
+                vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[to_host],
+                &[],
+                &[],
+            );
             d.end_command_buffer(cmd)?;
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let cmds = [cmd];
@@ -691,14 +762,7 @@ impl BatteryResources {
                 d.unmap_memory(mem);
             }
             let f0 = &self.images[flow0];
-            let meta = format!(
-                "{} {} {} {} {}\n",
-                self.extent.width,
-                self.extent.height,
-                self.format.code(),
-                f0.width,
-                f0.height
-            );
+            let meta = format!("{} {} {} {} {}\n", self.extent.width, self.extent.height, self.format.code(), f0.width, f0.height);
             let _ = std::fs::write(dir.join("meta.txt"), meta);
             Ok(())
         })();

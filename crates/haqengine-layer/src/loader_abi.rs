@@ -188,11 +188,8 @@ mod tests {
 
     #[test]
     fn find_instance_link_none_when_absent() {
-        let head = vk::BaseInStructure {
-            s_type: vk::StructureType::APPLICATION_INFO,
-            p_next: ptr::null(),
-            _marker: std::marker::PhantomData,
-        };
+        let head =
+            vk::BaseInStructure { s_type: vk::StructureType::APPLICATION_INFO, p_next: ptr::null(), _marker: std::marker::PhantomData };
         assert_eq!(unsafe { find_instance_link(&head as *const _ as *const c_void) }, None);
         assert_eq!(unsafe { find_instance_link(ptr::null()) }, None);
         assert_eq!(unsafe { find_device_link(ptr::null()) }, None);

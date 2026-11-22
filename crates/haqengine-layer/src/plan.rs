@@ -115,12 +115,7 @@ mod tests {
     }
 
     fn caps(max: u32, usage: vk::ImageUsageFlags) -> vk::SurfaceCapabilitiesKHR {
-        vk::SurfaceCapabilitiesKHR {
-            min_image_count: 2,
-            max_image_count: max,
-            supported_usage_flags: usage,
-            ..Default::default()
-        }
+        vk::SurfaceCapabilitiesKHR { min_image_count: 2, max_image_count: max, supported_usage_flags: usage, ..Default::default() }
     }
 
     fn all_usage() -> vk::ImageUsageFlags {

@@ -12,12 +12,7 @@ static LOADED: Once = Once::new();
 fn log_loaded() {
     LOADED.call_once(|| {
         let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
-        LOG.log(&format!(
-            "loaded: {} pid {} version {}",
-            process_name(&comm),
-            std::process::id(),
-            env!("CARGO_PKG_VERSION")
-        ));
+        LOG.log(&format!("loaded: {} pid {} version {}", process_name(&comm), std::process::id(), env!("CARGO_PKG_VERSION")));
         for note in crate::state::SETTINGS.notes() {
             LOG.log(&format!("warning: {note}"));
         }
@@ -29,9 +24,7 @@ pub unsafe extern "system" fn create_instance(
     allocator: *const vk::AllocationCallbacks,
     out: *mut vk::Instance,
 ) -> vk::Result {
-    guard("vkCreateInstance", vk::Result::ERROR_INITIALIZATION_FAILED, || unsafe {
-        create_instance_inner(create_info, allocator, out)
-    })
+    guard("vkCreateInstance", vk::Result::ERROR_INITIALIZATION_FAILED, || unsafe { create_instance_inner(create_info, allocator, out) })
 }
 
 unsafe fn create_instance_inner(

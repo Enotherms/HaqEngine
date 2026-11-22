@@ -2,8 +2,8 @@
 //! of the pixel's block and its edge neighbours, chosen by a 3×3 window of 8-bit luma.
 
 use crate::flow::Flow;
-use crate::image::{Image, Rgba8};
 use crate::frame_change::{is_cut, ChangeCounts};
+use crate::image::{Image, Rgba8};
 use crate::packed::PackedFormat;
 
 /// Above this weighted 3×3 sum of 8-bit luma differences the best candidate's samples show
@@ -242,7 +242,15 @@ pub fn battery_blend_reference(
             let b = crate::flow::bilinear(cur, px + (1.0 - t) * v[0], py + (1.0 - t) * v[1]);
             let mut c = [0u8, 0, 0, 255];
             for i in 0..3 {
-                let value = if disagree { if t >= 0.5 { b[i] } else { a[i] } } else { a[i] * (1.0 - t) + b[i] * t };
+                let value = if disagree {
+                    if t >= 0.5 {
+                        b[i]
+                    } else {
+                        a[i]
+                    }
+                } else {
+                    a[i] * (1.0 - t) + b[i] * t
+                };
                 c[i] = (value + 0.5).floor().clamp(0.0, 255.0) as u8;
             }
             out.set(x, y, c);
@@ -321,7 +329,15 @@ pub fn battery_blend_packed_with_tiles(
             let b = bilinear_packed(f, cur, px + (1.0 - t) * v[0], py + (1.0 - t) * v[1]);
             let mut c = [0.0f32, 0.0, 0.0, 1.0];
             for i in 0..3 {
-                c[i] = if disagree { if t >= 0.5 { b[i] } else { a[i] } } else { a[i] * (1.0 - t) + b[i] * t };
+                c[i] = if disagree {
+                    if t >= 0.5 {
+                        b[i]
+                    } else {
+                        a[i]
+                    }
+                } else {
+                    a[i] * (1.0 - t) + b[i] * t
+                };
             }
             out.set(x, y, pack(f, c));
         }
@@ -524,7 +540,10 @@ mod tests {
         let mut checked = 0;
         let l8 = |img: &Image<f32>| {
             let img = img.clone();
-            move |x: i64, y: i64| (img.get(x.clamp(0, img.width as i64 - 1) as u32, y.clamp(0, img.height as i64 - 1) as u32).clamp(0.0, 1.0) * 255.0 + 0.5).floor() as i32
+            move |x: i64, y: i64| {
+                (img.get(x.clamp(0, img.width as i64 - 1) as u32, y.clamp(0, img.height as i64 - 1) as u32).clamp(0.0, 1.0) * 255.0 + 0.5)
+                    .floor() as i32
+            }
         };
         let vector_at = |bx: u32, by: u32| {
             let v: [f32; 2] = flow.get(bx, by);
@@ -534,7 +553,8 @@ mod tests {
         for y in 4..44 {
             for x in 4..60 {
                 differs += (choose_vector(x, y, (flow.width, flow.height), vector_at, l8(&lp), l8(&lc), t).1
-                    != choose_vector(x & !1, y & !1, (flow.width, flow.height), vector_at, l8(&lp), l8(&lc), t).1) as u32;
+                    != choose_vector(x & !1, y & !1, (flow.width, flow.height), vector_at, l8(&lp), l8(&lc), t).1)
+                    as u32;
                 if fallback_weight(&tiles, 64, 48, x, y) > 0.0 {
                     continue;
                 }
@@ -588,7 +608,8 @@ mod tests {
             let mut per_pixel = 0;
             for y in 0..64 {
                 for x in 0..96 {
-                    per_pixel += (choose_vector(x, y, (flow.width, flow.height), vector_at, luma8(&lp), luma8(&lc), t).0 > DISAGREE8) as u32;
+                    per_pixel +=
+                        (choose_vector(x, y, (flow.width, flow.height), vector_at, luma8(&lp), luma8(&lc), t).0 > DISAGREE8) as u32;
                 }
             }
             assert!(per_pixel > 0, "the scene must have no-match pixels");
@@ -695,7 +716,8 @@ mod tests {
     fn battery_blend_uniform_pan_matches_shift() {
         let prev = noise(64, 48, 3);
         let cur = shift(&prev, 8, -4);
-        let (out, _) = battery_blend_reference(&prev, &cur, &uniform(64, 48, [4.0, -2.0]), &luma_downsample(&prev), &luma_downsample(&cur), 0.5);
+        let (out, _) =
+            battery_blend_reference(&prev, &cur, &uniform(64, 48, [4.0, -2.0]), &luma_downsample(&prev), &luma_downsample(&cur), 0.5);
         let want = shift(&prev, 4, -2);
         for y in 12..36 {
             for x in 12..52 {
@@ -716,7 +738,8 @@ mod tests {
                 }
             }
         }
-        let (out, _) = battery_blend_reference(&prev, &cur, &uniform(64, 48, [4.0, 0.0]), &luma_downsample(&prev), &luma_downsample(&cur), 0.5);
+        let (out, _) =
+            battery_blend_reference(&prev, &cur, &uniform(64, 48, [4.0, 0.0]), &luma_downsample(&prev), &luma_downsample(&cur), 0.5);
         for y in 18..30 {
             for x in 26..38 {
                 assert_eq!(out.get(x, y)[..3], bar.get(x - 24, y - 16)[..3], "bar ({x}, {y})");

@@ -177,12 +177,8 @@ pub fn of_schedule(width: u32, height: u32, frame_index: u32, input: OfInput) ->
             base,
         )),
         OfInput::PackedHalf { format, full_width, full_height } => {
-            let mut d = plain(
-                PASS_LUMA_HALF,
-                [width.div_ceil(8), height.div_ceil(8), 1],
-                vec![(0, OfRes::Raw), (1, OfRes::Input(cur, 0))],
-                base,
-            );
+            let mut d =
+                plain(PASS_LUMA_HALF, [width.div_ceil(8), height.div_ceil(8), 1], vec![(0, OfRes::Raw), (1, OfRes::Input(cur, 0))], base);
             d.push = push_words([full_width, full_height, format]);
             out.push(d);
         }
@@ -317,24 +313,12 @@ mod tests {
         let odd = of_schedule(1280, 800, 1, OfInput::Color);
         assert_eq!(even[0].bind, vec![(0, OfRes::Color), (1, OfRes::Input(0, 0))]);
         assert_eq!(odd[0].bind, vec![(0, OfRes::Color), (1, OfRes::Input(1, 0))]);
-        assert_eq!(
-            even[4].bind,
-            vec![(0, OfRes::Input(0, 6)), (1, OfRes::Input(1, 6)), (2, OfRes::Flow(0, 6)), (3, OfRes::ScdOutput)]
-        );
-        assert_eq!(
-            odd[4].bind,
-            vec![(0, OfRes::Input(1, 6)), (1, OfRes::Input(0, 6)), (2, OfRes::Flow(1, 6)), (3, OfRes::ScdOutput)]
-        );
+        assert_eq!(even[4].bind, vec![(0, OfRes::Input(0, 6)), (1, OfRes::Input(1, 6)), (2, OfRes::Flow(0, 6)), (3, OfRes::ScdOutput)]);
+        assert_eq!(odd[4].bind, vec![(0, OfRes::Input(1, 6)), (1, OfRes::Input(0, 6)), (2, OfRes::Flow(1, 6)), (3, OfRes::ScdOutput)]);
         assert_eq!(even[5].bind, vec![(0, OfRes::Flow(0, 6)), (1, OfRes::Flow(1, 6))]);
         assert_eq!(
             even[6].bind,
-            vec![
-                (0, OfRes::Input(0, 6)),
-                (1, OfRes::Input(1, 6)),
-                (2, OfRes::Flow(1, 6)),
-                (3, OfRes::Flow(1, 5)),
-                (4, OfRes::ScdOutput)
-            ]
+            vec![(0, OfRes::Input(0, 6)), (1, OfRes::Input(1, 6)), (2, OfRes::Flow(1, 6)), (3, OfRes::Flow(1, 5)), (4, OfRes::ScdOutput)]
         );
         assert_eq!(even[7].bind[2], (2, OfRes::Flow(1, 5)));
         let last = even.last().unwrap();

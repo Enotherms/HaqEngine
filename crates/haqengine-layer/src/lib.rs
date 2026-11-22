@@ -27,12 +27,8 @@ use std::ffi::{c_char, CStr};
 const LAYER_INTERFACE_VERSION: u32 = 2;
 
 #[no_mangle]
-pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
-    p_version: *mut NegotiateLayerInterface,
-) -> vk::Result {
-    guard::guard("vkNegotiateLoaderLayerInterfaceVersion", vk::Result::ERROR_INITIALIZATION_FAILED, || unsafe {
-        negotiate(p_version)
-    })
+pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(p_version: *mut NegotiateLayerInterface) -> vk::Result {
+    guard::guard("vkNegotiateLoaderLayerInterfaceVersion", vk::Result::ERROR_INITIALIZATION_FAILED, || unsafe { negotiate(p_version) })
 }
 
 unsafe fn negotiate(p_version: *mut NegotiateLayerInterface) -> vk::Result {
@@ -59,18 +55,13 @@ fn instance_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCreateInstance" => erase(instance::create_instance as *const ()),
         b"vkDestroyInstance" => erase(instance::destroy_instance as *const ()),
         b"vkCreateDevice" => erase(device::create_device as *const ()),
-        b"vkEnumerateDeviceExtensionProperties" => {
-            erase(extensions::enumerate_device_extension_properties as *const ())
-        }
+        b"vkEnumerateDeviceExtensionProperties" => erase(extensions::enumerate_device_extension_properties as *const ()),
         _ => None,
     }
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn vkGetInstanceProcAddr(
-    instance: vk::Instance,
-    p_name: *const c_char,
-) -> vk::PFN_vkVoidFunction {
+pub unsafe extern "system" fn vkGetInstanceProcAddr(instance: vk::Instance, p_name: *const c_char) -> vk::PFN_vkVoidFunction {
     guard::guard("vkGetInstanceProcAddr", None, || unsafe {
         if p_name.is_null() {
             return None;

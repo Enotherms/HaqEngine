@@ -9,50 +9,31 @@ pub struct Shader {
 }
 
 /// Half-resolution luma: bindings 0 = `rgba8` input, 1 = `r32f` output; push `{ in_w, in_h }`.
-pub const LUMA_DOWNSAMPLE: Shader = Shader {
-    name: "luma_downsample",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/luma_downsample.spv")),
-    local_size: [8, 8],
-};
+pub const LUMA_DOWNSAMPLE: Shader =
+    Shader { name: "luma_downsample", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/luma_downsample.spv")), local_size: [8, 8] };
 
 /// `mix(a, b, t)`: bindings 0 = `rgba8` a, 1 = `rgba8` b, 2 = `rgba8` output; push `{ w, h, t }`.
-pub const BLEND: Shader = Shader {
-    name: "blend",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/blend.spv")),
-    local_size: [8, 8],
-};
+pub const BLEND: Shader = Shader { name: "blend", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/blend.spv")), local_size: [8, 8] };
 
 /// Halves an `r32f` luma level: bindings 0 = input, 1 = output; push `{ in_w, in_h }`.
-pub const LUMA_REDUCE: Shader = Shader {
-    name: "luma_reduce",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/luma_reduce.spv")),
-    local_size: [8, 8],
-};
+pub const LUMA_REDUCE: Shader =
+    Shader { name: "luma_reduce", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/luma_reduce.spv")), local_size: [8, 8] };
 
 /// One motion vector per 8×8 block: bindings 0 = prev `r32f`, 1 = cur `r32f`, 2 = coarse `rg32f`,
 /// 3 = output `rg32f`; push `{ w, h, coarse_w, coarse_h, radius: i32, use_coarse }`. One workgroup
 /// (8×8 threads) per block: dispatch `blocks_w × blocks_h` groups. `radius` is at most 4.
-pub const BLOCK_MATCH: Shader = Shader {
-    name: "block_match",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/block_match.spv")),
-    local_size: [8, 8],
-};
+pub const BLOCK_MATCH: Shader =
+    Shader { name: "block_match", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/block_match.spv")), local_size: [8, 8] };
 
 /// The frame at time `t`: bindings 0 = prev `rgba8`, 1 = cur `rgba8`, 2 = level-0 flow `rg32f`,
 /// 3 = output `rgba8`; push `{ w, h, flow_w, flow_h, t: f32 }`.
-pub const WARP_BLEND: Shader = Shader {
-    name: "warp_blend",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/warp_blend.spv")),
-    local_size: [8, 8],
-};
+pub const WARP_BLEND: Shader =
+    Shader { name: "warp_blend", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/warp_blend.spv")), local_size: [8, 8] };
 
 /// 3×3 component-wise median of a flow field: bindings 0 = input `rg32f`, 1 = output `rg32f`;
 /// push `{ w, h }`.
-pub const FLOW_MEDIAN: Shader = Shader {
-    name: "flow_median",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/flow_median.spv")),
-    local_size: [8, 8],
-};
+pub const FLOW_MEDIAN: Shader =
+    Shader { name: "flow_median", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/flow_median.spv")), local_size: [8, 8] };
 
 /// Half-resolution luma from packed pixels: bindings 0 = `r32ui` input, 1 = `r32f` output;
 /// push `{ in_w, in_h, format }` with the `PackedFormat` code.
@@ -64,11 +45,8 @@ pub const LUMA_DOWNSAMPLE_PACKED: Shader = Shader {
 
 /// The frame at time `t` on packed pixels: bindings 0 = prev `r32ui`, 1 = cur `r32ui`, 2 = level-0
 /// flow `rg32f`, 3 = output `r32ui`; push `{ w, h, flow_w, flow_h, t: f32, format }`.
-pub const WARP_BLEND_PACKED: Shader = Shader {
-    name: "warp_blend_packed",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/warp_blend_packed.spv")),
-    local_size: [8, 8],
-};
+pub const WARP_BLEND_PACKED: Shader =
+    Shader { name: "warp_blend_packed", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/warp_blend_packed.spv")), local_size: [8, 8] };
 
 /// How a descriptor binding of an FSR 3 pass is declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,16 +147,8 @@ pub const OF_LUMA_HALF: Fsr3Pass = Fsr3Pass {
 };
 
 /// The optical flow passes; indices are the schedule's `PASS_*` constants.
-pub const OF_PASSES: [&Fsr3Pass; 8] = [
-    &OF_PREPARE_LUMA,
-    &OF_LUMINANCE_PYRAMID,
-    &OF_SCD_HISTOGRAM,
-    &OF_SCD_DIVERGENCE,
-    &OF_SEARCH,
-    &OF_FILTER,
-    &OF_SCALE,
-    &OF_LUMA_HALF,
-];
+pub const OF_PASSES: [&Fsr3Pass; 8] =
+    [&OF_PREPARE_LUMA, &OF_LUMINANCE_PYRAMID, &OF_SCD_HISTOGRAM, &OF_SCD_DIVERGENCE, &OF_SEARCH, &OF_FILTER, &OF_SCALE, &OF_LUMA_HALF];
 
 /// Clears the vector fields and masks: 0 = scene change, 1..=4 = game and flow fields, 5 = disocclusion, 6 = counters, 7 = constants.
 pub const FI_SETUP: Fsr3Pass = Fsr3Pass {
@@ -221,7 +191,27 @@ pub const FI_GAME_VECTOR_FIELD_INPAINTING_PYRAMID: Fsr3Pass = Fsr3Pass {
     name: "fi_game_vector_field_inpainting_pyramid",
     spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_game_vector_field_inpainting_pyramid.spv")),
     local_size: [256, 1, 1],
-    bindings: &[(0, Srv), (1, Srv), (2, Buf), (3, Uav), (4, Uav), (5, Uav), (6, Uav), (7, Uav), (8, Uav), (9, Uav), (10, Uav), (11, Uav), (12, Uav), (13, Uav), (14, Uav), (15, Uav), (16, Cb), (17, Cb), (1000, Smp)],
+    bindings: &[
+        (0, Srv),
+        (1, Srv),
+        (2, Buf),
+        (3, Uav),
+        (4, Uav),
+        (5, Uav),
+        (6, Uav),
+        (7, Uav),
+        (8, Uav),
+        (9, Uav),
+        (10, Uav),
+        (11, Uav),
+        (12, Uav),
+        (13, Uav),
+        (14, Uav),
+        (15, Uav),
+        (16, Cb),
+        (17, Cb),
+        (1000, Smp),
+    ],
     push_size: 0,
 };
 
@@ -257,7 +247,26 @@ pub const FI_INPAINTING_PYRAMID: Fsr3Pass = Fsr3Pass {
     name: "fi_inpainting_pyramid",
     spirv: include_bytes!(concat!(env!("OUT_DIR"), "/fi_inpainting_pyramid.spv")),
     local_size: [256, 1, 1],
-    bindings: &[(0, Srv), (1, Buf), (2, Uav), (3, Uav), (4, Uav), (5, Uav), (6, Uav), (7, Uav), (8, Uav), (9, Uav), (10, Uav), (11, Uav), (12, Uav), (13, Uav), (14, Uav), (15, Cb), (16, Cb), (1000, Smp)],
+    bindings: &[
+        (0, Srv),
+        (1, Buf),
+        (2, Uav),
+        (3, Uav),
+        (4, Uav),
+        (5, Uav),
+        (6, Uav),
+        (7, Uav),
+        (8, Uav),
+        (9, Uav),
+        (10, Uav),
+        (11, Uav),
+        (12, Uav),
+        (13, Uav),
+        (14, Uav),
+        (15, Cb),
+        (16, Cb),
+        (1000, Smp),
+    ],
     push_size: 0,
 };
 
@@ -320,11 +329,8 @@ pub const BATTERY_BLEND_PACKED: Shader = Shader {
 /// Shows the current frame on a scene cut: bindings 0 = change counters `r32ui`, 1 = current
 /// frame `r32ui`, 2 = output `r32ui`; push `{ w, h, cut_threshold, row }` (pixels; more
 /// disagreeing pixels than that in counter row `row` is a cut).
-pub const CUT_FIXUP: Shader = Shader {
-    name: "cut_fixup",
-    spirv: include_bytes!(concat!(env!("OUT_DIR"), "/cut_fixup.spv")),
-    local_size: [8, 8],
-};
+pub const CUT_FIXUP: Shader =
+    Shader { name: "cut_fixup", spirv: include_bytes!(concat!(env!("OUT_DIR"), "/cut_fixup.spv")), local_size: [8, 8] };
 
 /// Every shader HaqEngine ships.
 pub fn all() -> &'static [Shader] {
@@ -500,7 +506,19 @@ mod tests {
     #[test]
     fn fsr3_pass_order() {
         let names: Vec<&str> = OF_PASSES.iter().map(|p| p.name).collect();
-        assert_eq!(names, ["of_prepare_luma", "of_luminance_pyramid", "of_scd_histogram", "of_scd_divergence", "of_search", "of_filter", "of_scale", "of_luma_half"]);
+        assert_eq!(
+            names,
+            [
+                "of_prepare_luma",
+                "of_luminance_pyramid",
+                "of_scd_histogram",
+                "of_scd_divergence",
+                "of_search",
+                "of_filter",
+                "of_scale",
+                "of_luma_half"
+            ]
+        );
     }
 
     #[test]
@@ -519,6 +537,20 @@ mod tests {
     #[test]
     fn all_lists_every_shader() {
         let names: Vec<&str> = all().iter().map(|s| s.name).collect();
-        assert_eq!(names, ["luma_downsample", "blend", "luma_reduce", "block_match", "warp_blend", "flow_median", "luma_downsample_packed", "warp_blend_packed", "battery_blend_packed", "cut_fixup"]);
+        assert_eq!(
+            names,
+            [
+                "luma_downsample",
+                "blend",
+                "luma_reduce",
+                "block_match",
+                "warp_blend",
+                "flow_median",
+                "luma_downsample_packed",
+                "warp_blend_packed",
+                "battery_blend_packed",
+                "cut_fixup"
+            ]
+        );
     }
 }

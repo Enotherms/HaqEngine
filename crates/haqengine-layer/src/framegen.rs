@@ -1,15 +1,15 @@
 //! Per-swapchain resources for generated frames. Created once per swapchain, never per frame.
 
 use crate::battery::BatteryResources;
-use crate::pipelines::QualityPipelines;
-use crate::quality::QualityResources;
-use haqengine_core::frame_change::{is_cut, ChangeCounts, StillBuckets, StillDetector};
 use crate::pipelines::Pipelines;
+use crate::pipelines::QualityPipelines;
+use crate::present_watch::PresentWatch;
+use crate::quality::QualityResources;
 use crate::queue::{queue_can_transfer, QUEUES};
 use crate::state::{DeviceData, LOG};
 use ash::vk;
 use ash::vk::Handle;
-use crate::present_watch::PresentWatch;
+use haqengine_core::frame_change::{is_cut, ChangeCounts, StillBuckets, StillDetector};
 use haqengine_core::pacing::pace_target;
 use haqengine_core::{should_log, FrameStats, Mode, PackedFormat, MAX_GENERATED};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,8 +221,7 @@ impl FrameGen {
         } else {
             vk::QueryPool::null()
         };
-        let timestamp_period_ns =
-            device.instance.instance.get_physical_device_properties(device.physical_device).limits.timestamp_period;
+        let timestamp_period_ns = device.instance.instance.get_physical_device_properties(device.physical_device).limits.timestamp_period;
         let mut ready = Ready {
             family,
             pool,
@@ -339,7 +338,11 @@ impl FrameGen {
     fn generated_now(&self, st: &GenState) -> usize {
         let quality = st.mode == Mode::Quality && !st.quality_failed;
         let battery = st.mode != Mode::Copy && self.battery_format.is_some() && !st.battery_failed && !quality;
-        if battery { crate::battery::outputs_for_multiplier(st.live_multiplier).min(self.max_generated()) } else { 1 }
+        if battery {
+            crate::battery::outputs_for_multiplier(st.live_multiplier).min(self.max_generated())
+        } else {
+            1
+        }
     }
 
     /// Applies a live config change to this swapchain: the multiplier at once (within what the
@@ -388,7 +391,14 @@ impl FrameGen {
     /// Whether this present's frames are tagged and watched (and paced, unless `HAQENGINE_PACING`
     /// is off): the device has present waits, the game does not tag its own presents, and the
     /// watch thread runs (started here on first use).
-    unsafe fn pacing_ready(&self, st: &mut GenState, id: u64, device: &DeviceData, swapchain: vk::SwapchainKHR, pi: &vk::PresentInfoKHR) -> bool {
+    unsafe fn pacing_ready(
+        &self,
+        st: &mut GenState,
+        id: u64,
+        device: &DeviceData,
+        swapchain: vk::SwapchainKHR,
+        pi: &vk::PresentInfoKHR,
+    ) -> bool {
         let Some(wait) = device.wait_for_present else { return false };
         if st.watch_off {
             return false;
@@ -434,14 +444,7 @@ impl FrameGen {
     ///
     /// # Safety
     /// `pi` must be a valid present for `queue`, and `device` the live device owning the swapchain.
-    pub unsafe fn present(
-        &self,
-        id: u64,
-        device: &DeviceData,
-        queue: vk::Queue,
-        pi: &vk::PresentInfoKHR,
-        start: Instant,
-    ) -> vk::Result {
+    pub unsafe fn present(&self, id: u64, device: &DeviceData, queue: vk::Queue, pi: &vk::PresentInfoKHR, start: Instant) -> vk::Result {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let next_present = device.swapchain.queue_present_khr;
         let pass = |st: &mut GenState, skipped: bool| {
@@ -868,10 +871,7 @@ impl FrameGen {
 
     /// Records copying the game's image into the spare image, leaving both ready to present.
     unsafe fn record_copy_body(&self, d: &ash::Device, cmd: vk::CommandBuffer, src: vk::Image, dst: vk::Image) {
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
         let barrier = |image, old, new, src_access, dst_access| {
             vk::ImageMemoryBarrier::default()
                 .image(image)
@@ -884,21 +884,62 @@ impl FrameGen {
                 .subresource_range(range)
         };
         let to_copy = [
-            barrier(src, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ),
-            barrier(dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
+            barrier(
+                src,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_READ,
+            ),
+            barrier(
+                dst,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
         ];
-        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_copy);
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_copy,
+        );
         let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
-        let region = vk::ImageCopy::default()
-            .src_subresource(layers)
-            .dst_subresource(layers)
-            .extent(vk::Extent3D { width: self.extent.width, height: self.extent.height, depth: 1 });
+        let region = vk::ImageCopy::default().src_subresource(layers).dst_subresource(layers).extent(vk::Extent3D {
+            width: self.extent.width,
+            height: self.extent.height,
+            depth: 1,
+        });
         d.cmd_copy_image(cmd, src, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
         let to_present = [
-            barrier(src, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::empty()),
-            barrier(dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty()),
+            barrier(
+                src,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::empty(),
+            ),
+            barrier(
+                dst,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            ),
         ];
-        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &to_present);
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_present,
+        );
     }
 
     /// Error path after spare images were acquired: present each as-is (waiting on its acquire
@@ -1018,11 +1059,7 @@ fn record(st: &mut GenState, id: u64, start: Instant, generated: u64, skipped: b
             } else {
                 quality
             };
-            let gpu = s
-                .gpu_cost
-                .summary()
-                .map(|g| format!(", gpu {:.2} ms p99 {:.2}", g.mean_ms, g.p99_ms))
-                .unwrap_or_default();
+            let gpu = s.gpu_cost.summary().map(|g| format!(", gpu {:.2} ms p99 {:.2}", g.mean_ms, g.p99_ms)).unwrap_or_default();
             let shown = watch
                 .as_ref()
                 .and_then(|w| w.take_shown())
@@ -1101,7 +1138,11 @@ pub fn timing_queries(timing: bool, valid_bits: u32, slots: usize) -> u32 {
 
 /// Frames shown per second in a log window with `real` real and `generated` generated presents.
 pub fn out_fps(real_fps: f32, real: u64, generated: u64) -> f32 {
-    if real == 0 { real_fps } else { real_fps * (real + generated) as f32 / real as f32 }
+    if real == 0 {
+        real_fps
+    } else {
+        real_fps * (real + generated) as f32 / real as f32
+    }
 }
 
 /// The log line's change fields.
@@ -1117,7 +1158,11 @@ pub fn effective_multiplier(live: u32, created: u32) -> u32 {
 /// Frames per real frame the engine `mode` shows at multiplier `m`: Quality and copy mode make
 /// one generated frame.
 pub fn shown_multiplier(mode: Mode, m: u32) -> u32 {
-    if mode == Mode::Battery { m } else { m.min(2) }
+    if mode == Mode::Battery {
+        m
+    } else {
+        m.min(2)
+    }
 }
 
 /// Which resources a switch from `from` to `to` frees: `(battery, quality)`. Copy mode keeps
@@ -1171,7 +1216,11 @@ pub fn combine_present_results(copy: vk::Result, real: vk::Result) -> vk::Result
             _ => 0,
         }
     }
-    if severity(copy) > severity(real) { copy } else { real }
+    if severity(copy) > severity(real) {
+        copy
+    } else {
+        real
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1334,12 +1383,7 @@ mod tests {
     fn present_shape_requires_single_swapchain() {
         let sc = [vk::SwapchainKHR::null(); 2];
         let idx = [0u32; 2];
-        let one = vk::PresentInfoKHR {
-            swapchain_count: 1,
-            p_swapchains: sc.as_ptr(),
-            p_image_indices: idx.as_ptr(),
-            ..Default::default()
-        };
+        let one = vk::PresentInfoKHR { swapchain_count: 1, p_swapchains: sc.as_ptr(), p_image_indices: idx.as_ptr(), ..Default::default() };
         assert!(present_shape_ok(&one));
         let two = vk::PresentInfoKHR { swapchain_count: 2, ..one };
         assert!(!present_shape_ok(&two));

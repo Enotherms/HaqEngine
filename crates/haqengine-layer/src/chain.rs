@@ -167,7 +167,11 @@ mod tests {
         let (before_first, before_target) = (bytes(&first), bytes(&target));
         let mut copy = ChainCopy::new();
         let PrefixCopy::Copied { head, target: t } = (unsafe {
-            copy.copy_prefix(&first as *const _ as *const c_void, vk::StructureType::SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT, swapchain_ext_size)
+            copy.copy_prefix(
+                &first as *const _ as *const c_void,
+                vk::StructureType::SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT,
+                swapchain_ext_size,
+            )
         }) else {
             panic!("expected a copy");
         };

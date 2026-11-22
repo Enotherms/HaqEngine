@@ -530,7 +530,8 @@ mod tests {
         let prev = noise(128, 96, 2);
         let cur = shift(&prev, 8, 0);
         let flow = Image::new(8, 6, [4.0f32, 0.0]);
-        let (new, old) = (warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.5), old_warp(&prev, &cur, &flow, 0.5));
+        let (new, old) =
+            (warp_blend(&prev, &cur, &luma_downsample(&prev), &luma_downsample(&cur), &flow, 0.5), old_warp(&prev, &cur, &flow, 0.5));
         for y in 0..96 {
             for x in 16..112 {
                 assert_eq!(new.get(x, y), old.get(x, y), "({x},{y})");

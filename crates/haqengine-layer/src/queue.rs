@@ -33,11 +33,7 @@ pub unsafe extern "system" fn get_device_queue(device: vk::Device, family: u32, 
     })
 }
 
-pub unsafe extern "system" fn get_device_queue2(
-    device: vk::Device,
-    info: *const vk::DeviceQueueInfo2,
-    out: *mut vk::Queue,
-) {
+pub unsafe extern "system" fn get_device_queue2(device: vk::Device, info: *const vk::DeviceQueueInfo2, out: *mut vk::Queue) {
     guard("vkGetDeviceQueue2", (), || unsafe {
         if let Some(data) = DEVICES.get(dispatch_key(device)) {
             (data.device.fp_v1_1().get_device_queue2)(device, info, out);
@@ -57,9 +53,10 @@ pub fn forget_device(device_key: usize) {
 pub fn queue_can_transfer(queue: vk::Queue) -> bool {
     let Some(info) = QUEUES.get(queue.as_raw() as usize) else { return false };
     let Some(device) = DEVICES.get(info.device_key) else { return false };
-    device.queue_families.get(info.family as usize).is_some_and(|f| {
-        f.queue_flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
-    })
+    device
+        .queue_families
+        .get(info.family as usize)
+        .is_some_and(|f| f.queue_flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER))
 }
 
 #[cfg(test)]

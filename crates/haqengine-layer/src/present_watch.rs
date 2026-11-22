@@ -45,15 +45,19 @@ impl PresentWatch {
     /// Starts watching `swapchain`, or `None` when the thread cannot start.
     pub fn start(device: vk::Device, swapchain: vk::SwapchainKHR, wait: vk::PFN_vkWaitForPresentKHR) -> Option<PresentWatch> {
         let shared = Arc::new(Shared {
-            state: Mutex::new(Watched { queue: ShownQueue::default(), shown_id: 0, stop: false, failed: None, shown_us: FrameStats::new() }),
+            state: Mutex::new(Watched {
+                queue: ShownQueue::default(),
+                shown_id: 0,
+                stop: false,
+                failed: None,
+                shown_us: FrameStats::new(),
+            }),
             queued: Condvar::new(),
             shown: Condvar::new(),
         });
         let theirs = Arc::clone(&shared);
-        let thread = std::thread::Builder::new()
-            .name("haqengine-pacing".into())
-            .spawn(move || watch(&theirs, device, swapchain, wait))
-            .ok()?;
+        let thread =
+            std::thread::Builder::new().name("haqengine-pacing".into()).spawn(move || watch(&theirs, device, swapchain, wait)).ok()?;
         Some(PresentWatch { shared, thread: Some(thread) })
     }
 

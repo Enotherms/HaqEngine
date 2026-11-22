@@ -72,9 +72,7 @@ pub fn compare_rg32f(expected: &Image<[f32; 2]>, actual: &Image<[f32; 2]>, tol: 
 
 /// Compares RGBA8 images channel by channel.
 pub fn compare_rgba8(expected: &Image<Rgba8>, actual: &Image<Rgba8>, tol_per_channel: u8) -> CompareReport {
-    compare(expected, actual, tol_per_channel as f32, |e, a| {
-        (0..4).map(|c| (e[c] as f32 - a[c] as f32).abs()).fold(0.0, f32::max)
-    })
+    compare(expected, actual, tol_per_channel as f32, |e, a| (0..4).map(|c| (e[c] as f32 - a[c] as f32).abs()).fold(0.0, f32::max))
 }
 
 pub(crate) fn compare<T: Copy>(expected: &Image<T>, actual: &Image<T>, tol: f32, diff: impl Fn(T, T) -> f32) -> CompareReport {

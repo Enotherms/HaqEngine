@@ -37,7 +37,11 @@ pub fn is_fatal(r: &Result<CaseResult, String>) -> bool {
 }
 
 pub fn exit_code(results: &[Outcome], validation_errors: u32) -> i32 {
-    if validation_errors == 0 && results.iter().all(|o| *o == Outcome::Pass) { 0 } else { 1 }
+    if validation_errors == 0 && results.iter().all(|o| *o == Outcome::Pass) {
+        0
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]

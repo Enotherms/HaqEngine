@@ -79,15 +79,24 @@ pub enum QualityStep {
 /// A copy when there is no previous frame; otherwise interpolation, also during FSR 3's warm-up,
 /// when the flow is zero and the blend still produces a valid frame.
 pub fn quality_step(has_prev: bool, _frames_since_reset: u32) -> QualityStep {
-    if has_prev { QualityStep::Interpolate } else { QualityStep::CopyAndPrime }
+    if has_prev {
+        QualityStep::Interpolate
+    } else {
+        QualityStep::CopyAndPrime
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const GOOD: QualityCaps =
-        QualityCaps { api_version: (1 << 22) | (3 << 12), subgroup_ops_ok: true, subgroup_size: 64, extended_formats: true, robust_images: true };
+    const GOOD: QualityCaps = QualityCaps {
+        api_version: (1 << 22) | (3 << 12),
+        subgroup_ops_ok: true,
+        subgroup_size: 64,
+        extended_formats: true,
+        robust_images: true,
+    };
 
     #[test]
     fn quality_gate_reports_first_failure() {

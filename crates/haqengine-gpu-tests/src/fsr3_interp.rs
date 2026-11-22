@@ -39,9 +39,7 @@ pub struct Fsr3Interp {
 type ImageSpec = (FiRes, vk::Format, (u32, u32), u32, u32);
 
 fn owned_images(s: &FiSizes) -> Vec<ImageSpec> {
-    vec![
-        (FiRes::Output, vk::Format::R8G8B8A8_UNORM, s.display, 1, 0),
-    ]
+    vec![(FiRes::Output, vk::Format::R8G8B8A8_UNORM, s.display, 1, 0)]
 }
 
 impl Fsr3Interp {

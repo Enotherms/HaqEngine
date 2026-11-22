@@ -61,10 +61,9 @@ unsafe fn create_pass(d: &ash::Device, shader: &Shader, bindings: u32, push_size
     };
     let ranges = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(push_size)];
     let set_layouts = [set_layout];
-    let layout = match d.create_pipeline_layout(
-        &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts).push_constant_ranges(&ranges),
-        None,
-    ) {
+    let layout = match d
+        .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts).push_constant_ranges(&ranges), None)
+    {
         Ok(l) => l,
         Err(e) => {
             d.destroy_descriptor_set_layout(set_layout, None);
@@ -72,10 +71,7 @@ unsafe fn create_pass(d: &ash::Device, shader: &Shader, bindings: u32, push_size
             return Err(e);
         }
     };
-    let stage = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(module)
-        .name(c"main");
+    let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
     let created = d.create_compute_pipelines(
         vk::PipelineCache::null(),
         &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],

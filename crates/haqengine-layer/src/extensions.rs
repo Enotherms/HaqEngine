@@ -15,10 +15,7 @@ pub const HIDDEN_WHEN_GENERATING: &[&CStr] = &[c"VK_EXT_swapchain_maintenance1"]
 
 /// `list` without the extensions named in `hide`.
 pub fn filter_extensions(list: &[vk::ExtensionProperties], hide: &[&CStr]) -> Vec<vk::ExtensionProperties> {
-    list.iter()
-        .filter(|p| p.extension_name_as_c_str().map_or(true, |name| !hide.contains(&name)))
-        .copied()
-        .collect()
+    list.iter().filter(|p| p.extension_name_as_c_str().map_or(true, |name| !hide.contains(&name))).copied().collect()
 }
 
 /// Writes `list` back with Vulkan's two-call idiom (`props` null: report the count).
@@ -33,7 +30,11 @@ pub unsafe fn write_out(list: &[vk::ExtensionProperties], count: *mut u32, props
     let n = (*count as usize).min(list.len());
     std::ptr::copy_nonoverlapping(list.as_ptr(), props, n);
     *count = n as u32;
-    if n < list.len() { vk::Result::INCOMPLETE } else { vk::Result::SUCCESS }
+    if n < list.len() {
+        vk::Result::INCOMPLETE
+    } else {
+        vk::Result::SUCCESS
+    }
 }
 
 pub unsafe extern "system" fn enumerate_device_extension_properties(

@@ -100,7 +100,11 @@ pub fn parse_config(text: &str) -> Result<(FileConfig, Vec<String>), String> {
                 None => return Err(format!("line {n}: unknown mode {t:?}")),
             },
             ("multiplier", Value::Number(m)) if (1..=MAX_MULTIPLIER as i64).contains(&m) => profile.multiplier = Some(m as u32),
-            ("mode" | "multiplier", _) => return Err(format!("line {n}: bad {key}, expected mode = \"battery\" | \"copy\" | \"quality\" or multiplier = 1..{MAX_MULTIPLIER}")),
+            ("mode" | "multiplier", _) => {
+                return Err(format!(
+                    "line {n}: bad {key}, expected mode = \"battery\" | \"copy\" | \"quality\" or multiplier = 1..{MAX_MULTIPLIER}"
+                ))
+            }
             _ => notes.push(format!("config line {n}: unknown key {key:?} ignored")),
         }
     }
@@ -133,11 +137,14 @@ pub struct Live {
 pub fn apply_reload(current: Live, reloaded: Result<Profile, String>, cap: u32) -> (Live, Option<String>) {
     let profile = match reloaded {
         Ok(p) => p,
-        Err(e) => return (current, Some(format!("config not applied ({e}); keeping mode {:?} multiplier {}", current.mode, current.multiplier))),
+        Err(e) => {
+            return (current, Some(format!("config not applied ({e}); keeping mode {:?} multiplier {}", current.mode, current.multiplier)))
+        }
     };
     let wanted = profile.multiplier.unwrap_or(1);
     let multiplier = wanted.min(cap.max(1));
-    let note = (multiplier < wanted).then(|| format!("multiplier {wanted} applies after the game recreates its swapchain; using {multiplier}"));
+    let note =
+        (multiplier < wanted).then(|| format!("multiplier {wanted} applies after the game recreates its swapchain; using {multiplier}"));
     (Live { mode: profile.mode.unwrap_or(Mode::Battery), multiplier }, note)
 }
 
@@ -388,7 +395,8 @@ mode = "quality"
 
     #[test]
     fn config_path_prefers_xdg() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+        let env =
+            |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
         assert_eq!(config_path(env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")])), Some("/x/haqengine/conf.toml".into()));
         assert_eq!(config_path(env(&[("HOME", "/h")])), Some("/h/.config/haqengine/conf.toml".into()));
         assert_eq!(config_path(env(&[])), None);

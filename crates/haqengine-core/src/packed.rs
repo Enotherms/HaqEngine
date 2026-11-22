@@ -61,11 +61,8 @@ pub fn compare_packed(f: PackedFormat, expected: &Image<u32>, actual: &Image<u32
 
 /// `img` stored in format `f`.
 pub fn to_packed(f: PackedFormat, img: &Image<Rgba8>) -> Image<u32> {
-    let data = img
-        .data
-        .iter()
-        .map(|p| pack(f, [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0, p[3] as f32 / 255.0]))
-        .collect();
+    let data =
+        img.data.iter().map(|p| pack(f, [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0, p[3] as f32 / 255.0])).collect();
     Image { width: img.width, height: img.height, data }
 }
 

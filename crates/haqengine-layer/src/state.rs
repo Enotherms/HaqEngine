@@ -47,8 +47,7 @@ pub struct DeviceData {
 pub static INSTANCES: LazyLock<HandleMap<Arc<InstanceData>>> = LazyLock::new(HandleMap::new);
 pub static DEVICES: LazyLock<HandleMap<Arc<DeviceData>>> = LazyLock::new(HandleMap::new);
 /// This process's name as Linux reports it (at most 15 bytes).
-pub static PROCESS: LazyLock<String> =
-    LazyLock::new(|| process_name(&std::fs::read_to_string("/proc/self/comm").unwrap_or_default()));
+pub static PROCESS: LazyLock<String> = LazyLock::new(|| process_name(&std::fs::read_to_string("/proc/self/comm").unwrap_or_default()));
 pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| {
     let env = |k: &str| std::env::var(k).ok();
     let mut notes = Vec::new();
@@ -139,7 +138,14 @@ static TEST_MEASURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::
 /// Test-only: overrides measure-only mode (`None` restores the environment's value).
 #[cfg(test)]
 pub fn set_test_measure(on: Option<bool>) {
-    TEST_MEASURE.store(match on { None => 0, Some(true) => 1, Some(false) => 2 }, std::sync::atomic::Ordering::SeqCst);
+    TEST_MEASURE.store(
+        match on {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
 }
 
 /// Whether HaqEngine only measures (passes every present through and logs the real frame rate).
@@ -172,9 +178,10 @@ pub fn multiplier() -> u32 {
 
 /// True when any queue family of the device can record copies.
 pub fn device_can_transfer(device: &DeviceData) -> bool {
-    device.queue_families.iter().any(|f| {
-        f.queue_flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
-    })
+    device
+        .queue_families
+        .iter()
+        .any(|f| f.queue_flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER))
 }
 
 /// Fake Vulkan objects for unit tests on the Mac.

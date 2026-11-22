@@ -3,8 +3,8 @@
 use crate::guard::guard;
 use crate::loader_abi::{find_device_link, find_device_loader_data};
 use crate::state::{dispatch_key, DeviceData, InstanceData, DEVICES, INSTANCES, LOG};
-use haqengine_core::quality::{quality_gate, QualityCaps};
 use ash::vk;
+use haqengine_core::quality::{quality_gate, QualityCaps};
 use std::ffi::CStr;
 use std::sync::Arc;
 
@@ -131,8 +131,7 @@ unsafe fn create_device_inner(
     let swapchain = ash::khr::swapchain::DeviceFn::load(load);
     let queue_families = instance.instance.get_physical_device_queue_family_properties(physical_device);
     let wait_for_present = if paced {
-        let f: Option<vk::PFN_vkWaitForPresentKHR> =
-            next_gdpa(handle, c"vkWaitForPresentKHR".as_ptr()).map(|p| std::mem::transmute(p));
+        let f: Option<vk::PFN_vkWaitForPresentKHR> = next_gdpa(handle, c"vkWaitForPresentKHR".as_ptr()).map(|p| std::mem::transmute(p));
         if f.is_none() {
             LOG.log("pacing off: vkWaitForPresentKHR missing");
         }
@@ -248,7 +247,8 @@ unsafe fn quality_verdict(instance: &InstanceData, physical: vk::PhysicalDevice,
     let (extended_formats, robust_images) = crate::features::enabled_caps(used);
     quality_gate(&QualityCaps {
         api_version: instance.api_version,
-        subgroup_ops_ok: subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE) && subgroup.supported_operations.contains(needed),
+        subgroup_ops_ok: subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
+            && subgroup.supported_operations.contains(needed),
         subgroup_size: subgroup.subgroup_size,
         extended_formats,
         robust_images,
