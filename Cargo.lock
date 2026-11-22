@@ -19,11 +19,11 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "haqengine-core"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "haqengine-gpu-tests"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ash",
  "haqengine-core",
@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "haqengine-layer"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ash",
  "haqengine-core",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "haqengine-shaders"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "libloading"
