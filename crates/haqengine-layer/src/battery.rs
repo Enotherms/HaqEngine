@@ -220,6 +220,11 @@ fn groups(w: u32, h: u32) -> (u32, u32) {
     (w.div_ceil(8), h.div_ceil(8))
 }
 
+/// Workgroups for the blend, whose 8×8 threads each handle a 2×2 pixel quad.
+fn blend_groups(w: u32, h: u32) -> (u32, u32) {
+    (w.div_ceil(16), h.div_ceil(16))
+}
+
 /// Push-constant bytes for 2 words, without allocating.
 pub fn push2(a: [u8; 4], b: [u8; 4]) -> [u8; 8] {
     let mut out = [0u8; 8];
@@ -587,7 +592,7 @@ impl BatteryResources {
                     fmt.to_le_bytes(),
                     row.to_le_bytes(),
                 ];
-                dispatch(d, cmd, &p.warp, self.warp_sets[cur][k], push.as_flattened(), groups(w, h));
+                dispatch(d, cmd, &p.warp, self.warp_sets[cur][k], push.as_flattened(), blend_groups(w, h));
             }
             stamp(3);
             memory_barrier(d, cmd, S::COMPUTE_SHADER, S::COMPUTE_SHADER);
