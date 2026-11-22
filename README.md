@@ -116,3 +116,9 @@ HaqEngine is a personal hobby project, built in my spare time to improve my own 
 ## Licence
 
 BSD 3-Clause, see `LICENSE`. The FidelityFX shaders in `third_party/fidelityfx` are MIT-licensed by AMD, see `THIRD_PARTY_NOTICES.txt`.
+
+---
+
+HaqGen and HaqEngine are personal, non-commercial hobby projects by [Enotherms](https://github.com/Enotherms), shared freely in case they help other players. Licensed under BSD 3-Clause.
+
+Not affiliated with Lossless Scaling, lsfg-vk, Decky Loader or Valve.
