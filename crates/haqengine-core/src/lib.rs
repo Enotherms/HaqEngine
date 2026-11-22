@@ -11,6 +11,7 @@ pub mod image;
 pub mod log;
 pub mod packed;
 pub mod pacing;
+pub mod phases;
 pub mod quality;
 pub mod reference;
 pub mod settings;

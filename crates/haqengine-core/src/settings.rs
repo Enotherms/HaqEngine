@@ -35,6 +35,8 @@ pub struct Settings {
     pub measure: bool,
     /// Set when measure-only mode overrides a requested multiplier.
     pub measure_note: Option<String>,
+    /// `HAQENGINE_TIMING=1`: log Battery's GPU time per phase.
+    pub timing: bool,
 }
 
 impl Settings {
@@ -65,7 +67,8 @@ impl Settings {
         let pacing = !matches!(get("HAQENGINE_PACING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0") | Some("off"));
         let measure = matches!(get("HAQENGINE_MEASURE").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
         let measure_note = measure_note(measure, multiplier);
-        Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new(), pacing, measure, measure_note }
+        let timing = matches!(get("HAQENGINE_TIMING").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1") | Some("on") | Some("true"));
+        Settings { log_path, multiplier, multiplier_note, mode, mode_note, config_notes: Vec::new(), pacing, measure, measure_note, timing }
     }
 }
 
@@ -167,6 +170,14 @@ mod tests {
         for v in ["0", "9", "x", "", "-2"] {
             assert_eq!(Settings::from_lookup(env(&[("HAQENGINE_MULTIPLIER", v)])).multiplier, 1, "{v}");
         }
+    }
+
+    #[test]
+    fn timing_flag_parses() {
+        assert!(Settings::from_lookup(env(&[("HAQENGINE_TIMING", "1")])).timing);
+        assert!(Settings::from_lookup(env(&[("HAQENGINE_TIMING", "on")])).timing);
+        assert!(!Settings::from_lookup(env(&[("HAQENGINE_TIMING", "0")])).timing);
+        assert!(!Settings::from_lookup(env(&[])).timing);
     }
 
     #[test]
