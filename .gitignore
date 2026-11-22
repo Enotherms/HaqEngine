@@ -1,1 +1,7 @@
 /target
+/dist
+.DS_Store
+/docs/
+/.superpowers/
+/scripts/deploy.sh
+/scripts/run-gpu-tests.sh
