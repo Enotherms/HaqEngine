@@ -20,12 +20,14 @@ pub const NEAR_BEST8: u32 = 96;
 /// only lines up badly (a dim pan seen as still) does not.
 pub const SHAPE8: u32 = 8;
 
-/// A quad's top-left choice is shared by its four pixels when its cost is at most this (a good
-/// match); otherwise each pixel chooses for itself (object edges keep their per-pixel choice).
+/// A quad's top-left choice is offered to its other pixels when its cost is at most this (a good
+/// match); a pixel keeps it only while it also matches there (`DISAGREE8`), so no-match flags stay
+/// exactly the per-pixel ones; otherwise the pixel chooses for itself.
 pub const QUAD_TRUST8: u32 = 48;
 
-/// The vector for pixel `(x, y)`: its 2×2 quad's top-left choice when that matches well
-/// (`QUAD_TRUST8`), else its own.
+/// The vector for pixel `(x, y)` and its cost there: its 2×2 quad's top-left choice when that
+/// matches well at the corner (`QUAD_TRUST8`) and still matches at the pixel (`DISAGREE8`), else
+/// its own choice.
 #[allow(clippy::too_many_arguments)]
 pub fn choose_quad(
     x: u32,
@@ -37,10 +39,31 @@ pub fn choose_quad(
     t: f32,
 ) -> (u32, [f32; 2]) {
     let corner = choose_vector(x & !1, y & !1, blocks, vector_at, luma_prev, luma_cur, t);
-    if corner.0 <= QUAD_TRUST8 || (x & 1 == 0 && y & 1 == 0) {
+    if x & 1 == 0 && y & 1 == 0 {
         return corner;
     }
+    if corner.0 <= QUAD_TRUST8 {
+        let own = vector_cost(x, y, corner.1, luma_prev, luma_cur, t);
+        if own <= DISAGREE8 {
+            return (own, corner.1);
+        }
+    }
     choose_vector(x, y, blocks, vector_at, luma_prev, luma_cur, t)
+}
+
+/// The weighted 3×3 cost of vector `v` at pixel `(x, y)` (as `choose_vector` scores a candidate).
+pub fn vector_cost(x: u32, y: u32, v: [f32; 2], luma_prev: impl Fn(i64, i64) -> i32, luma_cur: impl Fn(i64, i64) -> i32, t: f32) -> u32 {
+    let (px, py) = (x as f32, y as f32);
+    let (ax, ay, bx, by) = (px - t * v[0], py - t * v[1], px + (1.0 - t) * v[0], py + (1.0 - t) * v[1]);
+    let (pa, pb) = (((ax / 2.0).floor() as i64, (ay / 2.0).floor() as i64), ((bx / 2.0).floor() as i64, (by / 2.0).floor() as i64));
+    let mut sum = 0u32;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let weight = if dx == 0 && dy == 0 { 4 } else { 1 };
+            sum += weight * luma_prev(pa.0 + dx, pa.1 + dy).abs_diff(luma_cur(pb.0 + dx, pb.1 + dy));
+        }
+    }
+    sum
 }
 
 /// Side of a fallback tile in pixels.
@@ -516,8 +539,7 @@ mod tests {
                     continue;
                 }
                 checked += 1;
-                let corner = choose_vector(x & !1, y & !1, (flow.width, flow.height), vector_at, l8(&lp), l8(&lc), t);
-                let (cost, v) = if corner.0 <= QUAD_TRUST8 { corner } else { choose_vector(x, y, (flow.width, flow.height), vector_at, l8(&lp), l8(&lc), t) };
+                let (cost, v) = choose_quad(x, y, (flow.width, flow.height), vector_at, luma8(&lp), luma8(&lc), t);
                 let (px, py) = (x as f32, y as f32);
                 let a = crate::flow::bilinear(&prev, px - t * v[0], py - t * v[1]);
                 let b = crate::flow::bilinear(&cur, px + (1.0 - t) * v[0], py + (1.0 - t) * v[1]);
@@ -532,6 +554,46 @@ mod tests {
         }
         assert!(differs > 0, "the scene must have pixels whose own choice differs from the quad corner's");
         assert!(checked > 1000, "only {checked} pixels outside the fallback");
+    }
+
+    #[test]
+    fn quad_sharing_keeps_the_per_pixel_no_match_count() {
+        let prev = noise(96, 64, 81);
+        let mut cur = shift(&prev, 6, 2);
+        let blast = noise(40, 30, 83);
+        for y in 0..30 {
+            for x in 0..40 {
+                let a = cur.get(30 + x, 20 + y);
+                let b = blast.get(x, y);
+                cur.set(30 + x, 20 + y, if (x + y) % 3 == 0 { b } else { a });
+            }
+        }
+        let (lp, lc) = (luma_downsample(&prev), luma_downsample(&cur));
+        let mut flow = uniform(96, 64, [3.0, 1.0]);
+        let field = noise(6, 4, 85);
+        for by in 0..4 {
+            for bx in 0..6 {
+                let c = field.get(bx, by);
+                if c[0] % 3 == 0 {
+                    flow.set(bx, by, [(c[0] % 9) as f32 - 4.0, (c[1] % 7) as f32 - 3.0]);
+                }
+            }
+        }
+        let vector_at = |bx: u32, by: u32| {
+            let v: [f32; 2] = flow.get(bx, by);
+            [v[0] * 2.0, v[1] * 2.0]
+        };
+        for t in [1.0 / 3.0, 0.5] {
+            let (_, counts) = battery_blend_reference(&prev, &cur, &flow, &lp, &lc, t);
+            let mut per_pixel = 0;
+            for y in 0..64 {
+                for x in 0..96 {
+                    per_pixel += (choose_vector(x, y, (flow.width, flow.height), vector_at, luma8(&lp), luma8(&lc), t).0 > DISAGREE8) as u32;
+                }
+            }
+            assert!(per_pixel > 0, "the scene must have no-match pixels");
+            assert_eq!(counts.disagree, per_pixel, "t={t}");
+        }
     }
 
     #[test]

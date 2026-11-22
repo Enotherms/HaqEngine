@@ -128,7 +128,20 @@ uint shape12(int i, ivec2 ca, ivec2 cb) {
     }
     return shape;
 }
-void choose(vec2 pf, vec2 cands[6], int n, ivec2 base_prev[6], ivec2 base_cur[6], out vec2 best, out uint best_cost) {
+uint window_cost(int i, vec2 pf, vec2 v, ivec2 base_p, ivec2 base_c) {
+    ivec2 ca = clamp(ivec2(floor(prev_at(pf, v) / 2.0)) - base_p, ivec2(1), ivec2(9));
+    ivec2 cb = clamp(ivec2(floor(cur_at(pf, v) / 2.0)) - base_c, ivec2(1), ivec2(9));
+    uint cost = 0u;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            uint weight = (dx == 0 && dy == 0) ? 4u : 1u;
+            cost += weight * uint(abs(win_prev[i][ca.y + dy][ca.x + dx] - win_cur[i][cb.y + dy][cb.x + dx]));
+        }
+    }
+    return cost;
+}
+
+void choose(vec2 pf, vec2 cands[6], int n, ivec2 base_prev[6], ivec2 base_cur[6], out vec2 best, out uint best_cost, out int best_index) {
     uint costs[6];
     uint lowest = 0xFFFFFFFFu;
     int pick = 0;
@@ -166,6 +179,7 @@ void choose(vec2 pf, vec2 cands[6], int n, ivec2 base_prev[6], ivec2 base_cur[6]
     }
     best = cands[pick];
     best_cost = costs[pick];
+    best_index = pick;
 }
 
 bool in_frame(ivec2 p) {
@@ -226,7 +240,8 @@ void main() {
     if (in_frame(q)) {
         vec2 corner;
         uint corner_cost;
-        choose(vec2(q), cands, n, base_prev, base_cur, corner, corner_cost);
+        int corner_index;
+        choose(vec2(q), cands, n, base_prev, base_cur, corner, corner_cost, corner_index);
         vec2 last = vec2(float(pc.w - 1u), float(pc.h - 1u));
         uint disagree = 0u;
         uint tile = 0u;
@@ -239,8 +254,14 @@ void main() {
             vec2 pp = vec2(p);
             vec2 best = corner;
             uint best_cost = corner_cost;
-            if (corner_cost > QUAD_TRUST8 && k != 0) {
-                choose(pp, cands, n, base_prev, base_cur, best, best_cost);
+            if (k != 0) {
+                uint own = corner_cost <= QUAD_TRUST8 ? window_cost(corner_index, pp, corner, base_prev[corner_index], base_cur[corner_index]) : 0xFFFFFFFFu;
+                if (own <= DISAGREE8) {
+                    best_cost = own;
+                } else {
+                    int ignored;
+                    choose(pp, cands, n, base_prev, base_cur, best, best_cost, ignored);
+                }
             }
             vec4 a = bilinear(true, prev_at(pp, best));
             vec4 b = bilinear(false, cur_at(pp, best));
