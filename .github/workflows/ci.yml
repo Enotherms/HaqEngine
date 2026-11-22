@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install glslang
+        run: sudo apt-get update && sudo apt-get install -y glslang-tools
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+      - name: Package
+        run: sh scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: haqengine-x86_64-linux
+          path: dist/*.tar.gz
